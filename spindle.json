@@ -1,0 +1,18 @@
+{
+  "name": "Guided Generations",
+  "identifier": "guided_generations",
+  "version": "1.0.0",
+  "author": "Gehihi",
+  "github": "https://github.com/tminh159/GuidedGenerations",
+  "homepage": "https://github.com/tminh159/GuidedGenerations",
+  "description": "Guided Response, Guided Continue, Guided Regenerate, Guided Swipe, Impersonation, and Input Recovery buttons on the chat input bar, each with its own API connection profile, model, and preset settings.",
+  "permissions": [
+    "generation",
+    "chats",
+    "chat_mutation",
+    "presets"
+  ],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.2.0"
+}

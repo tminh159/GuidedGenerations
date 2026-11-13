@@ -1,0 +1,19 @@
+{
+  "name": "lumiverse-guided-generations",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js && bun build src/backend.ts --target bun --outfile dist/backend.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "@types/jsdom": "^28.0.1",
+    "jsdom": "^29.0.1",
+    "lumiverse-spindle-types": "0.6.32",
+    "typescript": "^5.9.3"
+  }
+}
+

@@ -3,6 +3,7 @@ import { JSDOM } from "jsdom";
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import { setup } from "../src/frontend";
 import { InputToolbarController } from "../src/frontend/input-toolbar";
+import { PillMetricsController } from "../src/frontend/pill-metrics";
 import { SettingsDrawerController } from "../src/frontend/settings-drawer";
 import { GUIDED_GENERATIONS_CSS } from "../src/frontend/styles";
 import { createDefaultSettings } from "../src/shared/defaults";
@@ -36,6 +37,8 @@ function makeBootstrapView(
       chats: true,
       chat_mutation: true,
       presets: true,
+      regex_scripts: true,
+      interceptor: true,
     },
     ...overrides,
   };
@@ -60,17 +63,54 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
   const eventListeners = new Map<string, Set<(payload: unknown) => void>>();
   const stateListeners = new Map<string, Set<(payload: unknown) => void>>();
   const activateHandlers = new Set<() => void>();
+  const messageElements = new Map<string, Element>();
+  const injectedWrappers = new Set<Element>();
 
+  let injectCalls = 0;
+  let uninjectCalls = 0;
   let mountedTextAreaDestroyCount = 0;
   let mountedComboboxDestroyCount = 0;
   let lastTextAreaOnChange: ((val: string) => void) | undefined;
   let lastComboboxOnChange: ((val: string) => void) | undefined;
   let focusCalls = 0;
   const setTextCalls: string[] = [];
+  const chatMessages = new Map<
+    string,
+    Array<{ id: string; chat_id?: string; swipe_id: number; extra?: Record<string, unknown> }>
+  >();
+  const getMessagesCalls: Array<{ chatId: string; options?: { limit?: number; tail?: boolean } }> = [];
+  const updateMessageCalls: Array<{
+    chatId: string;
+    messageId: string;
+    input: Record<string, unknown>;
+  }> = [];
+  let customGetMessages:
+    | ((chatId: string, options?: { limit?: number; tail?: boolean }) => Promise<unknown>)
+    | null = null;
+  let customUpdateMessage:
+    | ((chatId: string, messageId: string, input: Record<string, unknown>) => Promise<unknown>)
+    | null = null;
 
   const ctx = {
     dom: {
       addStyle: () => () => {},
+      findMessageElement: (messageId: string) => messageElements.get(messageId) ?? null,
+      inject: (target: string | Element, html: string, position: InsertPosition = "beforeend") => {
+        const el = typeof target === "string" ? document.querySelector(target)! : target;
+        const wrapper = document.createElement("div");
+        wrapper.setAttribute("data-spindle-injected", "true");
+        wrapper.innerHTML = html;
+        el.insertAdjacentElement(position, wrapper);
+        injectedWrappers.add(wrapper);
+        injectCalls += 1;
+        return wrapper;
+      },
+      uninject: (el: Element) => {
+        if (injectedWrappers.delete(el)) {
+          uninjectCalls += 1;
+        }
+        el.remove();
+      },
     },
     ui: {
       mount: (point: string) => {
@@ -184,6 +224,32 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
       getActive: () => ({ activeProfileId: "c1", provider: "openai", model: "gpt-4o" }),
       subscribe: () => () => {},
     },
+    chats: {
+      getMessages: async (chatId: string, options?: { limit?: number; tail?: boolean }) => {
+        getMessagesCalls.push({ chatId, options });
+        if (customGetMessages) {
+          return customGetMessages(chatId, options);
+        }
+        const rows = chatMessages.get(chatId) ?? [];
+        return { data: rows.map((row) => structuredClone(row)), total: rows.length };
+      },
+      updateMessage: async (
+        chatId: string,
+        messageId: string,
+        input: Record<string, unknown>,
+      ) => {
+        updateMessageCalls.push({ chatId, messageId, input: structuredClone(input) });
+        if (customUpdateMessage) {
+          return customUpdateMessage(chatId, messageId, input);
+        }
+        const rows = chatMessages.get(chatId) ?? [];
+        const target = rows.find((m) => m.id === messageId);
+        if (target && input.extra && typeof input.extra === "object") {
+          target.extra = structuredClone(input.extra as Record<string, unknown>);
+        }
+        return target ?? { id: messageId };
+      },
+    },
     events: {
       on: (event: string, handler: (payload: unknown) => void) => {
         let set = eventListeners.get(event);
@@ -264,6 +330,23 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
     tabRoot,
     sentRpcs,
     emitFromBackend,
+    emitEvent: (event: string, payload: unknown) => {
+      for (const handler of eventListeners.get(event) ?? []) {
+        handler(payload);
+      }
+    },
+    setMessageElement: (messageId: string, el: Element | null) => {
+      if (el) {
+        messageElements.set(messageId, el);
+      } else {
+        messageElements.delete(messageId);
+      }
+    },
+    getInjectCounts: () => ({
+      injectCalls,
+      uninjectCalls,
+      activeInjections: injectedWrappers.size,
+    }),
     resolveLastRpc,
     rejectRpc,
     setChat: (chatId: string | null, opts2?: { mounted?: boolean; text?: string }) => {
@@ -287,6 +370,24 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
     }),
     triggerLastTextAreaChange: (val: string) => lastTextAreaOnChange?.(val),
     triggerLastComboboxChange: (val: string) => lastComboboxOnChange?.(val),
+    setChatMessages: (
+      chatId: string,
+      messages: Array<{ id: string; chat_id?: string; swipe_id: number; extra?: Record<string, unknown> }>,
+    ) => {
+      chatMessages.set(chatId, messages);
+    },
+    getGetMessagesCalls: () => getMessagesCalls,
+    getUpdateMessageCalls: () => updateMessageCalls,
+    setCustomGetMessages: (
+      fn: ((chatId: string, options?: { limit?: number; tail?: boolean }) => Promise<unknown>) | null,
+    ) => {
+      customGetMessages = fn;
+    },
+    setCustomUpdateMessage: (
+      fn: ((chatId: string, messageId: string, input: Record<string, unknown>) => Promise<unknown>) | null,
+    ) => {
+      customUpdateMessage = fn;
+    },
   };
 }
 
@@ -808,6 +909,8 @@ describe("frontend orchestration and safety", () => {
       onTriggerAction: () => {},
       onAbortAction: () => {},
       onRestoreLatest: () => {},
+      onRemoveLastContinue: () => {},
+      onRegenerateLastContinue: () => {},
     });
 
     const settings = createDefaultSettings();
@@ -844,5 +947,2289 @@ describe("frontend orchestration and safety", () => {
     toolbar.destroy();
     expect(actionsMount.style.display).toBe("none");
     expect(rowMount.style.display).toBe("none");
+  });
+
+  test("Input Recovery clears composer without saving to History or showing a banner when history is empty, and restores when saved inputs exist", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "  Draft with formatting  ",
+    });
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView({ recovery: [] }), "get_bootstrap");
+    await flushMicrotasks();
+
+    const getRecoveryBtn = () =>
+      h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+
+    expect(getRecoveryBtn().disabled).toBe(false);
+    expect(getRecoveryBtn().getAttribute("aria-label")).toBe("Clear current input");
+
+    // Pressing Input Recovery with empty history clears the composer, focuses it,
+    // does NOT push to recovery history, and shows NO pop-up banner.
+    getRecoveryBtn().click();
+    await flushMicrotasks();
+
+    expect(h.getComposerText()).toBe("");
+    expect(h.getFocusCalls()).toBe(1);
+    expect(h.sentRpcs.filter((r) => r.action === "push_recovery")).toHaveLength(0);
+    expect(h.alertMount.children.length).toBe(0);
+    expect(h.alertMount.textContent).toBe("");
+    expect(h.tabRoot.querySelector(".gg-recovery-item")).toBeNull();
+    expect(getRecoveryBtn().getAttribute("aria-label")).toBe("Clear current input");
+
+    // When saved inputs exist, pressing Input Recovery still restores the latest saved entry.
+    const savedEntry: RecoveryEntry = {
+      id: "rec-1",
+      text: "Previously saved draft",
+      actionId: "guided_response",
+      chatId: "chat-a",
+      createdAt: 123,
+    };
+    h.emitFromBackend({
+      type: "gg:recovery-updated",
+      recovery: [savedEntry],
+    });
+    await flushMicrotasks();
+
+    expect(getRecoveryBtn().getAttribute("aria-label")).toBe("Restore last input");
+    getRecoveryBtn().click();
+    await flushMicrotasks();
+    expect(h.getComposerText()).toBe("Previously saved draft");
+    expect(h.getFocusCalls()).toBe(2);
+    expect(h.sentRpcs.filter((r) => r.action === "push_recovery")).toHaveLength(0);
+    expect(h.alertMount.children.length).toBe(0);
+
+    teardown();
+  });
+
+  test("Input Recovery with empty history is a quiet no-op when composer is already empty and warns only if composer is unavailable", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView({ recovery: [] }), "get_bootstrap");
+    await flushMicrotasks();
+
+    const getRecoveryBtn = () =>
+      h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+
+    // Already empty composer -> focuses quietly, no setText call, no push_recovery, no banner.
+    getRecoveryBtn().click();
+    await flushMicrotasks();
+    expect(h.getComposerText()).toBe("");
+    expect(h.getFocusCalls()).toBe(1);
+    expect(h.getSetTextCalls()).toEqual([]);
+    expect(h.sentRpcs.filter((r) => r.action === "push_recovery")).toHaveLength(0);
+    expect(h.alertMount.children.length).toBe(0);
+    expect(h.alertMount.textContent).toBe("");
+
+    // Whitespace-only input is cleared to "" without saving or showing a banner.
+    h.setComposerState({ text: "   \n  " });
+    getRecoveryBtn().click();
+    await flushMicrotasks();
+    expect(h.getComposerText()).toBe("");
+    expect(h.getFocusCalls()).toBe(2);
+    expect(h.sentRpcs.filter((r) => r.action === "push_recovery")).toHaveLength(0);
+    expect(h.alertMount.children.length).toBe(0);
+
+    // Unmounted / unavailable composer -> warns safely without uncaught throws or push_recovery.
+    h.setComposerState({ mounted: false, chatId: null, text: "" });
+    getRecoveryBtn().click();
+    await flushMicrotasks();
+    expect(h.sentRpcs.filter((r) => r.action === "push_recovery")).toHaveLength(0);
+    expect(h.alertMount.textContent).toContain("Composer is unavailable");
+
+    teardown();
+  });
+
+  test("guided_impersonate applies streaming and final regex-processed gg:impersonate-chunk cleanly without cross-chat races", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "ask about the mission",
+    });
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+    await flushMicrotasks();
+
+    const impersonateBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+      '[data-gg-action="guided_impersonate"]',
+    )!;
+    impersonateBtn.click();
+    await flushMicrotasks();
+
+    const runReq = h.sentRpcs.find((r) => r.action === "run_action")!;
+    expect(runReq).toBeDefined();
+    expect(h.getComposerText()).toBe("");
+
+    h.emitFromBackend({
+      type: "gg:status",
+      run: {
+        runId: "imp-1",
+        actionId: "guided_impersonate",
+        chatId: "chat-a",
+        startedAt: Date.now(),
+      },
+    });
+
+    // Streaming chunk updates composer without stealing focus
+    h.emitFromBackend({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-a",
+      text: "*waves* [OOC: keep it brief]",
+      done: false,
+    });
+    expect(h.getComposerText()).toBe("*waves* [OOC: keep it brief]");
+    expect(h.getFocusCalls()).toBe(0);
+
+    // Even if composer text changed mid-stream or gg:status cleared activeRun slightly early,
+    // the final regex-processed chunk (done: true) replaces composer cleanly and focuses it.
+    h.setComposerState({ text: "*waves* [OOC: user edited]" });
+    h.emitFromBackend({ type: "gg:status", run: null });
+    h.emitFromBackend({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-a",
+      text: "Waves warmly.",
+      done: true,
+      aborted: false,
+    });
+    expect(h.getComposerText()).toBe("Waves warmly.");
+    expect(h.getFocusCalls()).toBe(1);
+
+    h.emitFromBackend({
+      type: "gg:reply",
+      requestId: runReq.requestId,
+      result: {
+        runId: "imp-1",
+        actionId: "guided_impersonate",
+        chatId: "chat-a",
+        aborted: false,
+        text: "Waves warmly.",
+      },
+    });
+    await flushMicrotasks();
+
+    // Switching to chat-b rejects late chunks tagged for chat-a
+    h.setChat("chat-b", { mounted: true, text: "Chat B draft" });
+    h.emitFromBackend({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-a",
+      text: "Late stale chunk",
+      done: true,
+    });
+    expect(h.getComposerText()).toBe("Chat B draft");
+
+    teardown();
+  });
+
+  test("preserves fallback In-history depth input focus and debounced save across background gg:changed refresh", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+    const initialView = makeBootstrapView();
+    initialView.settings.actions.guided_response.guidancePosition = "in_history";
+    initialView.settings.actions.guided_response.guidanceDepth = 2;
+    h.resolveLastRpc(initialView, "get_bootstrap");
+    await flushMicrotasks();
+
+    const depthInput = h.tabRoot.querySelector<HTMLInputElement>(
+      'input[aria-label="Guided Response In-history depth"]',
+    )!;
+    expect(depthInput).not.toBeNull();
+    expect(depthInput.disabled).toBe(false);
+    expect(depthInput.value).toBe("2");
+
+    depthInput.focus();
+    depthInput.value = "7";
+    depthInput.dispatchEvent(new (document.defaultView!.Event)("input", { bubbles: true }));
+
+    // Background gg:changed triggers get_bootstrap while user is still editing depth
+    h.emitFromBackend({ type: "gg:changed" });
+    const nextView = makeBootstrapView({
+      presets: [{ id: "p1", name: "Default" }, { id: "p2", name: "Extra" }],
+    });
+    nextView.settings.actions.guided_response.guidancePosition = "in_history";
+    nextView.settings.actions.guided_response.guidanceDepth = 2;
+    h.resolveLastRpc(nextView, "get_bootstrap");
+    await flushMicrotasks();
+
+    // Depth input element stays intact & focused, and blurring commits normalized depth = 7
+    expect(document.activeElement).toBe(depthInput);
+    depthInput.blur();
+    depthInput.dispatchEvent(new (document.defaultView!.FocusEvent)("focusout", { bubbles: true }));
+    await flushMicrotasks();
+
+    const saveReq = h.sentRpcs.find((r) => r.action === "save_settings");
+    expect(saveReq).toBeDefined();
+    expect((saveReq!.input as GuidedGenerationsSettings).actions.guided_response.guidanceDepth).toBe(
+      7,
+    );
+
+    teardown();
+  });
+
+  test("guided_swipe click, Ctrl/Cmd+Click, and click-and-hold wire backgroundSwipe into run_action RPC without double-triggering or aborting", async () => {
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const pendingHoldTimers = new Map<number, () => void>();
+    let nextTimerId = 95_000;
+
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextTimerId;
+        pendingHoldTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (pendingHoldTimers.has(num)) {
+        pendingHoldTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const fireHoldTimers = () => {
+      for (const [id, fn] of [...pendingHoldTimers.entries()]) {
+        if (!pendingHoldTimers.has(id)) continue;
+        pendingHoldTimers.delete(id);
+        fn();
+      }
+    };
+
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Keep tension high",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const Win = document.defaultView!;
+      const PointerEvt = Win.PointerEvent;
+      const MouseEvt = Win.MouseEvent;
+
+      const getSwipeBtn = () =>
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_swipe"]')!;
+
+      // 1. Plain click -> run_action without backgroundSwipe
+      getSwipeBtn().click();
+      await flushMicrotasks();
+
+      let runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(1);
+      expect(runRpcs[0]!.input).toEqual({
+        actionId: "guided_swipe",
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+        inputText: "Keep tension high",
+      });
+      expect("backgroundSwipe" in (runRpcs[0]!.input as Record<string, unknown>)).toBe(false);
+
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[0]!.requestId,
+        result: { runId: "r-1", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 2. Ctrl+Click -> run_action with backgroundSwipe: true
+      h.setComposerState({ text: "Background via Ctrl+Click" });
+      getSwipeBtn().dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      await flushMicrotasks();
+
+      runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(2);
+      expect(runRpcs[1]!.input).toEqual({
+        actionId: "guided_swipe",
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+        inputText: "Background via Ctrl+Click",
+        backgroundSwipe: true,
+      });
+
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[1]!.requestId,
+        result: { runId: "r-2", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 3. Click-and-hold (pointerdown -> 450ms timer -> pointerup -> click)
+      //    triggers run_action with backgroundSwipe: true once without aborting on release
+      h.setComposerState({ text: "Background via hold" });
+      const swipeBtnBeforeHold = getSwipeBtn();
+      swipeBtnBeforeHold.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 15,
+          clientY: 15,
+        }),
+      );
+      expect(swipeBtnBeforeHold.classList.contains("is-holding")).toBe(true);
+      expect(pendingHoldTimers.size).toBe(1);
+
+      fireHoldTimers();
+      await flushMicrotasks();
+
+      runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(3);
+      expect(runRpcs[2]!.input).toEqual({
+        actionId: "guided_swipe",
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+        inputText: "Background via hold",
+        backgroundSwipe: true,
+      });
+
+      // Release pointerup + click on the button must neither double-trigger nor abort
+      swipeBtnBeforeHold.dispatchEvent(
+        new PointerEvt("pointerup", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 15,
+          clientY: 15,
+        }),
+      );
+      swipeBtnBeforeHold.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true }),
+      );
+      await flushMicrotasks();
+
+      expect(h.sentRpcs.filter((r) => r.action === "run_action")).toHaveLength(3);
+      expect(h.sentRpcs.filter((r) => r.action === "abort_action")).toHaveLength(0);
+
+      // 3b. When gg:status arrives right after 450ms hold fires (replacing button with is-running Stop button)
+      //     before pointerup + click, releasing does NOT abort; a subsequent deliberate click DOES abort.
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[2]!.requestId,
+        result: { runId: "r-3", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      h.setComposerState({ text: "Hold with immediate gg:status" });
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 18,
+          clientY: 18,
+        }),
+      );
+      expect(pendingHoldTimers.size).toBe(1);
+      fireHoldTimers();
+      await flushMicrotasks();
+
+      runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(4);
+      expect(runRpcs[3]!.input).toEqual({
+        actionId: "guided_swipe",
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+        inputText: "Hold with immediate gg:status",
+        backgroundSwipe: true,
+      });
+
+      const oldBtnBeforeStatus = getSwipeBtn();
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "r-3b",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+        },
+      });
+      const replacementBtn = getSwipeBtn();
+      expect(replacementBtn).not.toBe(oldBtnBeforeStatus);
+      expect(replacementBtn.classList.contains("is-running")).toBe(true);
+
+      // Synthesized release pointerup + click on replacement button must NOT abort
+      replacementBtn.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 18,
+          clientY: 18,
+        }),
+      );
+      replacementBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true }),
+      );
+      await flushMicrotasks();
+      expect(h.sentRpcs.filter((r) => r.action === "abort_action")).toHaveLength(0);
+
+      // Subsequent deliberate click on replacement button DOES abort
+      replacementBtn.click();
+      await flushMicrotasks();
+      let abortRpcs = h.sentRpcs.filter((r) => r.action === "abort_action");
+      expect(abortRpcs).toHaveLength(1);
+      expect(abortRpcs[0]!.input).toEqual({ runId: "r-3b" });
+
+      h.emitFromBackend({ type: "gg:status", run: null });
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[3]!.requestId,
+        result: { runId: "r-3b", actionId: "guided_swipe", chatId: "chat-a", aborted: true },
+      });
+      await flushMicrotasks();
+
+      // 3c. When gg:status replaces button and browser drops click after pointerup,
+      //     0ms timer after document pointerup clears suppression so next deliberate click aborts.
+      h.setComposerState({ text: "Hold with dropped click" });
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 12,
+          clientY: 12,
+        }),
+      );
+      fireHoldTimers();
+      await flushMicrotasks();
+      runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(5);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "r-3c",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+        },
+      });
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 12,
+          clientY: 12,
+        }),
+      );
+      // No click fired on release; wait for next macrotask then click Stop deliberately
+      await flushMicrotasks();
+      getSwipeBtn().click();
+      await flushMicrotasks();
+      abortRpcs = h.sentRpcs.filter((r) => r.action === "abort_action");
+      expect(abortRpcs).toHaveLength(2);
+      expect(abortRpcs[1]!.input).toEqual({ runId: "r-3c" });
+
+      h.emitFromBackend({ type: "gg:status", run: null });
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[4]!.requestId,
+        result: { runId: "r-3c", actionId: "guided_swipe", chatId: "chat-a", aborted: true },
+      });
+      await flushMicrotasks();
+
+      // 4. Releasing early (<450ms) cancels hold and falls back to normal swipe without backgroundSwipe
+      h.setComposerState({ text: "Short click" });
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+      expect(pendingHoldTimers.size).toBe(1);
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerup", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+      expect(pendingHoldTimers.size).toBe(0);
+      getSwipeBtn().dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true }),
+      );
+      await flushMicrotasks();
+
+      runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(6);
+      expect("backgroundSwipe" in (runRpcs[5]!.input as Record<string, unknown>)).toBe(false);
+
+      // 5. Teardown during an active hold clears the hold timer
+      getSwipeBtn().dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+      expect(pendingHoldTimers.size).toBe(1);
+      teardown();
+      expect(pendingHoldTimers.size).toBe(0);
+    } finally {
+      teardown();
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("guided_continue click vs hold/shortcut drop-up dispatches remove_last_continue and regenerate_last_continue RPCs without touching composer and respects isLaunching lock", async () => {
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origDateNow = Date.now;
+    let fakeNow = 20_000;
+    const pendingHoldTimers = new Map<number, () => void>();
+    let nextTimerId = 96_000;
+
+    Date.now = () => fakeNow;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextTimerId;
+        pendingHoldTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (pendingHoldTimers.has(num)) {
+        pendingHoldTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const fireHoldTimers = () => {
+      for (const [id, fn] of [...pendingHoldTimers.entries()]) {
+        if (!pendingHoldTimers.has(id)) continue;
+        pendingHoldTimers.delete(id);
+        fn();
+      }
+    };
+
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Unsent user draft",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const Win = document.defaultView!;
+      const PointerEvt = Win.PointerEvent;
+      const MouseEvt = Win.MouseEvent;
+      const KeyEvt = Win.KeyboardEvent;
+
+      const getContinueBtn = () =>
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_continue"]')!;
+      const getMenu = () =>
+        document.body.querySelector<HTMLDivElement>(".gg-dropup-menu");
+      const getMenuItem = (action: "remove_last_continue" | "regenerate_last_continue") =>
+        document.body.querySelector<HTMLButtonElement>(
+          `.gg-dropup-menu [data-gg-menu-action="${action}"]`,
+        )!;
+
+      // 1. Single click on guided_continue still runs guided_continue with composer text
+      h.setComposerState({ text: "Nudge toward mystery" });
+      getContinueBtn().click();
+      await flushMicrotasks();
+
+      let runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+      expect(runRpcs).toHaveLength(1);
+      expect(runRpcs[0]!.input).toEqual({
+        actionId: "guided_continue",
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+        inputText: "Nudge toward mystery",
+      });
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[0]!.requestId,
+        result: { runId: "c-run-1", actionId: "guided_continue", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 2. 450ms click-and-hold opens drop-up menu without triggering guided_continue on release,
+      //    respects touch-release grace window, and clicking "Remove the last continue" sends RPC
+      //    while keeping composer draft untouched.
+      h.setComposerState({ text: "Keep this draft intact" });
+      const setTextCountBeforeMenu = h.getSetTextCalls().length;
+      const continueBtn = getContinueBtn();
+      continueBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 20,
+          clientY: 20,
+        }),
+      );
+      fakeNow += 450;
+      fireHoldTimers();
+      expect(getMenu()).not.toBeNull();
+
+      // Release inside 150ms grace period -> menu remains open & no run_action fired
+      fakeNow += 30;
+      continueBtn.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 20,
+          clientY: 20,
+        }),
+      );
+      continueBtn.dispatchEvent(new MouseEvt("click", { bubbles: true, cancelable: true }));
+      await flushMicrotasks();
+      expect(getMenu()).not.toBeNull();
+      expect(h.sentRpcs.filter((r) => r.action === "run_action")).toHaveLength(1);
+
+      // Click "Remove the last continue"
+      getMenuItem("remove_last_continue").click();
+      await flushMicrotasks();
+      expect(getMenu()).toBeNull();
+
+      // Double-opening via Ctrl+Click while remove_last_continue is in-flight is blocked by isLaunching
+      continueBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      getMenuItem("remove_last_continue").click();
+      await flushMicrotasks();
+
+      const removeRpcs = h.sentRpcs.filter((r) => r.action === "remove_last_continue");
+      expect(removeRpcs).toHaveLength(1);
+      expect(removeRpcs[0]!.input).toEqual({ chatId: "chat-a" });
+      expect(h.getComposerText()).toBe("Keep this draft intact");
+      expect(h.getSetTextCalls().length).toBe(setTextCountBeforeMenu);
+
+      // Backend rejection on remove_last_continue surfaces warn banner
+      h.rejectRpc(removeRpcs[0]!.requestId, "No continue history found.");
+      await flushMicrotasks();
+      const warnNotice = h.alertMount.querySelector(".gg-notice");
+      expect(warnNotice?.classList.contains("is-warn")).toBe(true);
+      expect(warnNotice?.textContent).toContain("No continue history found.");
+
+      // Successful remove_last_continue clears existing banner
+      continueBtn.dispatchEvent(
+        new KeyEvt("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true }),
+      );
+      getMenuItem("remove_last_continue").click();
+      await flushMicrotasks();
+      const removeRpcs2 = h.sentRpcs.filter((r) => r.action === "remove_last_continue");
+      expect(removeRpcs2).toHaveLength(2);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: removeRpcs2[1]!.requestId,
+        result: { removed: true, messageId: "m2", swipeIndex: 0, text: "Before" },
+      });
+      await flushMicrotasks();
+      expect(h.alertMount.children.length).toBe(0);
+
+      // 3. Alt+ArrowUp opens menu and "Regenerate last continue" dispatches RPC without touching composer
+      continueBtn.dispatchEvent(
+        new KeyEvt("keydown", { key: "ArrowUp", altKey: true, bubbles: true, cancelable: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      getMenuItem("regenerate_last_continue").click();
+      await flushMicrotasks();
+
+      // Attempt second regenerate while isLaunching is true -> blocked
+      continueBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      getMenuItem("regenerate_last_continue").click();
+      await flushMicrotasks();
+
+      const regenRpcs = h.sentRpcs.filter((r) => r.action === "regenerate_last_continue");
+      expect(regenRpcs).toHaveLength(1);
+      expect(regenRpcs[0]!.input).toEqual({
+        chatId: "chat-a",
+        activeConnectionId: "c1",
+      });
+      expect(h.getComposerText()).toBe("Keep this draft intact");
+      expect(h.getSetTextCalls().length).toBe(setTextCountBeforeMenu);
+
+      // Failure shows error banner
+      h.rejectRpc(regenRpcs[0]!.requestId, "Regenerate failed.");
+      await flushMicrotasks();
+      const errNotice = h.alertMount.querySelector(".gg-notice");
+      expect(errNotice?.classList.contains("is-error")).toBe(true);
+      expect(errNotice?.textContent).toContain("Regenerate failed.");
+
+      // 4. Active run status closes an open menu; outside click after grace period closes menu; teardown closes menu
+      getContinueBtn().dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "live-cont",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: fakeNow,
+        },
+      });
+      expect(getMenu()).toBeNull();
+
+      h.emitFromBackend({ type: "gg:status", run: null });
+      getContinueBtn().dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      fakeNow += 200;
+      document.body.click();
+      expect(getMenu()).toBeNull();
+
+      getContinueBtn().dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      teardown();
+      expect(getMenu()).toBeNull();
+    } finally {
+      teardown();
+      Date.now = origDateNow;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("StreamingIndicatorController mounts 3-dot indicator into message_body_before with rAF retry for response, regenerate, and swipe", async () => {
+    expect(GUIDED_GENERATIONS_CSS).toContain(".gg-streaming-indicator");
+    expect(GUIDED_GENERATIONS_CSS).toContain(".gg-streaming-dot");
+    expect(GUIDED_GENERATIONS_CSS).toContain("@keyframes gg-streaming-bounce");
+    expect(GUIDED_GENERATIONS_CSS).toContain("var(--lumiverse-primary, rgba(147, 112, 219, 0.9))");
+    expect(GUIDED_GENERATIONS_CSS).toContain("animation-delay: 0.15s");
+    expect(GUIDED_GENERATIONS_CSS).toContain("animation-delay: 0.3s");
+
+    const origRaf = globalThis.requestAnimationFrame;
+    const origCancelRaf = globalThis.cancelAnimationFrame;
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = (
+      cb: FrameRequestCallback,
+    ) => {
+      const id = nextRafId++;
+      rafQueue.set(id, cb);
+      return id;
+    };
+    (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = (
+      id: number,
+    ) => {
+      rafQueue.delete(id);
+    };
+
+    const flushRaf = () => {
+      const entries = [...rafQueue.entries()];
+      rafQueue.clear();
+      for (const [, cb] of entries) cb(16);
+    };
+
+    const createBubbleRow = (messageId: string, withMount = true) => {
+      const row = document.createElement("div");
+      row.setAttribute("data-item-type", "message");
+      row.setAttribute("data-message-id", messageId);
+      const bubbleMsg = document.createElement("div");
+      bubbleMsg.setAttribute("data-component", "BubbleMessage");
+      const bubble = document.createElement("div");
+      const header = document.createElement("div");
+      const content = document.createElement("div");
+      if (withMount) {
+        const mount = document.createElement("span");
+        mount.setAttribute("data-spindle-mount", "message_body_before");
+        content.append(mount);
+      }
+      bubble.append(header, content);
+      bubbleMsg.append(bubble);
+      row.append(bubbleMsg);
+      document.body.append(row);
+      return { row, target: withMount ? content.firstElementChild! : content };
+    };
+
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 1. guided_response: gg:status arrives before DOM paints -> rAF retries until row mounts
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-resp",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-resp",
+          swipeId: 0,
+        },
+      });
+      expect(rafQueue.size).toBe(1);
+
+      const respDom = createBubbleRow("m-resp");
+      h.setMessageElement("m-resp", respDom.row);
+      flushRaf();
+
+      const respIndicators = respDom.target.querySelectorAll(".gg-streaming-indicator");
+      expect(respIndicators).toHaveLength(1);
+      expect(respIndicators[0]!.getAttribute("role")).toBe("status");
+      expect(respIndicators[0]!.getAttribute("aria-label")).toBe("Generating response");
+      expect(respIndicators[0]!.querySelectorAll(".gg-streaming-dot")).toHaveLength(3);
+
+      // Re-emitting status or MESSAGE_SENT does not duplicate the injection
+      h.emitEvent("MESSAGE_SENT", { message: { id: "m-resp", content: "", swipe_id: 0 } });
+      expect(respDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      expect(h.getInjectCounts().injectCalls).toBe(1);
+
+      // 2. guided_regenerate mounts into its target message_body_before and cleans up previous
+      const regenDom = createBubbleRow("m-regen");
+      h.setMessageElement("m-regen", regenDom.row);
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-regen",
+          actionId: "guided_regenerate",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-regen",
+          swipeId: 0,
+        },
+      });
+      expect(respDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(regenDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // 3. guided_swipe mounts into fallback BubbleMessage content container when mount span is absent
+      const swipeDom = createBubbleRow("m-swipe", false);
+      h.setMessageElement("m-swipe", swipeDom.row);
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-swipe",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-swipe",
+          swipeId: 1,
+          backgroundSwipe: false,
+        },
+      });
+      expect(regenDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(swipeDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // 4. Non-card action (guided_impersonate) does not mount indicator
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-imp",
+          actionId: "guided_impersonate",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-swipe",
+        },
+      });
+      expect(swipeDom.target.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+    } finally {
+      teardown();
+      (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = origRaf;
+      (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = origCancelRaf;
+    }
+  });
+
+  test("StreamingIndicatorController mounts guided_continue after MessageContent with fallbacks and clean action transitions", async () => {
+    expect(GUIDED_GENERATIONS_CSS).toContain(".gg-streaming-indicator--after");
+
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 1. BubbleMessage with MessageContent: injects "afterend" on [data-component="MessageContent"] (inside .content, outside MessageContent)
+      const bubbleRow = document.createElement("div");
+      bubbleRow.setAttribute("data-message-id", "m-cont-1");
+      const bubbleMsg = document.createElement("div");
+      bubbleMsg.setAttribute("data-component", "BubbleMessage");
+      const bubbleInner = document.createElement("div");
+      const bubbleContent = document.createElement("div");
+      bubbleContent.className = "bubble_content_abc";
+      const mountBefore = document.createElement("span");
+      mountBefore.setAttribute("data-spindle-mount", "message_body_before");
+      const messageContent = document.createElement("div");
+      messageContent.setAttribute("data-component", "MessageContent");
+      messageContent.textContent = "Existing paragraph";
+      const mountAfter = document.createElement("span");
+      mountAfter.setAttribute("data-spindle-mount", "message_body_after");
+      bubbleContent.append(mountBefore, messageContent);
+      bubbleInner.append(bubbleContent, mountAfter);
+      bubbleMsg.append(bubbleInner);
+      bubbleRow.append(bubbleMsg);
+      document.body.append(bubbleRow);
+      h.setMessageElement("m-cont-1", bubbleRow);
+
+      // guided_continue injects directly after MessageContent
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-cont-1",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-1",
+          swipeId: 0,
+          hasContentOutput: false,
+        },
+      });
+      expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(messageContent.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(mountAfter.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      const afterSibling = messageContent.nextElementSibling;
+      expect(afterSibling).not.toBeNull();
+      expect(afterSibling!.parentElement).toBe(bubbleContent);
+      expect(afterSibling!.querySelectorAll(".gg-streaming-indicator--after")).toHaveLength(1);
+      expect(bubbleRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // Re-emitting same guided_continue status must not unmount/re-inject
+      const injectCountBeforeDup = h.getInjectCounts().injectCalls;
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-cont-1",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-1",
+          swipeId: 0,
+          hasContentOutput: false,
+        },
+      });
+      expect(h.getInjectCounts().injectCalls).toBe(injectCountBeforeDup);
+      expect(bubbleRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // 2. Fallback to [data-spindle-mount="message_body_after"] ("beforeend") when MessageContent is absent
+      const fallbackRow = document.createElement("div");
+      fallbackRow.setAttribute("data-message-id", "m-cont-2");
+      const fallbackMountBefore = document.createElement("span");
+      fallbackMountBefore.setAttribute("data-spindle-mount", "message_body_before");
+      const fallbackMountAfter = document.createElement("span");
+      fallbackMountAfter.setAttribute("data-spindle-mount", "message_body_after");
+      fallbackRow.append(fallbackMountBefore, fallbackMountAfter);
+      document.body.append(fallbackRow);
+      h.setMessageElement("m-cont-2", fallbackRow);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-cont-2",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-2",
+          swipeId: 0,
+          hasContentOutput: false,
+        },
+      });
+      expect(bubbleRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(fallbackMountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(fallbackMountAfter.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      expect(h.getInjectCounts().activeInjections).toBe(1);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("StreamingIndicatorController keeps dots mounted across hasContentOutput and MESSAGE_EDITED for all 4 actions until run: null", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const row = document.createElement("div");
+      const bubbleMsg = document.createElement("div");
+      bubbleMsg.setAttribute("data-component", "BubbleMessage");
+      const bubbleInner = document.createElement("div");
+      const contentWrap = document.createElement("div");
+      const mountBefore = document.createElement("span");
+      mountBefore.setAttribute("data-spindle-mount", "message_body_before");
+      contentWrap.append(mountBefore);
+      bubbleInner.append(contentWrap);
+      bubbleMsg.append(bubbleInner);
+      row.append(bubbleMsg);
+      document.body.append(row);
+      h.setMessageElement("m-all-4", row);
+
+      const actions: Array<"guided_response" | "guided_regenerate" | "guided_swipe" | "guided_continue"> = [
+        "guided_response",
+        "guided_regenerate",
+        "guided_swipe",
+        "guided_continue",
+      ];
+
+      for (const [idx, actionId] of actions.entries()) {
+        // Reset MessageContent for blank-slot start on non-continue, or present for continue
+        contentWrap.querySelector('[data-component="MessageContent"]')?.remove();
+        if (actionId === "guided_continue") {
+          const mc = document.createElement("div");
+          mc.setAttribute("data-component", "MessageContent");
+          mc.textContent = "Base text";
+          contentWrap.append(mc);
+        }
+
+        const runId = `run-all-${idx}`;
+        h.emitFromBackend({
+          type: "gg:status",
+          run: {
+            runId,
+            actionId,
+            chatId: "chat-a",
+            startedAt: Date.now(),
+            messageId: "m-all-4",
+            swipeId: 0,
+            hasContentOutput: false,
+          },
+        });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+        // Reasoning-only edit keeps indicator
+        h.emitEvent("MESSAGE_EDITED", {
+          message: { id: "m-all-4", content: actionId === "guided_continue" ? "Base text" : "", reasoning: "Thinking...", swipe_id: 0 },
+        });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+        // Ensure MessageContent exists for streaming text, then emit hasContentOutput: true + MESSAGE_EDITED text chunks
+        if (!contentWrap.querySelector('[data-component="MessageContent"]')) {
+          const mc = document.createElement("div");
+          mc.setAttribute("data-component", "MessageContent");
+          mc.textContent = "Chunk 1";
+          contentWrap.append(mc);
+        }
+
+        h.emitFromBackend({
+          type: "gg:status",
+          run: {
+            runId,
+            actionId,
+            chatId: "chat-a",
+            startedAt: Date.now(),
+            messageId: "m-all-4",
+            swipeId: 0,
+            hasContentOutput: true,
+          },
+        });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+        const mc = contentWrap.querySelector('[data-component="MessageContent"]')!;
+        expect(mc.nextElementSibling?.querySelectorAll(".gg-streaming-indicator--after")).toHaveLength(1);
+
+        h.emitEvent("MESSAGE_EDITED", {
+          message: { id: "m-all-4", content: "Chunk 1 Chunk 2", swipe_id: 0 },
+        });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+        // Unmounts only when run becomes null (finish, abort/cancel, or error)
+        h.emitFromBackend({ type: "gg:status", run: null });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+        expect(h.getInjectCounts().activeInjections).toBe(0);
+      }
+    } finally {
+      teardown();
+    }
+  });
+
+  test("StreamingIndicatorController relocates blank-slot actions from message_body_before to MessageContent afterend via rAF without flicker", async () => {
+    const origRaf = globalThis.requestAnimationFrame;
+    const origCancelRaf = globalThis.cancelAnimationFrame;
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = (
+      cb: FrameRequestCallback,
+    ) => {
+      const id = nextRafId++;
+      rafQueue.set(id, cb);
+      return id;
+    };
+    (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = (
+      id: number,
+    ) => {
+      rafQueue.delete(id);
+    };
+
+    const flushRaf = () => {
+      const entries = [...rafQueue.entries()];
+      rafQueue.clear();
+      for (const [, cb] of entries) cb(16);
+    };
+
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const actionList: Array<"guided_response" | "guided_regenerate" | "guided_swipe"> = [
+        "guided_response",
+        "guided_regenerate",
+        "guided_swipe",
+      ];
+
+      for (const [idx, actionId] of actionList.entries()) {
+        const messageId = `m-reloc-${idx}`;
+        // 1. Run starts before row mounts -> rAF retries in "row" mode
+        h.emitFromBackend({
+          type: "gg:status",
+          run: {
+            runId: `run-reloc-${idx}`,
+            actionId,
+            chatId: "chat-a",
+            startedAt: Date.now(),
+            messageId,
+            swipeId: 0,
+            backgroundSwipe: false,
+          },
+        });
+        expect(rafQueue.size).toBe(1);
+
+        // Row mounts with blank eager slot (message_body_before, no MessageContent yet)
+        const row = document.createElement("div");
+        const contentWrap = document.createElement("div");
+        const mountBefore = document.createElement("span");
+        mountBefore.setAttribute("data-spindle-mount", "message_body_before");
+        contentWrap.append(mountBefore);
+        row.append(contentWrap);
+        document.body.append(row);
+        h.setMessageElement(messageId, row);
+
+        flushRaf();
+        expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+        expect(rafQueue.size).toBe(0);
+
+        // 2. Content output begins (MESSAGE_EDITED / hasContentOutput) BEFORE MessageContent renders in DOM
+        //    -> keeps fallback mounted AND schedules rAF retry in "content" mode
+        const injectCountBeforeWait = h.getInjectCounts().injectCalls;
+        h.emitEvent("MESSAGE_EDITED", {
+          message: { id: messageId, content: "First token", swipe_id: 0 },
+        });
+        expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+        expect(h.getInjectCounts().injectCalls).toBe(injectCountBeforeWait);
+        expect(rafQueue.size).toBe(1);
+
+        // Still not in DOM on first rAF -> stays on fallback and keeps retrying
+        flushRaf();
+        expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+        expect(h.getInjectCounts().injectCalls).toBe(injectCountBeforeWait);
+        expect(rafQueue.size).toBe(1);
+
+        // 3. React mounts <MessageContent> -> next rAF cleanly relocates to MessageContent "afterend"
+        const messageContent = document.createElement("div");
+        messageContent.setAttribute("data-component", "MessageContent");
+        messageContent.textContent = "First token";
+        contentWrap.append(messageContent);
+
+        flushRaf();
+        expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+        expect(messageContent.nextElementSibling).not.toBeNull();
+        expect(messageContent.nextElementSibling!.querySelectorAll(".gg-streaming-indicator--after")).toHaveLength(1);
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+        expect(rafQueue.size).toBe(0);
+
+        // Subsequent streaming updates do not re-inject
+        const injectCountAfterReloc = h.getInjectCounts().injectCalls;
+        h.emitEvent("MESSAGE_EDITED", {
+          message: { id: messageId, content: "First token second token", swipe_id: 0 },
+        });
+        expect(h.getInjectCounts().injectCalls).toBe(injectCountAfterReloc);
+
+        h.emitFromBackend({ type: "gg:status", run: null });
+        expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      }
+    } finally {
+      teardown();
+      (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = origRaf;
+      (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = origCancelRaf;
+    }
+  });
+
+  test("StreamingIndicatorController hides guided_continue and guided_regenerate on swipe-away and remounts on swipe-back while running", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const row = document.createElement("div");
+      const messageContent = document.createElement("div");
+      messageContent.setAttribute("data-component", "MessageContent");
+      messageContent.textContent = "Existing swipe 1 text";
+      row.append(messageContent);
+      document.body.append(row);
+      h.setMessageElement("m-cont-swipe", row);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-cont-swipe",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-swipe",
+          swipeId: 1,
+          hasContentOutput: false,
+        },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // User swipes to swipe 0 -> indicator hides
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-cont-swipe", swipe_id: 0, content: "Swipe 0 text" },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // User swipes back to swipe 1 while still running (even after hasContentOutput: true) -> indicator remounts
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-cont-swipe",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-swipe",
+          swipeId: 1,
+          hasContentOutput: true,
+        },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-cont-swipe", swipe_id: 1, content: "Existing swipe 1 text + more" },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // guided_regenerate with swipeId set also guards against swipe-away/back
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-regen-swipe",
+          actionId: "guided_regenerate",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-cont-swipe",
+          swipeId: 2,
+          hasContentOutput: true,
+        },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-cont-swipe", swipe_id: 0, content: "Swipe 0 text" },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-cont-swipe", swipe_id: 2, content: "Regen text" },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // Only run: null unmounts
+      h.emitFromBackend({ type: "gg:status", run: null });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("StreamingIndicatorController handles guided_swipe foreground swipe-away/back and backgroundSwipe visibility", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const row = document.createElement("div");
+      const mount = document.createElement("span");
+      mount.setAttribute("data-spindle-mount", "message_body_before");
+      row.append(mount);
+      document.body.append(row);
+      h.setMessageElement("m-swipe", row);
+
+      // 1. Foreground swipe (swipeId: 1) mounts -> swiping away to 0 (even with old content) unmounts -> swiping back to 1 remounts
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "swipe-fg",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-swipe",
+          swipeId: 1,
+          backgroundSwipe: false,
+        },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-swipe", swipe_id: 0, content: "Previous swipe content" },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-swipe", swipe_id: 1, content: "" },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // 2. Background swipe (swipeId: 2, backgroundSwipe: true) does NOT mount on old swipe,
+      //    but DOES mount when user navigates onto swipe 2 while still empty
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "swipe-bg",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-swipe",
+          swipeId: 2,
+          backgroundSwipe: true,
+        },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // Old swipe edit does not falsely mark new swipe as having content
+      h.emitEvent("MESSAGE_EDITED", {
+        message: { id: "m-swipe", swipe_id: 0, content: "Still old swipe" },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // Navigating forward onto swipe 2 while empty mounts the indicator
+      h.emitEvent("MESSAGE_SWIPED", {
+        message: { id: "m-swipe", swipe_id: 2, content: "" },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("StreamingIndicatorController unmounts cleanly on run: null, CHAT_CHANGED, and destroy()", async () => {
+    const origRaf = globalThis.requestAnimationFrame;
+    const origCancelRaf = globalThis.cancelAnimationFrame;
+    const cancelledRafs: number[] = [];
+    let nextRafId = 10;
+    (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = () =>
+      nextRafId++;
+    (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = (
+      id: number,
+    ) => {
+      cancelledRafs.push(id);
+    };
+
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const row = document.createElement("div");
+      const mount = document.createElement("span");
+      mount.setAttribute("data-spindle-mount", "message_body_before");
+      row.append(mount);
+      document.body.append(row);
+      h.setMessageElement("m-life", row);
+
+      // Unmounts on run: null
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-null-test",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-life",
+          swipeId: 0,
+        },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      h.emitFromBackend({ type: "gg:status", run: null });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.getInjectCounts().activeInjections).toBe(0);
+
+      // Unmounts on CHAT_CHANGED
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-chat-test",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-life",
+          swipeId: 0,
+        },
+      });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      h.setChat("chat-b");
+      h.emitEvent("CHAT_CHANGED", { chatId: "chat-b" });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // Switching back to chat-a while run is still active & empty remounts, then teardown() unmounts
+      h.setChat("chat-a");
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      teardown();
+      expect(mount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.getInjectCounts().activeInjections).toBe(0);
+
+      // Pending rAF retry is cancelled on destroy()
+      const h2 = createFrontendHarness({ initialChatId: "chat-a" });
+      const teardown2 = setup(h2.ctx);
+      h2.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+      h2.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-raf-cancel",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-unpainted",
+          swipeId: 0,
+        },
+      });
+      teardown2();
+      expect(cancelledRafs.length).toBeGreaterThan(0);
+    } finally {
+      teardown();
+      (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = origRaf;
+      (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = origCancelRaf;
+    }
+  });
+
+  test("PillMetricsController persists tokenCount and generationMetrics onto active swipe via extra-only updateMessage", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    h.setChatMessages("chat-a", [
+      {
+        id: "msg-1",
+        chat_id: "chat-a",
+        swipe_id: 1,
+        extra: { spindle_metadata: { preset_contexts: { 1: { preset_id: "p1" } } } },
+      },
+    ]);
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const metrics = {
+        ttft: 320,
+        tps: 44.5,
+        durationMs: 2100,
+        wasStreaming: true,
+        model: "gpt-4o",
+        provider: "openai",
+        presetId: "p1",
+        presetName: "Default",
+      };
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-1",
+        swipeId: 1,
+        tokenCount: 128,
+        generationMetrics: metrics,
+      });
+      await flushMicrotasks();
+
+      expect(h.getGetMessagesCalls()).toEqual([
+        { chatId: "chat-a", options: { limit: 50, tail: true } },
+      ]);
+      const updates = h.getUpdateMessageCalls();
+      expect(updates).toHaveLength(1);
+      expect(updates[0]!.chatId).toBe("chat-a");
+      expect(updates[0]!.messageId).toBe("msg-1");
+      expect("content" in updates[0]!.input).toBe(false);
+      expect(updates[0]!.input).toEqual({
+        extra: {
+          spindle_metadata: { preset_contexts: { 1: { preset_id: "p1" } } },
+          tokenCount: 128,
+          generationMetrics: metrics,
+        },
+      });
+    } finally {
+      teardown();
+    }
+  });
+
+  test("PillMetricsController defers background-swipe metrics until MESSAGE_SWIPED activates targetSwipeId", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    // User stayed on swipe 0 while background guided_swipe generated swipe 2
+    h.setChatMessages("chat-a", [
+      {
+        id: "msg-bg",
+        chat_id: "chat-a",
+        swipe_id: 0,
+        extra: { tokenCount: 50, generationMetrics: { durationMs: 800, wasStreaming: true, model: "old-model" } },
+      },
+    ]);
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const swipe2Metrics = {
+        ttft: 150,
+        tps: 60.2,
+        durationMs: 1400,
+        wasStreaming: true,
+        model: "claude-sonnet",
+        provider: "anthropic",
+        presetId: "p2",
+        presetName: "Creative",
+      };
+
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-bg",
+        swipeId: 2,
+        tokenCount: 240,
+        generationMetrics: swipe2Metrics,
+      });
+      await flushMicrotasks();
+
+      // Must NOT clobber swipe 0
+      expect(h.getUpdateMessageCalls()).toHaveLength(0);
+
+      // Swiping to swipe 1 still must NOT flush swipe 2's metrics
+      h.setChatMessages("chat-a", [
+        { id: "msg-bg", chat_id: "chat-a", swipe_id: 1, extra: {} },
+      ]);
+      h.emitEvent("MESSAGE_SWIPED", {
+        chatId: "chat-a",
+        message: { id: "msg-bg", chat_id: "chat-a", swipe_id: 1, extra: {} },
+      });
+      await flushMicrotasks();
+      expect(h.getUpdateMessageCalls()).toHaveLength(0);
+
+      // Swiping onto swipe 2 flushes the queued metrics onto swipe 2
+      h.setChatMessages("chat-a", [
+        { id: "msg-bg", chat_id: "chat-a", swipe_id: 2, extra: { spindle_metadata: { ok: true } } },
+      ]);
+      h.emitEvent("MESSAGE_SWIPED", {
+        chatId: "chat-a",
+        message: { id: "msg-bg", chat_id: "chat-a", swipe_id: 2, extra: { spindle_metadata: { ok: true } } },
+      });
+      await flushMicrotasks();
+
+      const updates = h.getUpdateMessageCalls();
+      expect(updates).toHaveLength(1);
+      expect("content" in updates[0]!.input).toBe(false);
+      expect(updates[0]!.input).toEqual({
+        extra: {
+          spindle_metadata: { ok: true },
+          tokenCount: 240,
+          generationMetrics: swipe2Metrics,
+        },
+      });
+    } finally {
+      teardown();
+    }
+  });
+
+  test("PillMetricsController passes explicit null to clear stale generationMetrics while updating tokenCount", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    h.setChatMessages("chat-a", [
+      {
+        id: "msg-cont",
+        chat_id: "chat-a",
+        swipe_id: 0,
+        extra: {
+          spindle_metadata: { keep: 1 },
+          tokenCount: 190,
+          generationMetrics: {
+            ttft: 100,
+            tps: 50,
+            durationMs: 1200,
+            wasStreaming: true,
+            model: "gpt-4o",
+          },
+        },
+      },
+    ]);
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-cont",
+        swipeId: 0,
+        tokenCount: 95,
+        generationMetrics: null,
+      });
+      await flushMicrotasks();
+
+      const updates = h.getUpdateMessageCalls();
+      expect(updates).toHaveLength(1);
+      expect("content" in updates[0]!.input).toBe(false);
+      const extra = updates[0]!.input.extra as Record<string, unknown>;
+      expect(extra.spindle_metadata).toEqual({ keep: 1 });
+      expect(extra.tokenCount).toBe(95);
+      expect("generationMetrics" in extra).toBe(true);
+      expect(extra.generationMetrics).toBeNull();
+    } finally {
+      teardown();
+    }
+  });
+
+  test("PillMetricsController coalesces concurrent updates, retries once on transient error, drops deleted/denied cleanly, and aborts safely on teardown", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    h.setChatMessages("chat-a", [
+      { id: "msg-race", chat_id: "chat-a", swipe_id: 0, extra: {} },
+    ]);
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 1. Coalescing while first getMessages is in flight
+      let resolveFirstRead!: (v: unknown) => void;
+      let readCount = 0;
+      h.setCustomGetMessages(async (chatId) => {
+        readCount += 1;
+        if (readCount === 1) {
+          return new Promise((resolve) => {
+            resolveFirstRead = resolve;
+          });
+        }
+        return {
+          data: [{ id: "msg-race", chat_id: chatId, swipe_id: 0, extra: {} }],
+          total: 1,
+        };
+      });
+
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-race",
+        swipeId: 0,
+        tokenCount: 10,
+        generationMetrics: { durationMs: 100, wasStreaming: true },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(readCount).toBe(1);
+
+      // Newer event arrives before first read resolves -> serialized follow-up applies tokenCount: 25
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-race",
+        swipeId: 0,
+        tokenCount: 25,
+        generationMetrics: null,
+      });
+
+      resolveFirstRead({
+        data: [{ id: "msg-race", chat_id: "chat-a", swipe_id: 0, extra: {} }],
+        total: 1,
+      });
+      await flushMicrotasks();
+
+      const updates = h.getUpdateMessageCalls();
+      expect(updates.length).toBeGreaterThanOrEqual(1);
+      expect(updates[updates.length - 1]!.input).toEqual({
+        extra: { tokenCount: 25, generationMetrics: null },
+      });
+
+      // 2. Transient updateMessage error retries once and succeeds
+      h.setCustomGetMessages(null);
+      let updateAttempts = 0;
+      h.setCustomUpdateMessage(async () => {
+        updateAttempts += 1;
+        if (updateAttempts === 1) {
+          throw new Error("Temporary network glitch");
+        }
+        return { id: "msg-race" };
+      });
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-race",
+        swipeId: 0,
+        tokenCount: 77,
+      });
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(updateAttempts).toBe(2);
+
+      // 3. Deleted message (not in getMessages) and PERMISSION_DENIED drop cleanly without throwing
+      h.setCustomUpdateMessage(null);
+      h.setChatMessages("chat-a", []);
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-deleted",
+        swipeId: 0,
+        tokenCount: 50,
+      });
+      await flushMicrotasks();
+
+      h.setCustomGetMessages(async () => {
+        throw new Error("PERMISSION_DENIED:chats");
+      });
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-denied",
+        swipeId: 0,
+        tokenCount: 50,
+      });
+      await flushMicrotasks();
+
+      // 4. Teardown while getMessages is pending prevents updateMessage from running
+      const updatesBeforeTeardown = h.getUpdateMessageCalls().length;
+      let resolvePendingRead!: (v: unknown) => void;
+      h.setCustomGetMessages(
+        () =>
+          new Promise((resolve) => {
+            resolvePendingRead = resolve;
+          }),
+      );
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-race",
+        swipeId: 0,
+        tokenCount: 999,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(typeof resolvePendingRead).toBe("function");
+
+      teardown();
+      resolvePendingRead({
+        data: [{ id: "msg-race", chat_id: "chat-a", swipe_id: 0, extra: {} }],
+        total: 1,
+      });
+      await flushMicrotasks();
+      expect(h.getUpdateMessageCalls().length).toBe(updatesBeforeTeardown);
+
+      // 5. Direct controller unit check: supports ctx.domain.chats.getMessages + onChatChanged
+      let domainReads = 0;
+      const domainUpdates: unknown[] = [];
+      const domainCtx = {
+        domain: {
+          chats: {
+            getMessages: async (chatId: string) => {
+              domainReads += 1;
+              return {
+                data: [{ id: "m-dom", chat_id: chatId, swipe_id: 0, extra: {} }],
+                total: 1,
+              };
+            },
+          },
+        },
+        chats: {
+          updateMessage: async (_chatId: string, _msgId: string, input: unknown) => {
+            domainUpdates.push(input);
+            return {};
+          },
+        },
+        getActiveChat: () => ({ chatId: "chat-dom", characterId: null }),
+      } as unknown as SpindleFrontendContext;
+
+      const ctrl = new PillMetricsController(domainCtx);
+      ctrl.handleMetricsEvent({
+        type: "gg:generation_metrics",
+        chatId: "chat-dom",
+        messageId: "m-dom",
+        swipeId: 0,
+        tokenCount: 42,
+      });
+      await flushMicrotasks();
+      expect(domainReads).toBe(1);
+      expect(domainUpdates).toEqual([{ extra: { tokenCount: 42 } }]);
+      ctrl.onChatChanged("chat-dom");
+      ctrl.destroy();
+    } finally {
+      teardown();
+    }
+  });
+
+  test("PillMetricsController drops deleted swipe metrics and decrements queued swipeId when an earlier swipe is deleted", async () => {
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    h.setChatMessages("chat-a", [
+      { id: "msg-del", chat_id: "chat-a", swipe_id: 1, extra: {} },
+    ]);
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const shiftedMetrics = {
+        ttft: 110,
+        tps: 55.4,
+        durationMs: 950,
+        wasStreaming: true,
+        model: "gpt-4o",
+      };
+
+      // Queue metrics for swipe 0 (will be deleted) and swipe 2 (will shift down to swipe 1)
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-del",
+        swipeId: 0,
+        tokenCount: 111,
+      });
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-del",
+        swipeId: 2,
+        tokenCount: 222,
+        generationMetrics: shiftedMetrics,
+      });
+      await flushMicrotasks();
+      expect(h.getUpdateMessageCalls()).toHaveLength(0);
+
+      // Delete swipe 0 while currently viewing new swipe 0
+      h.setChatMessages("chat-a", [
+        { id: "msg-del", chat_id: "chat-a", swipe_id: 0, extra: {} },
+      ]);
+      h.emitEvent("MESSAGE_SWIPED", {
+        chatId: "chat-a",
+        action: "deleted",
+        swipeId: 0,
+        message: { id: "msg-del", chat_id: "chat-a", swipe_id: 0, extra: {} },
+      });
+      await flushMicrotasks();
+
+      // Deleted swipe 0 entry must NOT flush onto the new swipe 0, and old swipe 2 waits at swipe 1
+      expect(h.getUpdateMessageCalls()).toHaveLength(0);
+
+      // Navigate onto new swipe 1 (formerly swipe 2) -> shifted metrics flush cleanly
+      h.setChatMessages("chat-a", [
+        {
+          id: "msg-del",
+          chat_id: "chat-a",
+          swipe_id: 1,
+          extra: { spindle_metadata: { kept: true } },
+        },
+      ]);
+      h.emitEvent("MESSAGE_SWIPED", {
+        chatId: "chat-a",
+        action: "navigated",
+        swipeId: 1,
+        message: { id: "msg-del", chat_id: "chat-a", swipe_id: 1, extra: {} },
+      });
+      await flushMicrotasks();
+
+      const updates = h.getUpdateMessageCalls();
+      expect(updates).toHaveLength(1);
+      expect(updates[0]!.messageId).toBe("msg-del");
+      expect(updates[0]!.input).toEqual({
+        extra: {
+          spindle_metadata: { kept: true },
+          tokenCount: 222,
+          generationMetrics: shiftedMetrics,
+        },
+      });
+    } finally {
+      teardown();
+    }
+  });
+
+  test("guided_continue anchor click closes open drop-up menu without triggering guided_continue, Tab/blur cancel cleanly, and positionContinueMenu respects scale / --lumiverse-ui-scale", () => {
+    expect(GUIDED_GENERATIONS_CSS).toContain(
+      "max-width: calc((100vw - 16px) / var(--lumiverse-ui-scale, 1));",
+    );
+
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origDateNow = Date.now;
+    let fakeNow = 50_000;
+    const pendingHoldTimers = new Map<number, () => void>();
+    let nextTimerId = 98_000;
+
+    Date.now = () => fakeNow;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextTimerId;
+        pendingHoldTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (pendingHoldTimers.has(num)) {
+        pendingHoldTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const Win = document.defaultView!;
+    const origGetComputedStyle = Win.getComputedStyle;
+
+    try {
+      const triggered: string[] = [];
+      const actionsMount = document.createElement("span");
+      document.body.append(actionsMount);
+      const fakeCtx = {
+        ui: { mount: () => actionsMount },
+      } as unknown as SpindleFrontendContext;
+
+      const toolbar = new InputToolbarController(fakeCtx, {
+        onTriggerAction: (actionId) => triggered.push(actionId),
+        onAbortAction: () => {},
+        onRestoreLatest: () => {},
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      });
+
+      toolbar.render({
+        settings: createDefaultSettings(),
+        activeRun: null,
+        recovery: [],
+        hasActiveChat: true,
+      });
+
+      const continueBtn = actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_continue"]',
+      )!;
+      const getMenu = () => document.body.querySelector<HTMLDivElement>(".gg-dropup-menu");
+      const PointerEvt = Win.PointerEvent;
+      const MouseEvt = Win.MouseEvent;
+      const KeyEvt = Win.KeyboardEvent;
+
+      Object.defineProperty(Win, "innerWidth", { configurable: true, value: 1000 });
+      Object.defineProperty(Win, "innerHeight", { configurable: true, value: 800 });
+      continueBtn.getBoundingClientRect = () =>
+        ({
+          top: 600,
+          bottom: 626,
+          left: 250,
+          right: 280,
+          width: 30,
+          height: 26,
+          x: 250,
+          y: 600,
+          toJSON: () => ({}),
+        }) as DOMRect;
+
+      // 1. CSS `scale` property (when zoom is 1) scales menu position
+      Win.getComputedStyle = (() =>
+        ({
+          zoom: "1",
+          getPropertyValue: (prop: string) => (prop === "scale" ? "1.25" : ""),
+        }) as unknown as CSSStyleDeclaration) as typeof Win.getComputedStyle;
+
+      continueBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      let menu = getMenu()!;
+      expect(menu).not.toBeNull();
+      expect(menu.style.left).toBe("200px");
+      expect(menu.style.bottom).toBe("166px");
+
+      // Clicking guided_continue button while menu is open (past 150ms grace window) toggles menu closed without triggering guided_continue
+      fakeNow += 200;
+      continueBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+        }),
+      );
+      continueBtn.dispatchEvent(new MouseEvt("click", { bubbles: true, cancelable: true }));
+      expect(getMenu()).toBeNull();
+      expect(continueBtn.getAttribute("aria-expanded")).toBe("false");
+      expect(triggered).toHaveLength(0);
+
+      // 2. `--lumiverse-ui-scale` fallback (when zoom is 1 and scale is "none") scales menu position
+      Win.getComputedStyle = (() =>
+        ({
+          zoom: "1",
+          getPropertyValue: (prop: string) => (prop === "--lumiverse-ui-scale" ? "2" : "none"),
+        }) as unknown as CSSStyleDeclaration) as typeof Win.getComputedStyle;
+
+      continueBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      menu = getMenu()!;
+      expect(menu.style.left).toBe("125px"); // 250 / 2
+      expect(menu.style.bottom).toBe("106px"); // (800 - 600) / 2 + 6
+
+      // Tab closes menu and restores focus to anchor button
+      menu.dispatchEvent(new KeyEvt("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+      expect(getMenu()).toBeNull();
+      expect(document.activeElement).toBe(continueBtn);
+
+      // Window blur cancels active 450ms hold timer
+      continueBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+      expect(pendingHoldTimers.size).toBe(1);
+      Win.dispatchEvent(new Win.Event("blur"));
+      expect(pendingHoldTimers.size).toBe(0);
+      expect(continueBtn.classList.contains("is-holding")).toBe(false);
+
+      toolbar.destroy();
+    } finally {
+      Win.getComputedStyle = origGetComputedStyle;
+      Date.now = origDateNow;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("SettingsDrawerController preserves just-saved edits when flushing deferred pendingView, and teardown flushes pending debounced saves before marking destroyed", async () => {
+    // 1. Deferred pendingView merges this.currentSettings on flush
+    const tabRoot = document.createElement("div");
+    document.body.append(tabRoot);
+    const saved: GuidedGenerationsSettings[] = [];
+
+    const fakeCtx = {
+      connections: { getActive: () => ({ activeProfileId: "c1" }) },
+      ui: {
+        registerDrawerTab: () => ({
+          root: tabRoot,
+          tabId: "t-pending",
+          setTitle: () => {},
+          setShortName: () => {},
+          setBadge: () => {},
+          activate: () => {},
+          destroy: () => {},
+          onActivate: () => () => {},
+        }),
+      },
+      components: {
+        mountSwitch: (
+          target: string | Element,
+          opts: { checked?: boolean; ariaLabel?: string; onChange?: (v: boolean) => void },
+        ) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const btn = document.createElement("button");
+          btn.setAttribute("role", "switch");
+          let checked = Boolean(opts.checked);
+          btn.setAttribute("aria-checked", String(checked));
+          if (opts.ariaLabel) btn.setAttribute("aria-label", opts.ariaLabel);
+          btn.addEventListener("click", () => {
+            checked = !checked;
+            btn.setAttribute("aria-checked", String(checked));
+            opts.onChange?.(checked);
+          });
+          el.append(btn);
+          return {
+            componentId: "s",
+            element: el as HTMLElement,
+            update: () => {},
+            destroy: () => el.replaceChildren(),
+          };
+        },
+        mountSelect: (
+          target: string | Element,
+          opts: {
+            options?: Array<{ value: string; label: string }>;
+            value?: string;
+            ariaLabel?: string;
+          },
+        ) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const sel = document.createElement("select");
+          if (opts.ariaLabel) sel.setAttribute("aria-label", opts.ariaLabel);
+          for (const opt of opts.options ?? []) {
+            const optionEl = document.createElement("option");
+            optionEl.value = opt.value;
+            optionEl.textContent = opt.label;
+            sel.append(optionEl);
+          }
+          sel.value = opts.value ?? "";
+          el.append(sel);
+          return {
+            componentId: "sel",
+            element: el as HTMLElement,
+            update: () => {},
+            destroy: () => el.replaceChildren(),
+          };
+        },
+        mountModelCombobox: (target: string | Element, opts: { value?: string }) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const input = document.createElement("input");
+          input.value = opts.value ?? "";
+          el.append(input);
+          return {
+            componentId: "mc",
+            element: el as HTMLElement,
+            update: () => {},
+            destroy: () => el.replaceChildren(),
+            getValue: () => input.value,
+            refresh: () => {},
+          };
+        },
+        mountTextArea: (
+          target: string | Element,
+          opts: { value?: string; ariaLabel?: string; onChange?: (v: string) => void },
+        ) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const ta = document.createElement("textarea");
+          ta.value = opts.value ?? "";
+          if (opts.ariaLabel) ta.setAttribute("aria-label", opts.ariaLabel);
+          ta.addEventListener("input", () => opts.onChange?.(ta.value));
+          el.append(ta);
+          return {
+            componentId: "ta",
+            element: el as HTMLElement,
+            update: () => {},
+            destroy: () => el.replaceChildren(),
+            getValue: () => ta.value,
+          };
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const drawer = new SettingsDrawerController(fakeCtx, {
+      onRefresh: () => {},
+      onSaveSettings: async (next) => {
+        saved.push(next);
+      },
+      onRestoreEntry: () => {},
+      onClearRecovery: async () => {},
+    });
+
+    const initialView = makeBootstrapView();
+    initialView.settings.actions.guided_response.instructionTemplate = "Initial template";
+    drawer.render(initialView);
+
+    // Edit switch synchronously (applyRegex -> false) + edit textarea debounced
+    const regexSwitch = tabRoot.querySelector<HTMLButtonElement>(
+      'button[role="switch"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
+    )!;
+    regexSwitch.click();
+
+    const textarea = tabRoot.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Guided Response Guidance Template"]',
+    )!;
+    textarea.focus();
+    textarea.value = "Just-saved template";
+    textarea.dispatchEvent(new (document.defaultView!.Event)("input", { bubbles: true }));
+
+    // Stale view arrives while editing (new preset added, but old settings snapshot)
+    const staleView = makeBootstrapView({
+      presets: [
+        { id: "p1", name: "Default" },
+        { id: "p2", name: "Added Preset" },
+      ],
+    });
+    staleView.settings.actions.guided_response.instructionTemplate = "Initial template";
+    staleView.settings.actions.guided_response.applyRegex = true;
+    drawer.render(staleView);
+    expect(tabRoot.textContent).not.toContain("Added Preset");
+
+    // Blur flushes debounced save AND applies deferred pendingView with currentSettings preserved
+    textarea.blur();
+    textarea.dispatchEvent(new (document.defaultView!.FocusEvent)("focusout", { bubbles: true }));
+    await flushMicrotasks();
+
+    expect(saved[saved.length - 1]!.actions.guided_response.instructionTemplate).toBe(
+      "Just-saved template",
+    );
+    expect(saved[saved.length - 1]!.actions.guided_response.applyRegex).toBe(false);
+    expect(tabRoot.textContent).toContain("Added Preset");
+
+    const rebuiltTextarea = tabRoot.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Guided Response Guidance Template"]',
+    )!;
+    const rebuiltRegexSwitch = tabRoot.querySelector<HTMLButtonElement>(
+      'button[role="switch"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
+    )!;
+    expect(rebuiltTextarea.value).toBe("Just-saved template");
+    expect(rebuiltRegexSwitch.getAttribute("aria-checked")).toBe("false");
+    drawer.destroy();
+
+    // 2. setup(ctx) teardown flushes pending debounced saves before marking destroyed
+    const h = createFrontendHarness({ initialChatId: "chat-a" });
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+    await flushMicrotasks();
+
+    const maxDraftsInput = h.tabRoot.querySelector<HTMLInputElement>(
+      'input[aria-label="Max saved drafts"]',
+    )!;
+    expect(maxDraftsInput).not.toBeNull();
+    maxDraftsInput.focus();
+    maxDraftsInput.value = "27";
+    maxDraftsInput.dispatchEvent(new (document.defaultView!.Event)("input", { bubbles: true }));
+
+    expect(h.sentRpcs.filter((r) => r.action === "save_settings")).toHaveLength(0);
+    teardown();
+
+    const saveRpcs = h.sentRpcs.filter((r) => r.action === "save_settings");
+    expect(saveRpcs).toHaveLength(1);
+    expect((saveRpcs[0]!.input as GuidedGenerationsSettings).inputRecovery.maxEntries).toBe(27);
   });
 });

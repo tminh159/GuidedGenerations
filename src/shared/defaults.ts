@@ -1,4 +1,5 @@
 import type {
+  GuidancePosition,
   GuidedActionConfig,
   GuidedActionId,
   GuidedGenerationsSettings,
@@ -15,6 +16,69 @@ export const GUIDED_ACTION_ORDER: readonly GuidedActionId[] = [
 ] as const;
 
 export const DEFAULT_TOOLBAR_PLACEMENT: ToolbarPlacement = "after_native";
+
+export const DEFAULT_GUIDANCE_POSITION: GuidancePosition = "before_post_history";
+
+export const DEFAULT_GUIDANCE_DEPTH = 0;
+
+export const DEFAULT_APPLY_REGEX = true;
+
+export const GUIDANCE_POSITION_OPTIONS: ReadonlyArray<{
+  value: GuidancePosition;
+  label: string;
+  shortLabel: string;
+  sublabel: string;
+}> = [
+  {
+    value: "before_post_history",
+    label: "Before Post-History (after chat history)",
+    shortLabel: "Before Post-History",
+    sublabel: "Places guidance right after chat history and before post-history preset blocks.",
+  },
+  {
+    value: "in_history",
+    label: "In History (at depth)",
+    shortLabel: "In History",
+    sublabel: "Splices guidance inside chat history N messages back from the end.",
+  },
+  {
+    value: "pre_history",
+    label: "Pre-History (before chat history)",
+    shortLabel: "Pre-History",
+    sublabel: "Places guidance after pre-history system prompts and before the first chat turn.",
+  },
+  {
+    value: "post_history",
+    label: "Post-History (end of prompt)",
+    shortLabel: "Post-History",
+    sublabel: "Appends guidance at the very end of the assembled prompt (before any trailing prefill).",
+  },
+];
+
+export function normalizeGuidancePosition(
+  value: unknown,
+  fallback: GuidancePosition = DEFAULT_GUIDANCE_POSITION,
+): GuidancePosition {
+  if (
+    value === "before_post_history" ||
+    value === "in_history" ||
+    value === "pre_history" ||
+    value === "post_history"
+  ) {
+    return value;
+  }
+  return fallback;
+}
+
+export function normalizeGuidanceDepth(
+  value: unknown,
+  fallback: number = DEFAULT_GUIDANCE_DEPTH,
+): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.min(999, Math.floor(value)));
+  }
+  return Math.max(0, Math.min(999, Math.floor(fallback)));
+}
 
 export const DEFAULT_BUTTON_ORDER: readonly ToolbarOptionId[] = [
   ...GUIDED_ACTION_ORDER,
@@ -150,8 +214,11 @@ export const DEFAULT_ACTION_CONFIGS: Record<GuidedActionId, GuidedActionConfig> 
     model: null,
     presetId: null,
     injectionRole: "system",
+    guidancePosition: DEFAULT_GUIDANCE_POSITION,
+    guidanceDepth: DEFAULT_GUIDANCE_DEPTH,
     instructionTemplate: "[OOC Guidance for the next response: {{input}}]",
     clearInputOnRun: true,
+    applyRegex: DEFAULT_APPLY_REGEX,
   },
   guided_continue: {
     enabled: true,
@@ -159,9 +226,12 @@ export const DEFAULT_ACTION_CONFIGS: Record<GuidedActionId, GuidedActionConfig> 
     model: null,
     presetId: null,
     injectionRole: "system",
+    guidancePosition: DEFAULT_GUIDANCE_POSITION,
+    guidanceDepth: DEFAULT_GUIDANCE_DEPTH,
     instructionTemplate:
       "[OOC Continuation Guidance — continue seamlessly from the current ending: {{input}}]",
     clearInputOnRun: true,
+    applyRegex: DEFAULT_APPLY_REGEX,
   },
   guided_regenerate: {
     enabled: true,
@@ -169,8 +239,11 @@ export const DEFAULT_ACTION_CONFIGS: Record<GuidedActionId, GuidedActionConfig> 
     model: null,
     presetId: null,
     injectionRole: "system",
+    guidancePosition: DEFAULT_GUIDANCE_POSITION,
+    guidanceDepth: DEFAULT_GUIDANCE_DEPTH,
     instructionTemplate: "[OOC Guidance for regenerating this response: {{input}}]",
     clearInputOnRun: true,
+    applyRegex: DEFAULT_APPLY_REGEX,
   },
   guided_swipe: {
     enabled: true,
@@ -178,8 +251,11 @@ export const DEFAULT_ACTION_CONFIGS: Record<GuidedActionId, GuidedActionConfig> 
     model: null,
     presetId: null,
     injectionRole: "system",
+    guidancePosition: DEFAULT_GUIDANCE_POSITION,
+    guidanceDepth: DEFAULT_GUIDANCE_DEPTH,
     instructionTemplate: "[OOC Guidance for this alternative response: {{input}}]",
     clearInputOnRun: true,
+    applyRegex: DEFAULT_APPLY_REGEX,
   },
   guided_impersonate: {
     enabled: true,
@@ -187,8 +263,11 @@ export const DEFAULT_ACTION_CONFIGS: Record<GuidedActionId, GuidedActionConfig> 
     model: null,
     presetId: null,
     injectionRole: "system",
+    guidancePosition: DEFAULT_GUIDANCE_POSITION,
+    guidanceDepth: DEFAULT_GUIDANCE_DEPTH,
     instructionTemplate: "[Write the user's next message following this outline: {{input}}]",
     clearInputOnRun: true,
+    applyRegex: DEFAULT_APPLY_REGEX,
   },
 };
 

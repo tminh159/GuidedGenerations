@@ -3,20 +3,27 @@ import type {
   SpindleDrawerTabHandle,
   SpindleFrontendContext,
   SpindleModelComboboxHandle,
+  SpindleNumericInputHandle,
   SpindleSelectOption,
 } from "lumiverse-spindle-types";
 import {
   ACTION_METADATA,
+  DEFAULT_APPLY_REGEX,
   DEFAULT_BUTTON_ORDER,
+  DEFAULT_GUIDANCE_DEPTH,
+  GUIDANCE_POSITION_OPTIONS,
   GUIDED_ACTION_ORDER,
   TOOLBAR_PLACEMENT_OPTIONS,
   normalizeButtonOrder,
+  normalizeGuidanceDepth,
+  normalizeGuidancePosition,
   normalizeToolbarPlacement,
 } from "../shared/defaults";
 import type {
   ConnectionOptionSummary,
   ExtensionBootstrapView,
   GuidanceInjectionRole,
+  GuidancePosition,
   GuidedActionId,
   GuidedGenerationsSettings,
   PresetOptionSummary,
@@ -63,6 +70,7 @@ interface RecoverySectionUi {
   body: HTMLDivElement;
   listEl: HTMLDivElement | null;
   maxEntries: number;
+  recoveryCount: number;
 }
 
 export class SettingsDrawerController {
@@ -120,7 +128,9 @@ export class SettingsDrawerController {
         queueMicrotask(() => {
           if (this.destroyed) return;
           if (this.pendingView && !this.isEditingDrawerInput()) {
-            const next = this.pendingView;
+            const next: ExtensionBootstrapView = this.currentSettings
+              ? { ...this.pendingView, settings: this.currentSettings }
+              : this.pendingView;
             this.pendingView = null;
             this.render(next, { force: true });
           }
@@ -174,6 +184,7 @@ export class SettingsDrawerController {
       this.currentSettings?.inputRecovery.maxEntries ??
       10;
     this.recoveryUi.maxEntries = maxEntries;
+    this.recoveryUi.recoveryCount = recovery.length;
     this.recoveryUi.setBadge(
       recovery.length > 0 ? String(recovery.length) : "",
       recovery.length === 0,
@@ -290,6 +301,30 @@ export class SettingsDrawerController {
       warn.setAttribute("aria-live", "assertive");
       warn.textContent = `Missing extension permissions (${missingPerms.join(", ")}). Grant all permissions in Extension Manager so actions and dropdowns work properly.`;
       root.append(warn);
+    }
+
+    const missingFeaturePerms: string[] = [];
+    const degradedNotes: string[] = [];
+    if (view.permissions.interceptor === false) {
+      missingFeaturePerms.push("interceptor");
+      degradedNotes.push(
+        "preset-aware guidance placement (pre-history, in-history, before/after post-history) and swipe turn matching fall back to basic heuristic placement",
+      );
+    }
+    if (view.permissions.regex_scripts === false) {
+      missingFeaturePerms.push("regex_scripts");
+      degradedNotes.push(
+        "Lumiverse regex scripts are skipped on guidance prompts and generated/impersonated outputs",
+      );
+    }
+
+    if (missingFeaturePerms.length > 0) {
+      const featureWarn = document.createElement("div");
+      featureWarn.className = "gg-notice is-warn";
+      featureWarn.setAttribute("role", "alert");
+      featureWarn.setAttribute("aria-live", "assertive");
+      featureWarn.textContent = `Optional permissions not granted (${missingFeaturePerms.join(", ")}): ${degradedNotes.join("; ")}. Grant them in Extension Manager for full functionality.`;
+      root.append(featureWarn);
     }
 
     if (view.catalogWarnings && view.catalogWarnings.length > 0) {
@@ -688,6 +723,25 @@ export class SettingsDrawerController {
       }),
     );
 
+    // Per-action Lumiverse regex scripts toggle
+    const regexRow = document.createElement("div");
+    regexRow.className = "gg-row";
+    const regexLabel = document.createElement("span");
+    regexLabel.className = "gg-field-label";
+    regexLabel.textContent = "Apply Lumiverse regex scripts";
+    const regexSlot = document.createElement("div");
+    regexRow.append(regexLabel, regexSlot);
+    body.append(regexRow);
+
+    this.handles.push(
+      this.ctx.components.mountSwitch(regexSlot, {
+        checked: cfg.applyRegex ?? DEFAULT_APPLY_REGEX,
+        size: "sm",
+        ariaLabel: `Apply Lumiverse regex scripts for ${meta.label}`,
+        onChange: (checked) => savePatch({ applyRegex: checked }),
+      }),
+    );
+
     const activeConnectionId = getActiveConnectionId(this.ctx);
     let modelHandle: SpindleModelComboboxHandle | null = null;
 
@@ -765,9 +819,58 @@ export class SettingsDrawerController {
       }),
     );
 
+    // Guidance position & conditional In-history depth
+    const initialPosition = normalizeGuidancePosition(cfg.guidancePosition);
+    const initialDepth = normalizeGuidanceDepth(cfg.guidanceDepth);
+    let depthControl: { setDisabled: (disabled: boolean) => void } | null = null;
+
+    const depthFieldId = `gg-${actionId}-guidance-depth`;
+    const depthField = createFieldContainer("In-History Depth (0–999)", depthFieldId);
+    const syncDepthFieldState = (pos: GuidancePosition) => {
+      const isInHistory = pos === "in_history";
+      depthField.wrap.style.display = isInHistory ? "" : "none";
+      depthControl?.setDisabled(!isInHistory);
+    };
+
+    const positionField = createFieldContainer("Guidance Position");
+    body.append(positionField.wrap, depthField.wrap);
+    this.handles.push(
+      this.ctx.components.mountSelect(positionField.slot, {
+        options: GUIDANCE_POSITION_OPTIONS.map((opt) => ({
+          value: opt.value,
+          label: opt.label,
+          sublabel: opt.sublabel,
+        })),
+        value: initialPosition,
+        ariaLabel: `${meta.label} Guidance Position`,
+        onChange: (val) => {
+          const nextPosition = normalizeGuidancePosition(val);
+          savePatch({ guidancePosition: nextPosition });
+          syncDepthFieldState(nextPosition);
+        },
+      }),
+    );
+
+    depthControl = this.mountBoundedIntegerField({
+      slot: depthField.slot,
+      fieldId: depthFieldId,
+      ariaLabel: `${meta.label} In-history depth`,
+      debounceKey: `${actionId}:depth`,
+      min: 0,
+      max: 999,
+      defaultValue: DEFAULT_GUIDANCE_DEPTH,
+      placeholder: "0",
+      initialValue: initialDepth,
+      disabled: initialPosition !== "in_history",
+      onCommit: (guidanceDepth) => {
+        savePatch({ guidanceDepth });
+      },
+    });
+    syncDepthFieldState(initialPosition);
+
     // Instruction template (debounced so typing never disrupts focus or floods storage)
     const templateField = createFieldContainer(
-      "Guidance Template (supports {{input}}; leave blank for raw input)",
+      "Guidance Template (supports {{input}} and Lumiverse macros like {{char}}, {{user}}; leave blank for raw input)",
     );
     body.append(templateField.wrap);
     this.handles.push(
@@ -783,6 +886,117 @@ export class SettingsDrawerController {
         },
       }),
     );
+  }
+
+  private mountBoundedIntegerField(options: {
+    slot: HTMLElement;
+    fieldId: string;
+    ariaLabel: string;
+    debounceKey: string;
+    min: number;
+    max: number;
+    defaultValue: number;
+    placeholder: string;
+    initialValue: number;
+    disabled?: boolean;
+    onCommit: (normalized: number) => void;
+  }): { setDisabled: (disabled: boolean) => void } {
+    const clamp = (raw: unknown): number => {
+      if (typeof raw === "number" && Number.isFinite(raw)) {
+        return Math.max(options.min, Math.min(options.max, Math.floor(raw)));
+      }
+      return Math.max(
+        options.min,
+        Math.min(options.max, Math.floor(options.defaultValue)),
+      );
+    };
+
+    let currentValue = clamp(options.initialValue);
+    let syncingUi = false;
+    let handle: SpindleNumericInputHandle | null = null;
+    let fallbackInput: HTMLInputElement | null = null;
+
+    const commitInput = (rawNumber: number | null) => {
+      if (syncingUi) return;
+      const normalized = clamp(rawNumber === null ? options.defaultValue : rawNumber);
+      currentValue = normalized;
+      this.scheduleDebouncedSave(options.debounceKey, () => {
+        options.onCommit(normalized);
+      });
+    };
+
+    if (typeof this.ctx.components.mountNumericInput === "function") {
+      handle = this.ctx.components.mountNumericInput(options.slot, {
+        value: currentValue,
+        min: options.min,
+        max: options.max,
+        step: 1,
+        integer: true,
+        allowEmpty: true,
+        placeholder: options.placeholder,
+        disabled: Boolean(options.disabled),
+        ariaLabel: options.ariaLabel,
+        onChange: commitInput,
+      });
+      const mountedInput = options.slot.querySelector("input");
+      if (mountedInput) {
+        if (!mountedInput.id) mountedInput.id = options.fieldId;
+        if (!mountedInput.getAttribute("aria-label")) {
+          mountedInput.setAttribute("aria-label", options.ariaLabel);
+        }
+      }
+      options.slot.addEventListener("focusout", () => {
+        this.flushPendingSaveKey(options.debounceKey);
+        if (handle && handle.getValue() !== currentValue) {
+          syncingUi = true;
+          try {
+            handle.update({ value: currentValue });
+          } finally {
+            syncingUi = false;
+          }
+        }
+      });
+      this.handles.push(handle);
+    } else {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.id = options.fieldId;
+      input.className = "gg-input-sm";
+      input.min = String(options.min);
+      input.max = String(options.max);
+      input.step = "1";
+      input.placeholder = options.placeholder;
+      input.value = String(currentValue);
+      input.disabled = Boolean(options.disabled);
+      input.setAttribute("aria-label", options.ariaLabel);
+      input.addEventListener("input", () => {
+        const raw = input.value.trim();
+        const parsed = raw === "" ? null : Number(raw);
+        commitInput(parsed !== null && Number.isFinite(parsed) ? parsed : null);
+      });
+      input.addEventListener("blur", () => {
+        this.flushPendingSaveKey(options.debounceKey);
+        input.value = String(currentValue);
+      });
+      fallbackInput = input;
+      options.slot.append(input);
+    }
+
+    return {
+      setDisabled: (disabled: boolean) => {
+        if (handle) {
+          syncingUi = true;
+          try {
+            handle.update({ disabled });
+          } finally {
+            syncingUi = false;
+          }
+        }
+        if (fallbackInput) {
+          fallbackInput.disabled = disabled;
+        }
+      },
+    };
   }
 
   private updateOrderStateTag(optionId: ToolbarOptionId, visible: boolean): void {
@@ -809,14 +1023,14 @@ export class SettingsDrawerController {
     const desc = document.createElement("p");
     desc.className = "gg-muted";
     desc.textContent =
-      "Automatically saves composer input cleared or replaced by guided actions so you can restore it in one click.";
+      "Automatically saves composer input cleared or replaced by guided actions so you can restore it in one click. When no saved inputs exist, clicking Input Recovery clears the current input.";
     body.append(desc);
 
     const enableRow = document.createElement("div");
     enableRow.className = "gg-row";
     const enableLabel = document.createElement("span");
     enableLabel.className = "gg-field-label";
-    enableLabel.textContent = "Show Restore button on input bar";
+    enableLabel.textContent = "Enable Input Recovery & toolbar button";
     const enableSlot = document.createElement("div");
     enableRow.append(enableLabel, enableSlot);
     body.append(enableRow);
@@ -838,6 +1052,41 @@ export class SettingsDrawerController {
         },
       }),
     );
+
+    const maxEntriesFieldId = "gg-recovery-max-entries";
+    const maxEntriesField = createFieldContainer(
+      "Max saved drafts (1–50)",
+      maxEntriesFieldId,
+    );
+    body.append(maxEntriesField.wrap);
+
+    this.mountBoundedIntegerField({
+      slot: maxEntriesField.slot,
+      fieldId: maxEntriesFieldId,
+      ariaLabel: "Max saved drafts",
+      debounceKey: "recovery:maxEntries",
+      min: 1,
+      max: 50,
+      defaultValue: 10,
+      placeholder: "10",
+      initialValue: settings.inputRecovery.maxEntries,
+      onCommit: (maxEntries) => {
+        const base = this.currentSettings ?? settings;
+        const next: GuidedGenerationsSettings = {
+          ...base,
+          inputRecovery: { ...base.inputRecovery, maxEntries },
+        };
+        this.currentSettings = next;
+        if (this.recoveryUi) {
+          this.recoveryUi.maxEntries = maxEntries;
+          this.recoveryUi.countLabel.textContent =
+            this.recoveryUi.recoveryCount > 0
+              ? `Saved inputs (${this.recoveryUi.recoveryCount}/${maxEntries}):`
+              : "No saved inputs yet.";
+        }
+        void this.handlers.onSaveSettings(next, { rebuildDrawer: false });
+      },
+    });
 
     const controlsRow = document.createElement("div");
     controlsRow.className = "gg-row";
@@ -867,6 +1116,7 @@ export class SettingsDrawerController {
       body,
       listEl: null,
       maxEntries: settings.inputRecovery.maxEntries,
+      recoveryCount: recovery.length,
     };
 
     this.syncRecoveryList(recovery);
@@ -932,7 +1182,9 @@ export class SettingsDrawerController {
       this.debounceTimers.delete(key);
       flush();
       if (this.pendingView && !this.isEditingDrawerInput()) {
-        const next = this.pendingView;
+        const next: ExtensionBootstrapView = this.currentSettings
+          ? { ...this.pendingView, settings: this.currentSettings }
+          : this.pendingView;
         this.pendingView = null;
         this.render(next, { force: true });
       }
@@ -948,6 +1200,15 @@ export class SettingsDrawerController {
       clearTimeout(entry.timer);
       entry.flush();
     }
+  }
+
+  private flushPendingSaveKey(key: string): void {
+    if (this.destroyed) return;
+    const entry = this.debounceTimers.get(key);
+    if (!entry) return;
+    this.debounceTimers.delete(key);
+    clearTimeout(entry.timer);
+    entry.flush();
   }
 
   private cancelPendingSaves(): void {

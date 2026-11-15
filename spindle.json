@@ -1,7 +1,7 @@
 {
   "name": "Guided Generations",
   "identifier": "guided_generations",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Gehihi",
   "github": "https://github.com/tminh159/GuidedGenerations",
   "homepage": "https://github.com/tminh159/GuidedGenerations",
@@ -10,7 +10,9 @@
     "generation",
     "chats",
     "chat_mutation",
-    "presets"
+    "presets",
+    "regex_scripts",
+    "interceptor"
   ],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",

@@ -3,10 +3,13 @@ import {
   createDefaultSettings,
   GUIDED_ACTION_ORDER,
   normalizeButtonOrder,
+  normalizeGuidanceDepth,
+  normalizeGuidancePosition,
   normalizeToolbarPlacement,
 } from "../shared/defaults";
 import type {
   ConnectionOptionSummary,
+  ContinueHistoryEntry,
   GuidanceInjectionRole,
   GuidedActionConfig,
   GuidedActionId,
@@ -17,6 +20,8 @@ import type {
 
 const SETTINGS_FILE = "settings.json";
 const RECOVERY_FILE = "recovery.json";
+const CONTINUE_HISTORY_FILE = "continue-history.json";
+export const MAX_CONTINUE_ENTRIES = 50;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -41,6 +46,8 @@ function normalizeActionConfig(
     model: normalizeOptionalId(record.model),
     presetId: normalizeOptionalId(record.presetId),
     injectionRole: normalizeRole(record.injectionRole, fallback.injectionRole),
+    guidancePosition: normalizeGuidancePosition(record.guidancePosition, fallback.guidancePosition),
+    guidanceDepth: normalizeGuidanceDepth(record.guidanceDepth, fallback.guidanceDepth),
     instructionTemplate:
       typeof record.instructionTemplate === "string"
         ? record.instructionTemplate
@@ -49,6 +56,7 @@ function normalizeActionConfig(
       typeof record.clearInputOnRun === "boolean"
         ? record.clearInputOnRun
         : fallback.clearInputOnRun,
+    applyRegex: typeof record.applyRegex === "boolean" ? record.applyRegex : fallback.applyRegex,
   };
 }
 
@@ -141,9 +149,93 @@ export function appendRecoveryEntry(
   return [entry, ...entries].slice(0, limit);
 }
 
+export type ContinueHistoryInput = Omit<ContinueHistoryEntry, "id" | "createdAt"> & {
+  id?: string;
+  createdAt?: number;
+};
+
+function createContinueEntry(input: ContinueHistoryInput): ContinueHistoryEntry {
+  const safeSwipeIndex =
+    typeof input.swipeIndex === "number" && Number.isFinite(input.swipeIndex)
+      ? Math.max(0, Math.floor(input.swipeIndex))
+      : 0;
+  return {
+    id: input.id ?? `cont-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    chatId: input.chatId,
+    messageId: input.messageId,
+    swipeIndex: safeSwipeIndex,
+    baseText: input.baseText,
+    resultText: input.resultText,
+    baseReasoning: typeof input.baseReasoning === "string" ? input.baseReasoning : null,
+    baseReasoningDuration:
+      typeof input.baseReasoningDuration === "number" &&
+      Number.isFinite(input.baseReasoningDuration) &&
+      input.baseReasoningDuration >= 0
+        ? input.baseReasoningDuration
+        : null,
+    inputText: input.inputText,
+    createdAt:
+      typeof input.createdAt === "number" && Number.isFinite(input.createdAt)
+        ? input.createdAt
+        : Date.now(),
+  };
+}
+
+export function normalizeContinueHistoryList(
+  raw: unknown,
+  maxEntries: number = MAX_CONTINUE_ENTRIES,
+): ContinueHistoryEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const limit = Number.isFinite(maxEntries)
+    ? Math.max(1, Math.floor(maxEntries))
+    : MAX_CONTINUE_ENTRIES;
+  const result: ContinueHistoryEntry[] = [];
+
+  for (const item of raw) {
+    if (!isRecord(item)) continue;
+    if (typeof item.id !== "string" || !item.id) continue;
+    if (typeof item.chatId !== "string" || !item.chatId) continue;
+    if (typeof item.messageId !== "string" || !item.messageId) continue;
+    if (
+      typeof item.swipeIndex !== "number" ||
+      !Number.isInteger(item.swipeIndex) ||
+      item.swipeIndex < 0
+    ) {
+      continue;
+    }
+    if (typeof item.baseText !== "string") continue;
+    if (typeof item.resultText !== "string") continue;
+
+    result.push({
+      id: item.id,
+      chatId: item.chatId,
+      messageId: item.messageId,
+      swipeIndex: item.swipeIndex,
+      baseText: item.baseText,
+      resultText: item.resultText,
+      baseReasoning: typeof item.baseReasoning === "string" ? item.baseReasoning : null,
+      baseReasoningDuration:
+        typeof item.baseReasoningDuration === "number" &&
+        Number.isFinite(item.baseReasoningDuration) &&
+        item.baseReasoningDuration >= 0
+          ? item.baseReasoningDuration
+          : null,
+      inputText: typeof item.inputText === "string" ? item.inputText : "",
+      createdAt:
+        typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+          ? item.createdAt
+          : Date.now(),
+    });
+    if (result.length >= limit) break;
+  }
+
+  return result;
+}
+
 export class SettingsStore {
   private readonly settingsCache = new Map<string, GuidedGenerationsSettings>();
   private readonly recoveryCache = new Map<string, RecoveryEntry[]>();
+  private readonly continueHistoryCache = new Map<string, ContinueHistoryEntry[]>();
   private readonly writeQueues = new Map<string, Promise<unknown>>();
 
   constructor(private readonly spindle: SpindleAPI) {}
@@ -179,10 +271,33 @@ export class SettingsStore {
     return next;
   }
 
+  private async waitForPendingWrites(key: string): Promise<void> {
+    let pending = this.writeQueues.get(key);
+    while (pending) {
+      await pending.catch(() => undefined);
+      const nextPending = this.writeQueues.get(key);
+      if (nextPending === pending) break;
+      pending = nextPending;
+    }
+  }
+
   async getSettings(userId?: string): Promise<GuidedGenerationsSettings> {
+    return this.getSettingsUnlocked(userId, false);
+  }
+
+  private async getSettingsUnlocked(
+    userId: string | undefined,
+    skipWriteWait = false,
+  ): Promise<GuidedGenerationsSettings> {
     const key = this.userKey(userId);
     const cached = this.settingsCache.get(key);
     if (cached) return this.cloneSettings(cached);
+
+    if (!skipWriteWait) {
+      await this.waitForPendingWrites(key);
+      const rechecked = this.settingsCache.get(key);
+      if (rechecked) return this.cloneSettings(rechecked);
+    }
 
     try {
       if (await this.spindle.userStorage.exists(SETTINGS_FILE, userId)) {
@@ -203,7 +318,14 @@ export class SettingsStore {
     return this.cloneSettings(defaults);
   }
 
-  async saveSettings(next: unknown, userId?: string): Promise<GuidedGenerationsSettings> {
+  async saveSettingsWithMeta(
+    next: unknown,
+    userId?: string,
+  ): Promise<{
+    settings: GuidedGenerationsSettings;
+    recoveryPruned: boolean;
+    recovery: RecoveryEntry[];
+  }> {
     return this.enqueueUserWrite(userId, async () => {
       const key = this.userKey(userId);
       const normalized = normalizeSettings(next);
@@ -214,23 +336,32 @@ export class SettingsStore {
       );
       this.settingsCache.set(key, normalized);
 
-      const currentRecovery = await this.readRecoveryUnlocked(
-        userId,
-        normalized.inputRecovery.maxEntries,
-      );
-      if (currentRecovery.length > normalized.inputRecovery.maxEntries) {
-        await this.writeRecoveryUnlocked(
-          currentRecovery.slice(0, normalized.inputRecovery.maxEntries),
-          userId,
-        );
+      const currentRecovery = await this.readRawRecoveryUnlocked(userId, true);
+      const recoveryPruned = currentRecovery.length > normalized.inputRecovery.maxEntries;
+      const trimmed = currentRecovery.slice(0, normalized.inputRecovery.maxEntries);
+      if (recoveryPruned) {
+        await this.writeRecoveryUnlocked(trimmed, userId);
       }
-      return this.cloneSettings(normalized);
+      this.recoveryCache.set(
+        key,
+        trimmed.map((e) => ({ ...e })),
+      );
+      return {
+        settings: this.cloneSettings(normalized),
+        recoveryPruned,
+        recovery: trimmed.map((e) => ({ ...e })),
+      };
     });
+  }
+
+  async saveSettings(next: unknown, userId?: string): Promise<GuidedGenerationsSettings> {
+    const { settings } = await this.saveSettingsWithMeta(next, userId);
+    return settings;
   }
 
   async getRecovery(userId?: string): Promise<RecoveryEntry[]> {
     const settings = await this.getSettings(userId);
-    return this.readRecoveryUnlocked(userId, settings.inputRecovery.maxEntries);
+    return this.readRecoveryUnlocked(userId, settings.inputRecovery.maxEntries, false);
   }
 
   async pushRecovery(
@@ -238,17 +369,18 @@ export class SettingsStore {
     userId?: string,
   ): Promise<RecoveryEntry[]> {
     return this.enqueueUserWrite(userId, async () => {
-      const settings = await this.getSettings(userId);
+      const settings = await this.getSettingsUnlocked(userId, true);
       const current = await this.readRecoveryUnlocked(
         userId,
         settings.inputRecovery.maxEntries,
+        true,
       );
       if (!settings.inputRecovery.enabled) {
         return current;
       }
       const updated = appendRecoveryEntry(current, input, settings.inputRecovery.maxEntries);
       await this.writeRecoveryUnlocked(updated, userId);
-      return [...updated];
+      return updated.map((e) => ({ ...e }));
     });
   }
 
@@ -259,20 +391,65 @@ export class SettingsStore {
     });
   }
 
-  private async readRecoveryUnlocked(
+  private async readRawRecoveryUnlocked(
     userId: string | undefined,
-    maxEntries: number,
+    skipWriteWait = false,
   ): Promise<RecoveryEntry[]> {
     const key = this.userKey(userId);
     const cached = this.recoveryCache.get(key);
-    if (cached) return [...cached.slice(0, maxEntries)];
+    if (cached) return cached.map((e) => ({ ...e }));
+
+    if (!skipWriteWait) {
+      await this.waitForPendingWrites(key);
+      const rechecked = this.recoveryCache.get(key);
+      if (rechecked) return rechecked.map((e) => ({ ...e }));
+    }
+
+    try {
+      if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
+        const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
+        const parsed = normalizeRecoveryList(JSON.parse(raw), 50);
+        this.recoveryCache.set(
+          key,
+          parsed.map((e) => ({ ...e })),
+        );
+        return parsed.map((e) => ({ ...e }));
+      }
+    } catch (error) {
+      this.spindle.log.warn(
+        `[GuidedGenerations] Failed reading recovery history: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
+
+    this.recoveryCache.set(key, []);
+    return [];
+  }
+
+  private async readRecoveryUnlocked(
+    userId: string | undefined,
+    maxEntries: number,
+    skipWriteWait = false,
+  ): Promise<RecoveryEntry[]> {
+    const key = this.userKey(userId);
+    const cached = this.recoveryCache.get(key);
+    if (cached) return cached.slice(0, maxEntries).map((e) => ({ ...e }));
+
+    if (!skipWriteWait) {
+      await this.waitForPendingWrites(key);
+      const rechecked = this.recoveryCache.get(key);
+      if (rechecked) return rechecked.slice(0, maxEntries).map((e) => ({ ...e }));
+    }
 
     try {
       if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
         const parsed = normalizeRecoveryList(JSON.parse(raw), maxEntries);
-        this.recoveryCache.set(key, parsed);
-        return [...parsed];
+        this.recoveryCache.set(
+          key,
+          parsed.map((e) => ({ ...e })),
+        );
+        return parsed.map((e) => ({ ...e }));
       }
     } catch (error) {
       this.spindle.log.warn(
@@ -294,7 +471,173 @@ export class SettingsStore {
       JSON.stringify(entries, null, 2),
       userId,
     );
-    this.recoveryCache.set(this.userKey(userId), [...entries]);
+    this.recoveryCache.set(
+      this.userKey(userId),
+      entries.map((e) => ({ ...e })),
+    );
+  }
+
+  async getContinueHistory(userId?: string): Promise<ContinueHistoryEntry[]> {
+    const entries = await this.readContinueHistoryUnlocked(userId, false);
+    return entries.map((entry) => ({ ...entry }));
+  }
+
+  async pushContinueEntry(
+    input: ContinueHistoryInput,
+    userId?: string,
+  ): Promise<ContinueHistoryEntry> {
+    return this.enqueueUserWrite(userId, async () => {
+      const current = await this.readContinueHistoryUnlocked(userId, true);
+      const entry = createContinueEntry(input);
+      const updated = [entry, ...current].slice(0, MAX_CONTINUE_ENTRIES);
+      await this.writeContinueHistoryUnlocked(updated, userId);
+      return { ...entry };
+    });
+  }
+
+  async peekContinueEntry(
+    chatId: string,
+    messageId: string,
+    swipeIndex: number,
+    userId?: string,
+  ): Promise<ContinueHistoryEntry | null> {
+    const current = await this.readContinueHistoryUnlocked(userId, false);
+    const match = current.find(
+      (entry) =>
+        entry.chatId === chatId &&
+        entry.messageId === messageId &&
+        entry.swipeIndex === swipeIndex,
+    );
+    return match ? { ...match } : null;
+  }
+
+  async popContinueEntry(
+    chatId: string,
+    messageId: string,
+    swipeIndex: number,
+    expectedId?: string,
+    userId?: string,
+  ): Promise<ContinueHistoryEntry | null> {
+    return this.enqueueUserWrite(userId, async () => {
+      const current = await this.readContinueHistoryUnlocked(userId, true);
+      const idx = current.findIndex(
+        (entry) =>
+          entry.chatId === chatId &&
+          entry.messageId === messageId &&
+          entry.swipeIndex === swipeIndex,
+      );
+      if (idx < 0) return null;
+      const target = current[idx]!;
+      if (expectedId !== undefined && target.id !== expectedId) {
+        return null;
+      }
+      const updated = [...current.slice(0, idx), ...current.slice(idx + 1)];
+      await this.writeContinueHistoryUnlocked(updated, userId);
+      return { ...target };
+    });
+  }
+
+  async replaceTopContinueEntry(
+    chatId: string,
+    messageId: string,
+    swipeIndex: number,
+    expectedId: string | undefined,
+    nextEntry: ContinueHistoryInput,
+    userId?: string,
+  ): Promise<ContinueHistoryEntry> {
+    return this.enqueueUserWrite(userId, async () => {
+      const current = await this.readContinueHistoryUnlocked(userId, true);
+      const created = createContinueEntry(nextEntry);
+      const idx = current.findIndex(
+        (entry) =>
+          entry.chatId === chatId &&
+          entry.messageId === messageId &&
+          entry.swipeIndex === swipeIndex,
+      );
+      const shouldReplace =
+        idx >= 0 && (expectedId === undefined || current[idx]!.id === expectedId);
+      const withoutOld = shouldReplace
+        ? [...current.slice(0, idx), ...current.slice(idx + 1)]
+        : current;
+      const updated = [created, ...withoutOld].slice(0, MAX_CONTINUE_ENTRIES);
+      await this.writeContinueHistoryUnlocked(updated, userId);
+      return { ...created };
+    });
+  }
+
+  async rebindContinueHistoryMessageId(
+    chatId: string,
+    oldMessageId: string,
+    newMessageId: string,
+    userId?: string,
+  ): Promise<void> {
+    if (!chatId || !oldMessageId || !newMessageId || oldMessageId === newMessageId) {
+      return;
+    }
+    return this.enqueueUserWrite(userId, async () => {
+      const current = await this.readContinueHistoryUnlocked(userId, true);
+      let changed = false;
+      const updated = current.map((entry) => {
+        if (entry.chatId === chatId && entry.messageId === oldMessageId) {
+          changed = true;
+          return { ...entry, messageId: newMessageId };
+        }
+        return entry;
+      });
+      if (changed) {
+        await this.writeContinueHistoryUnlocked(updated, userId);
+      }
+    });
+  }
+
+  private async readContinueHistoryUnlocked(
+    userId: string | undefined,
+    skipWriteWait = false,
+  ): Promise<ContinueHistoryEntry[]> {
+    const key = this.userKey(userId);
+    const cached = this.continueHistoryCache.get(key);
+    if (cached) return cached.map((entry) => ({ ...entry }));
+
+    if (!skipWriteWait) {
+      await this.waitForPendingWrites(key);
+      const rechecked = this.continueHistoryCache.get(key);
+      if (rechecked) return rechecked.map((entry) => ({ ...entry }));
+    }
+
+    try {
+      if (await this.spindle.userStorage.exists(CONTINUE_HISTORY_FILE, userId)) {
+        const raw = await this.spindle.userStorage.read(CONTINUE_HISTORY_FILE, userId);
+        const parsed = normalizeContinueHistoryList(JSON.parse(raw), MAX_CONTINUE_ENTRIES);
+        this.continueHistoryCache.set(
+          key,
+          parsed.map((entry) => ({ ...entry })),
+        );
+        return parsed.map((entry) => ({ ...entry }));
+      }
+    } catch (error) {
+      this.spindle.log.warn(
+        `[GuidedGenerations] Failed reading continue history: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
+
+    this.continueHistoryCache.set(key, []);
+    return [];
+  }
+
+  private async writeContinueHistoryUnlocked(
+    entries: ContinueHistoryEntry[],
+    userId?: string,
+  ): Promise<void> {
+    await this.spindle.userStorage.write(
+      CONTINUE_HISTORY_FILE,
+      JSON.stringify(entries, null, 2),
+      userId,
+    );
+    this.continueHistoryCache.set(
+      this.userKey(userId),
+      entries.map((entry) => ({ ...entry })),
+    );
   }
 
   async listConnections(userId?: string): Promise<ConnectionOptionSummary[]> {

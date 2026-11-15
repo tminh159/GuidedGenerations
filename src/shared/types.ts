@@ -15,14 +15,23 @@ export type ToolbarPlacement =
 
 export type GuidanceInjectionRole = "system" | "user" | "assistant";
 
+export type GuidancePosition =
+  | "before_post_history"
+  | "in_history"
+  | "pre_history"
+  | "post_history";
+
 export interface GuidedActionConfig {
   enabled: boolean;
   connectionId: string | null;
   model: string | null;
   presetId: string | null;
   injectionRole: GuidanceInjectionRole;
+  guidancePosition: GuidancePosition;
+  guidanceDepth: number;
   instructionTemplate: string;
   clearInputOnRun: boolean;
+  applyRegex: boolean;
 }
 
 export interface InputRecoveryConfig {
@@ -59,11 +68,28 @@ export interface RecoveryEntry {
   createdAt: number;
 }
 
+export interface ContinueHistoryEntry {
+  id: string;
+  chatId: string;
+  messageId: string;
+  swipeIndex: number;
+  baseText: string;
+  resultText: string;
+  baseReasoning: string | null;
+  baseReasoningDuration: number | null;
+  inputText: string;
+  createdAt: number;
+}
+
 export interface ActiveRunState {
   runId: string;
   actionId: GuidedActionId;
   chatId: string;
   startedAt: number;
+  messageId?: string;
+  swipeId?: number;
+  backgroundSwipe?: boolean;
+  hasContentOutput?: boolean;
 }
 
 export interface ExtensionBootstrapView {
@@ -77,6 +103,8 @@ export interface ExtensionBootstrapView {
     chats: boolean;
     chat_mutation: boolean;
     presets: boolean;
+    regex_scripts: boolean;
+    interceptor: boolean;
   };
   catalogWarnings?: string[];
 }
@@ -88,7 +116,9 @@ export type RpcActionName =
   | "abort_action"
   | "push_recovery"
   | "restore_recovery"
-  | "clear_recovery";
+  | "clear_recovery"
+  | "remove_last_continue"
+  | "regenerate_last_continue";
 
 export interface RpcRequestEnvelope {
   type: "gg:rpc";
@@ -109,6 +139,19 @@ export interface RunActionInput {
   chatId?: string | null;
   activeConnectionId?: string | null;
   inputText: string;
+  backgroundSwipe?: boolean;
+}
+
+export interface RegenerateContinueInput {
+  chatId?: string | null;
+  activeConnectionId?: string | null;
+}
+
+export interface RemoveContinueResult {
+  removed: boolean;
+  messageId: string;
+  swipeIndex: number;
+  text: string;
 }
 
 export interface ActionRunResult {
@@ -121,19 +164,50 @@ export interface ActionRunResult {
   text?: string;
 }
 
-export interface BackendPushEvent {
-  type:
-    | "gg:changed"
-    | "gg:status"
-    | "gg:impersonate-chunk"
-    | "gg:recovery-updated";
-  reason?: string;
-  run?: ActiveRunState | null;
-  chatId?: string;
-  text?: string;
-  done?: boolean;
-  aborted?: boolean;
-  error?: string;
-  recovery?: RecoveryEntry[];
+export interface NativeGenerationMetrics {
+  ttft?: number;
+  tps?: number;
+  durationMs: number;
+  wasStreaming: boolean;
+  model?: string;
+  provider?: string;
+  presetId?: string;
+  presetName?: string;
 }
+
+export type BackendPushEvent =
+  | {
+      type:
+        | "gg:changed"
+        | "gg:status"
+        | "gg:impersonate-chunk"
+        | "gg:recovery-updated";
+      reason?: string;
+      run?: ActiveRunState | null;
+      chatId?: string;
+      text?: string;
+      done?: boolean;
+      aborted?: boolean;
+      error?: string;
+      recovery?: RecoveryEntry[];
+      messageId?: string;
+      swipeId?: number;
+      tokenCount?: number | null;
+      generationMetrics?: NativeGenerationMetrics | null;
+    }
+  | {
+      type: "gg:generation_metrics";
+      chatId: string;
+      messageId: string;
+      swipeId: number;
+      tokenCount?: number | null;
+      generationMetrics?: NativeGenerationMetrics | null;
+      reason?: undefined;
+      run?: undefined;
+      text?: undefined;
+      done?: undefined;
+      aborted?: undefined;
+      error?: undefined;
+      recovery?: undefined;
+    };
 

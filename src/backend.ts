@@ -5,6 +5,7 @@ import { isGuidedActionId } from "./shared/defaults";
 import type {
   BackendPushEvent,
   ExtensionBootstrapView,
+  RegenerateContinueInput,
   RpcReplyEnvelope,
   RpcRequestEnvelope,
   RunActionInput,
@@ -35,6 +36,16 @@ function parseRunActionInput(raw: unknown): RunActionInput {
     activeConnectionId:
       typeof record.activeConnectionId === "string" ? record.activeConnectionId : null,
     inputText: typeof record.inputText === "string" ? record.inputText : "",
+    backgroundSwipe: record.backgroundSwipe === true,
+  };
+}
+
+function parseRegenerateContinueInput(raw: unknown): RegenerateContinueInput {
+  const record = isRecord(raw) ? raw : {};
+  return {
+    chatId: typeof record.chatId === "string" ? record.chatId : null,
+    activeConnectionId:
+      typeof record.activeConnectionId === "string" ? record.activeConnectionId : null,
   };
 }
 
@@ -65,6 +76,8 @@ export function registerBackend(api: SpindleAPI) {
         chats: api.permissions.has("chats"),
         chat_mutation: api.permissions.has("chat_mutation"),
         presets: api.permissions.has("presets"),
+        regex_scripts: api.permissions.has("regex_scripts"),
+        interceptor: api.permissions.has("interceptor"),
       },
       ...(catalogs.warnings.length > 0 ? { catalogWarnings: catalogs.warnings } : {}),
     };
@@ -87,8 +100,14 @@ export function registerBackend(api: SpindleAPI) {
           return;
         }
         case "save_settings": {
-          const saved = await store.saveSettings(req.input, userId);
-          reply(saved);
+          const { settings, recoveryPruned, recovery } = await store.saveSettingsWithMeta(
+            req.input,
+            userId,
+          );
+          if (recoveryPruned) {
+            emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
+          }
+          reply(settings);
           return;
         }
         case "run_action": {
@@ -109,6 +128,10 @@ export function registerBackend(api: SpindleAPI) {
         case "push_recovery": {
           const record = isRecord(req.input) ? req.input : {};
           const text = typeof record.text === "string" ? record.text : "";
+          if (!text.trim()) {
+            reply(await store.getRecovery(userId));
+            return;
+          }
           const actionId = isGuidedActionId(record.actionId)
             ? record.actionId
             : "guided_response";
@@ -145,6 +168,19 @@ export function registerBackend(api: SpindleAPI) {
           reply(recovery);
           return;
         }
+        case "remove_last_continue": {
+          const record = isRecord(req.input) ? req.input : {};
+          const chatId = typeof record.chatId === "string" ? record.chatId : null;
+          const result = await runner.removeLastContinue({ chatId }, userId);
+          reply(result);
+          return;
+        }
+        case "regenerate_last_continue": {
+          const parsed = parseRegenerateContinueInput(req.input);
+          const result = await runner.regenerateLastContinue(parsed, userId);
+          reply(result);
+          return;
+        }
         default:
           throw new Error(`Unsupported action: ${String(req.action)}`);
       }
@@ -153,23 +189,50 @@ export function registerBackend(api: SpindleAPI) {
     }
   }
 
-  api.onFrontendMessage((payload, userId) => {
-    const req = asRpcRequest(payload);
-    if (!req) return;
-    void handleRpc(req, userId);
-  });
+  const disposers: Array<(() => void) | void> = [];
 
-  api.permissions.onChanged(() => {
-    emitFrontend({ type: "gg:changed", reason: "permissions" });
-  });
+  disposers.push(
+    api.onFrontendMessage((payload, userId) => {
+      const req = asRpcRequest(payload);
+      if (!req) return;
+      void handleRpc(req, userId);
+    }),
+  );
+
+  disposers.push(
+    api.permissions.onChanged((arg1?: unknown, arg2?: unknown) => {
+      const userId =
+        typeof arg1 === "string" && arg1.length > 0
+          ? arg1
+          : typeof arg2 === "string" && arg2.length > 0
+            ? arg2
+            : isRecord(arg1) && typeof arg1.userId === "string" && arg1.userId.length > 0
+              ? arg1.userId
+              : undefined;
+      emitFrontend({ type: "gg:changed", reason: "permissions" }, userId);
+    }),
+  );
 
   for (const eventName of ["CHAT_SWITCHED", "CHAT_CHANGED"]) {
-    api.on(eventName, (_payload, userId) => {
-      emitFrontend({ type: "gg:changed", reason: eventName.toLowerCase() }, userId);
-    });
+    disposers.push(
+      api.on(eventName, (_payload, userId) => {
+        emitFrontend({ type: "gg:changed", reason: eventName.toLowerCase() }, userId);
+      }),
+    );
   }
 
-  return { store, runner, handleRpc, buildBootstrapView };
+  return {
+    store,
+    runner,
+    handleRpc,
+    buildBootstrapView,
+    dispose: () => {
+      runner.dispose();
+      for (const d of disposers.splice(0)) {
+        if (typeof d === "function") d();
+      }
+    },
+  };
 }
 
 if (typeof spindle !== "undefined") {

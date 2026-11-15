@@ -1,16 +1,33 @@
 import { describe, expect, test } from "bun:test";
 import type {
   ChatMessageDTO,
+  InterceptorHandler,
   LlmMessageDTO,
+  PromptBlockSnapshotDTO,
+  RegexScriptDTO,
   SpindleAPI,
   StreamChunkDTO,
 } from "lumiverse-spindle-types";
 import { registerBackend } from "../src/backend";
+import {
+  calculateGenerationTimingMetrics,
+  resolveGenerationTokenCounts,
+} from "../src/backend/generation-metrics";
 import { GuidedGenerationRunner } from "../src/backend/generation-runner";
 import type { ChatMessageWithRole } from "../src/backend/prompt-builder";
-import { SettingsStore } from "../src/backend/settings-store";
+import {
+  MAX_CONTINUE_ENTRIES,
+  normalizeSettings,
+  SettingsStore,
+} from "../src/backend/settings-store";
 import { createDefaultSettings } from "../src/shared/defaults";
-import type { BackendPushEvent, RpcReplyEnvelope } from "../src/shared/types";
+import type {
+  ActiveRunState,
+  BackendPushEvent,
+  ExtensionBootstrapView,
+  RemoveContinueResult,
+  RpcReplyEnvelope,
+} from "../src/shared/types";
 
 function makeMessage(
   overrides: Partial<ChatMessageWithRole> & { id: string; chat_id?: string },
@@ -39,10 +56,25 @@ function makeMessage(
 }
 
 interface HarnessOptions {
-  permissions?: Partial<Record<"generation" | "chats" | "chat_mutation" | "presets", boolean>>;
+  permissions?: Partial<
+    Record<
+      "generation" | "chats" | "chat_mutation" | "presets" | "regex_scripts" | "interceptor",
+      boolean
+    >
+  >;
   chats?: Record<string, ChatMessageWithRole[]>;
+  chatCharacterIds?: Record<string, string>;
   activeChatByUser?: Record<string, string | null>;
-  presets?: Record<string, { id: string; name: string }>;
+  presets?: Record<string, { id: string; name: string; prompt_order?: PromptBlockSnapshotDTO[] }>;
+  activePresetId?: string | null;
+  getActivePresetThrows?: boolean;
+  regexScripts?: RegexScriptDTO[];
+  macrosResolveImpl?: (
+    template: string,
+    opts?: Record<string, unknown>,
+  ) => Promise<{ text: string; diagnostics: Array<{ message: string; offset: number; length: number }> }>;
+  interceptorMessagesByChat?: Record<string, Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>>;
+  interceptorContextExtra?: Record<string, unknown>;
   writeError?: (path: string, userId?: string) => Error | null;
   writeDelayMs?: number;
   dryRunImpl?: (
@@ -52,6 +84,18 @@ interface HarnessOptions {
   rawStreamImpl?: (
     input: Record<string, unknown> & { signal?: AbortSignal },
   ) => AsyncGenerator<StreamChunkDTO, void, void>;
+  countTextImpl?: (
+    text: string,
+    opts?: Record<string, unknown>,
+  ) => Promise<{ total_tokens: number }>;
+  connections?: Array<{
+    id: string;
+    name: string;
+    provider: string;
+    model: string;
+    preset_id?: string | null;
+    is_default: boolean;
+  }>;
   updateMessageImpl?: (
     chatId: string,
     messageId: string,
@@ -66,6 +110,8 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     chats: true,
     chat_mutation: true,
     presets: true,
+    regex_scripts: true,
+    interceptor: true,
     ...options.permissions,
   };
 
@@ -91,6 +137,16 @@ function createSpindleHarness(options: HarnessOptions = {}) {
   const dryRunCalls: Array<{ input: Record<string, unknown>; userId?: string }> = [];
   const rawStreamCalls: Array<Record<string, unknown>> = [];
   const presetGetCalls: Array<{ id: string; userId?: string }> = [];
+  const registerInterceptorCalls: Array<{ options?: unknown; priority?: unknown }> = [];
+  const registeredInterceptors: InterceptorHandler[] = [];
+  const regexGetActiveCalls: Array<Record<string, unknown>> = [];
+  const macroResolveCalls: Array<{ template: string; opts?: Record<string, unknown> }> = [];
+  const countTextCalls: Array<{ text: string; opts?: Record<string, unknown> }> = [];
+  const updateMessageCalls: Array<{
+    chatId: string;
+    messageId: string;
+    patch: Record<string, unknown>;
+  }> = [];
   const eventHandlers = new Map<string, Array<(payload: unknown, userId?: string) => void>>();
   let frontendMessageHandler: ((payload: unknown, userId: string) => void) | null = null;
   let permissionsChangedHandler: (() => void) | null = null;
@@ -129,6 +185,12 @@ function createSpindleHarness(options: HarnessOptions = {}) {
       const list = eventHandlers.get(eventName) ?? [];
       list.push(cb);
       eventHandlers.set(eventName, list);
+      return () => {
+        const current = eventHandlers.get(eventName);
+        if (!current) return;
+        const idx = current.indexOf(cb);
+        if (idx >= 0) current.splice(idx, 1);
+      };
     },
     userStorage: {
       exists: async (path: string, userId?: string) => getUserBucket(userId).has(path),
@@ -158,16 +220,27 @@ function createSpindleHarness(options: HarnessOptions = {}) {
       },
     },
     connections: {
-      list: async () => [
-        {
-          id: "conn-1",
-          name: "Primary",
-          provider: "openai",
-          model: "gpt-4o",
-          is_default: true,
-        },
-      ],
+      list: async () =>
+        options.connections ?? [
+          {
+            id: "conn-1",
+            name: "Primary",
+            provider: "openai",
+            model: "gpt-4o",
+            is_default: true,
+          },
+        ],
     },
+    ...(options.countTextImpl
+      ? {
+          tokens: {
+            countText: async (text: string, opts?: Record<string, unknown>) => {
+              countTextCalls.push({ text, opts });
+              return options.countTextImpl!(text, opts);
+            },
+          },
+        }
+      : {}),
     presets: {
       list: async () => ({
         data: Object.values(options.presets ?? { "p-1": { id: "p-1", name: "Default" } }),
@@ -177,17 +250,75 @@ function createSpindleHarness(options: HarnessOptions = {}) {
         presetGetCalls.push({ id, userId });
         return options.presets?.[id] ?? null;
       },
+      ...(options.activePresetId !== undefined || options.getActivePresetThrows
+        ? {
+            getActive: async () => {
+              if (options.getActivePresetThrows) {
+                throw new Error("getActive unsupported");
+              }
+              return { preset_id: options.activePresetId ?? null };
+            },
+          }
+        : {}),
+      blocks: {
+        list: async (id: string) => options.presets?.[id]?.prompt_order ?? [],
+      },
+    },
+    regex_scripts: {
+      getActive: async (opts: Record<string, unknown>) => {
+        regexGetActiveCalls.push(opts);
+        const target = opts.target;
+        return (options.regexScripts ?? []).filter((s) => s.target === target);
+      },
+    },
+    macros: {
+      resolve: async (template: string, opts?: Record<string, unknown>) => {
+        macroResolveCalls.push({ template, opts });
+        if (options.macrosResolveImpl) {
+          return options.macrosResolveImpl(template, opts);
+        }
+        return { text: template, diagnostics: [] };
+      },
+    },
+    registerInterceptor: (
+      handler: InterceptorHandler,
+      priorityOrOpts?: unknown,
+      maybeOpts?: unknown,
+    ) => {
+      registerInterceptorCalls.push({
+        priority: typeof priorityOrOpts === "number" ? priorityOrOpts : undefined,
+        options: typeof priorityOrOpts === "object" ? priorityOrOpts : maybeOpts,
+      });
+      registeredInterceptors.push(handler);
+      return () => {
+        const idx = registeredInterceptors.indexOf(handler);
+        if (idx >= 0) registeredInterceptors.splice(idx, 1);
+      };
     },
     chats: {
       get: async (chatId: string) => {
-        return chatMessages.has(chatId) ? { id: chatId } : null;
+        return chatMessages.has(chatId)
+          ? {
+              id: chatId,
+              ...(options.chatCharacterIds?.[chatId]
+                ? { character_id: options.chatCharacterIds[chatId] }
+                : {}),
+            }
+          : null;
       },
       getActive: async (userId?: string) => {
         const activeId =
           userId && userId in activeChatByUser
             ? activeChatByUser[userId]
             : activeChatByUser.__default__ ?? "chat-1";
-        return activeId && chatMessages.has(activeId) ? { id: activeId } : null;
+        return activeId && chatMessages.has(activeId)
+          ? {
+              id: activeId,
+              ...(options.chatCharacterIds?.[activeId]
+                ? { character_id: options.chatCharacterIds[activeId] }
+                : {}),
+            }
+          : null;
       },
     },
     chat: {
@@ -198,6 +329,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
           swipes: [...m.swipes],
           swipe_dates: [...m.swipe_dates],
           extra: { ...m.extra },
+          ...(m.metadata ? { metadata: { ...m.metadata } } : {}),
         }));
       },
       appendMessage: async (
@@ -226,16 +358,27 @@ function createSpindleHarness(options: HarnessOptions = {}) {
         messageId: string,
         patch: {
           content?: string;
+          metadata?: Record<string, unknown>;
           swipes?: string[];
           swipe_id?: number;
           swipe_dates?: number[];
           reasoning?: { text?: string | null; duration?: number | null };
+          swipe_reasoning?: Array<{ text: string | null; duration?: number | null } | null>;
+          skipChunkRebuild?: boolean;
         },
       ) => {
+        updateMessageCalls.push({
+          chatId,
+          messageId,
+          patch: { ...(patch as Record<string, unknown>) },
+        });
         const defaultUpdate = async () => {
           const msgs = chatMessages.get(chatId) ?? [];
           const target = msgs.find((m) => m.id === messageId);
           if (!target) throw new Error(`Missing message ${messageId}`);
+          if (patch.metadata !== undefined) {
+            target.metadata = { ...patch.metadata };
+          }
           if (patch.swipes) target.swipes = [...patch.swipes];
           if (typeof patch.swipe_id === "number") target.swipe_id = patch.swipe_id;
           if (patch.swipe_dates) target.swipe_dates = [...patch.swipe_dates];
@@ -244,15 +387,47 @@ function createSpindleHarness(options: HarnessOptions = {}) {
             if (target.swipes.length > target.swipe_id) {
               target.swipes[target.swipe_id] = patch.content;
             }
+          } else if (patch.swipes || typeof patch.swipe_id === "number") {
+            target.content = target.swipes[target.swipe_id] ?? "";
           }
-          if (patch.reasoning) {
+          if (patch.swipe_reasoning) {
+            const reasoningBySwipe = patch.swipe_reasoning.map((slot) => slot?.text ?? null);
+            const reasoningDurationBySwipe = patch.swipe_reasoning.map(
+              (slot) => slot?.duration ?? null,
+            );
             target.extra = {
+              ...target.extra,
+              reasoningBySwipe,
+              reasoningDurationBySwipe,
+              reasoning: reasoningBySwipe[target.swipe_id] ?? null,
+              reasoning_duration: reasoningDurationBySwipe[target.swipe_id] ?? null,
+            };
+          } else if (patch.reasoning) {
+            const nextExtra: Record<string, unknown> = {
               ...target.extra,
               ...(patch.reasoning.text !== undefined ? { reasoning: patch.reasoning.text } : {}),
               ...(patch.reasoning.duration !== undefined
                 ? { reasoning_duration: patch.reasoning.duration }
                 : {}),
             };
+            if (Array.isArray(nextExtra.reasoningBySwipe) && patch.reasoning.text !== undefined) {
+              const bySwipe = [...(nextExtra.reasoningBySwipe as Array<string | null>)];
+              while (bySwipe.length <= target.swipe_id) bySwipe.push(null);
+              bySwipe[target.swipe_id] = patch.reasoning.text;
+              nextExtra.reasoningBySwipe = bySwipe;
+            }
+            if (
+              Array.isArray(nextExtra.reasoningDurationBySwipe) &&
+              patch.reasoning.duration !== undefined
+            ) {
+              const durBySwipe = [
+                ...(nextExtra.reasoningDurationBySwipe as Array<number | null>),
+              ];
+              while (durBySwipe.length <= target.swipe_id) durBySwipe.push(null);
+              durBySwipe[target.swipe_id] = patch.reasoning.duration;
+              nextExtra.reasoningDurationBySwipe = durBySwipe;
+            }
+            target.extra = nextExtra as ChatMessageWithRole["extra"];
           }
         };
 
@@ -273,6 +448,37 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     generate: {
       dryRun: async (input: Record<string, unknown>, userId?: string) => {
         dryRunCalls.push({ input, userId });
+        const chatId = String(input.chatId ?? "chat-1");
+        const interceptorMsgs = options.interceptorMessagesByChat?.[chatId];
+        if (interceptorMsgs && registeredInterceptors.length > 0) {
+          const ctx = {
+            userId: userId ?? "u1",
+            chatId,
+            generationId: "gen-dry-1",
+            generationType: (input.generationType as string) ?? "normal",
+            dryRun: true,
+            isDryRun: false, // Mirrors Lumiverse host quirk: dryRun=true instead of isDryRun=true
+            presetId: (input.presetId as string) ?? null,
+            presetMetadata: {},
+            personaId: null,
+            characterId: options.chatCharacterIds?.[chatId] ?? null,
+            personaAddonStates: {},
+            mainDispatch: {
+              source: "main",
+              descriptor: null,
+              connectionDispatchRevision: null,
+              dispatchKind: null,
+            },
+            prefillCarrier: { id: "p", state: "absent" },
+            interceptorDeadlineAt: Date.now() + 5000,
+            boundWorkDeadlineAt: Date.now() + 5000,
+            signal: new AbortController().signal,
+            ...(options.interceptorContextExtra ?? {}),
+          };
+          for (const handler of registeredInterceptors) {
+            await handler(interceptorMsgs, ctx as unknown as Parameters<InterceptorHandler>[1]);
+          }
+        }
         if (options.dryRunImpl) {
           return options.dryRunImpl(input, userId);
         }
@@ -305,6 +511,12 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     dryRunCalls,
     rawStreamCalls,
     presetGetCalls,
+    registerInterceptorCalls,
+    registeredInterceptors,
+    regexGetActiveCalls,
+    macroResolveCalls,
+    countTextCalls,
+    updateMessageCalls,
     triggerFrontendMessage: (payload: unknown, userId: string) => {
       frontendMessageHandler?.(payload, userId);
     },
@@ -312,10 +524,11 @@ function createSpindleHarness(options: HarnessOptions = {}) {
       permissionsChangedHandler?.();
     },
     triggerEvent: (eventName: string, payload: unknown, userId?: string) => {
-      for (const cb of eventHandlers.get(eventName) ?? []) {
+      for (const cb of [...(eventHandlers.get(eventName) ?? [])]) {
         cb(payload, userId);
       }
     },
+    getEventHandlerCount: (eventName: string) => (eventHandlers.get(eventName) ?? []).length,
   };
 }
 
@@ -402,13 +615,35 @@ describe("SettingsStore operator isolation, write queue, and guards", () => {
 });
 
 describe("GuidedGenerationRunner actions, safety, and operator isolation", () => {
-  test("guided_response uses request_messages, defers append until first token, and leaves no blank message on error/abort", async () => {
+  test("guided_response creates blank slot before dryRun, strips createdMessageId from prompt, sets preset_contexts once, and keeps space on 0-token error/abort", async () => {
     let streamMode: "normal" | "pre-token-error" | "pre-token-abort" = "normal";
     let runnerRef: GuidedGenerationRunner;
+    let sawBlankBeforeDryRun = false;
 
     const harness = createSpindleHarness({
+      activePresetId: "p-active",
       chats: {
         "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+      dryRunImpl: async () => {
+        const msgs = harness.chatMessages.get("chat-1")!;
+        const last = msgs[msgs.length - 1];
+        sawBlankBeforeDryRun =
+          msgs.length >= 2 &&
+          last?.role === "assistant" &&
+          last?.content === "" &&
+          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
+            ?.preset_id === "p-active";
+        return {
+          messages: [{ role: "user", content: "Flattened display" }],
+          request_messages: [
+            { role: "user", content: [{ type: "text", text: "Rich prompt" }], sourceMessageId: "m1" },
+            ...(last ? [{ role: "assistant" as const, content: "", sourceMessageId: last.id }] : []),
+          ],
+          parameters: { temperature: 0.7 },
+          model: "gpt-4o",
+          provider: "openai",
+        };
       },
       rawStreamImpl: async function* ({ signal }) {
         if (streamMode === "pre-token-error") {
@@ -422,7 +657,9 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
             throw err;
           }
         }
-        yield { type: "token", token: "Hi there!" };
+        yield { type: "token", token: "Hi " };
+        await new Promise((r) => setTimeout(r, 135));
+        yield { type: "token", token: "there!" };
         yield { type: "done", content: "Hi there!", finish_reason: "stop" };
       },
     });
@@ -436,7 +673,13 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     await expect(
       runnerRef.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Be warm" }, "u1"),
     ).rejects.toThrow("Upstream 502");
-    expect(harness.chatMessages.get("chat-1")?.length).toBe(1);
+    expect(sawBlankBeforeDryRun).toBe(true);
+    // Blank space was eagerly created and kept on 0-token error.
+    expect(harness.chatMessages.get("chat-1")?.length).toBe(2);
+    expect(harness.chatMessages.get("chat-1")![1]?.content).toBe("");
+
+    // Reset back to 1 message for abort test.
+    harness.chatMessages.get("chat-1")!.splice(1);
 
     streamMode = "pre-token-abort";
     const abortedRes = await runnerRef.run(
@@ -444,8 +687,12 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
       "u1",
     );
     expect(abortedRes.aborted).toBe(true);
-    expect(abortedRes.messageId).toBeUndefined();
-    expect(harness.chatMessages.get("chat-1")?.length).toBe(1);
+    expect(abortedRes.messageId).toBeDefined();
+    expect(harness.chatMessages.get("chat-1")?.length).toBe(2);
+    expect(harness.chatMessages.get("chat-1")![1]?.content).toBe("");
+
+    // Reset back to 1 message for normal streaming test.
+    harness.chatMessages.get("chat-1")!.splice(1);
 
     streamMode = "normal";
     const okRes = await runnerRef.run(
@@ -457,7 +704,23 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     expect(harness.chatMessages.get("chat-1")?.length).toBe(2);
     expect(harness.dryRunCalls[0]?.input.includeRequestMessages).toBe(true);
     const sentMessages = harness.rawStreamCalls[2]?.messages as LlmMessageDTO[];
+    // Stripped eager blank assistant message before injecting guidance!
+    expect(sentMessages.some((m) => m.role === "assistant")).toBe(false);
     expect(sentMessages[0]?.content).toEqual([{ type: "text", text: "Rich prompt" }]);
+
+    // Mid-stream flushes omit metadata and pass skipChunkRebuild: true; final flush omits metadata and passes skipChunkRebuild: false.
+    expect(harness.updateMessageCalls.length).toBeGreaterThanOrEqual(2);
+    for (let i = 0; i < harness.updateMessageCalls.length - 1; i += 1) {
+      const patch = harness.updateMessageCalls[i]!.patch;
+      expect("metadata" in patch).toBe(false);
+      expect(patch.skipChunkRebuild).toBe(true);
+    }
+    const finalPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect("metadata" in finalPatch).toBe(false);
+    expect(finalPatch.skipChunkRebuild).toBe(false);
+    expect(harness.chatMessages.get("chat-1")![1]?.metadata).toEqual({
+      preset_contexts: [{ preset_id: "p-active" }],
+    });
   });
 
   test("guided_regenerate snapshots & restores multi-swipe/reasoning assistant on dryRun or 0-token failure and gates presets.get", async () => {
@@ -526,9 +789,11 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     expect(afterStreamFail[1]?.swipes).toEqual(["Original swipe 1", "Original swipe 2"]);
   });
 
-  test("guided_swipe strips rejected assistant turn from prompt and defers creating swipe until first token", async () => {
+  test("guided_swipe creates slot before dryRun, strips rejected turn from prompt, and keeps slot on 0-token failure", async () => {
     let emitTokens = false;
+    let sawEagerSlotBeforeDryRun = false;
     const harness = createSpindleHarness({
+      activePresetId: "p-swipe",
       chats: {
         "chat-1": [
           makeMessage({ id: "m1", role: "user", content: "Knock knock" }),
@@ -541,19 +806,27 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
           }),
         ],
       },
-      dryRunImpl: async () => ({
-        messages: [
-          { role: "user", content: "Knock knock" },
-          { role: "assistant", content: "Rejected old swipe" },
-        ],
-        request_messages: [
-          { role: "user", content: "Knock knock", sourceMessageId: "m1" },
-          { role: "assistant", content: "Rejected old swipe", sourceMessageId: "m2" },
-        ],
-        parameters: {},
-        model: "gpt-4o",
-        provider: "openai",
-      }),
+      dryRunImpl: async () => {
+        const target = harness.chatMessages.get("chat-1")![1]!;
+        sawEagerSlotBeforeDryRun =
+          target.swipes.length === 2 &&
+          target.swipes[1] === "" &&
+          target.swipe_id === 1 &&
+          target.content === "";
+        return {
+          messages: [
+            { role: "user", content: "Knock knock" },
+            { role: "assistant", content: "" },
+          ],
+          request_messages: [
+            { role: "user", content: "Knock knock", sourceMessageId: "m1" },
+            { role: "assistant", content: "", sourceMessageId: "m2" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
       rawStreamImpl: async function* () {
         if (!emitTokens) {
           throw new Error("0-token failure");
@@ -566,30 +839,34 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     const store = new SettingsStore(harness.api);
     const runner = new GuidedGenerationRunner(harness.api, store, () => {});
 
-    // 0-token failure leaves original swipes & swipe_id intact.
+    // 0-token failure keeps the eagerly created swipe slot & swipe_id.
     await expect(
       runner.run({ actionId: "guided_swipe", chatId: "chat-1", inputText: "Be mysterious" }, "u1"),
     ).rejects.toThrow("0-token failure");
-    const untouched = harness.chatMessages.get("chat-1")![1]!;
-    expect(untouched.swipes).toEqual(["Rejected old swipe"]);
-    expect(untouched.swipe_id).toBe(0);
+    expect(sawEagerSlotBeforeDryRun).toBe(true);
+    const afterFailure = harness.chatMessages.get("chat-1")![1]!;
+    expect(afterFailure.swipes).toEqual(["Rejected old swipe", ""]);
+    expect(afterFailure.swipe_id).toBe(1);
+    expect(afterFailure.metadata).toEqual({
+      preset_contexts: [null, { preset_id: "p-swipe" }],
+    });
 
     // Rejected assistant message was stripped from rawStream input.
     const failedPrompt = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
-    expect(failedPrompt.some((m) => m.content === "Rejected old swipe")).toBe(false);
+    expect(failedPrompt.some((m) => m.role === "assistant")).toBe(false);
     expect(failedPrompt.map((m) => m.role)).toEqual(["user", "system"]);
 
-    // Successful swipe appends & selects new swipe only once tokens arrive.
+    // Successful swipe appends next slot before dryRun and streams into it without duplicate slots.
     emitTokens = true;
     const res = await runner.run(
       { actionId: "guided_swipe", chatId: "chat-1", inputText: "Be mysterious" },
       "u1",
     );
-    expect(res.swipeId).toBe(1);
+    expect(res.swipeId).toBe(2);
     expect(res.text).toBe("Who's there?");
     const updated = harness.chatMessages.get("chat-1")![1]!;
-    expect(updated.swipes).toEqual(["Rejected old swipe", "Who's there?"]);
-    expect(updated.swipe_id).toBe(1);
+    expect(updated.swipes).toEqual(["Rejected old swipe", "", "Who's there?"]);
+    expect(updated.swipe_id).toBe(2);
   });
 
   test("guided_continue skips trailing system messages, handles Continue Nudge, and preserves concurrent sibling swipe edits", async () => {
@@ -870,5 +1147,2833 @@ describe("backend handleRpc orchestration", () => {
       .filter((m) => (m.payload as BackendPushEvent).type === "gg:changed")
       .map((m) => (m.payload as BackendPushEvent).reason);
     expect(changedReasons).toEqual(["chat_switched", "permissions"]);
+  });
+
+  test("bootstrap exposes regex_scripts/interceptor permissions and normalizeSettings defaults legacy action configs", () => {
+    const harness = createSpindleHarness({
+      permissions: { regex_scripts: true, interceptor: false },
+    });
+    const { buildBootstrapView } = registerBackend(harness.api);
+
+    const legacy = normalizeSettings({
+      actions: {
+        guided_response: {
+          enabled: true,
+          injectionRole: "user",
+          instructionTemplate: "Legacy {{input}}",
+        },
+        guided_swipe: {
+          guidancePosition: "invalid_pos",
+          guidanceDepth: 2500,
+          applyRegex: false,
+        },
+        guided_continue: {
+          guidancePosition: "in_history",
+          guidanceDepth: -4,
+        },
+      },
+    });
+
+    expect(legacy.actions.guided_response.guidancePosition).toBe("before_post_history");
+    expect(legacy.actions.guided_response.guidanceDepth).toBe(0);
+    expect(legacy.actions.guided_response.applyRegex).toBe(true);
+    expect(legacy.actions.guided_swipe.guidancePosition).toBe("before_post_history");
+    expect(legacy.actions.guided_swipe.guidanceDepth).toBe(999);
+    expect(legacy.actions.guided_swipe.applyRegex).toBe(false);
+    expect(legacy.actions.guided_continue.guidancePosition).toBe("in_history");
+    expect(legacy.actions.guided_continue.guidanceDepth).toBe(0);
+
+    return buildBootstrapView("u1").then((view: ExtensionBootstrapView) => {
+      expect(view.permissions).toEqual({
+        generation: true,
+        chats: true,
+        chat_mutation: true,
+        presets: true,
+        regex_scripts: true,
+        interceptor: false,
+      });
+    });
+  });
+
+  test("captures dry-run interceptor messages with dryRun=true quirk, places guidance by preset position, and strips swipe by captured sourceMessageId", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Rejected old swipe",
+            swipes: ["Rejected old swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main Prompt", __isChatHistory: false },
+          {
+            role: "user",
+            content: "Hello",
+            __isChatHistory: true,
+            sourceMessageId: "m1",
+            sourceIndexInChat: 0,
+          },
+          {
+            role: "assistant",
+            content: "Rejected old swipe",
+            __isChatHistory: true,
+            sourceMessageId: "m2",
+            sourceIndexInChat: 1,
+          },
+          { role: "system", content: "Post-History Rules", __isChatHistory: false },
+        ],
+      },
+      dryRunImpl: async () => ({
+        messages: [
+          { role: "system", content: "Main Prompt" },
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Rejected old swipe" },
+          { role: "system", content: "Post-History Rules" },
+        ],
+        // Deliberately omit sourceMessageId & __isChatHistory from request_messages
+        // so the runner must rely on the dry-run interceptor capture.
+        request_messages: [
+          { role: "system", content: "Main Prompt" },
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Rejected old swipe" },
+          { role: "system", content: "Post-History Rules" },
+        ],
+        parameters: {},
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+    });
+
+    const store = new SettingsStore(harness.api);
+    const settings = createDefaultSettings();
+    settings.actions.guided_swipe.guidancePosition = "before_post_history";
+    settings.actions.guided_response.guidancePosition = "pre_history";
+    await store.saveSettings(settings, "u1");
+
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    await runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Try again" },
+      "u1",
+    );
+
+    // Must NOT register with match: { isDryRun: true } (which fails on Lumiverse's dryRun: true quirk)
+    expect(harness.registerInterceptorCalls.length).toBe(1);
+    expect(harness.registerInterceptorCalls[0]?.options).toBeUndefined();
+
+    // Rejected m2 stripped via captured sourceMessageId; guidance injected before Post-History Rules
+    const swipeMessages = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
+    expect(swipeMessages.map((m) => m.content)).toEqual([
+      "Main Prompt",
+      "Hello",
+      "[OOC Guidance for this alternative response: Try again]",
+      "Post-History Rules",
+    ]);
+    // Internal __isChatHistory flag is stripped before sending to rawStream
+    expect(swipeMessages.every((m) => m.__isChatHistory === undefined)).toBe(true);
+
+    // Non-dry-run interceptor calls must pass through untouched and not clobber captures
+    const liveResult = await harness.registeredInterceptors[0]!(
+      [{ role: "user", content: "Live call" }],
+      { chatId: "chat-1", isDryRun: false, dryRun: false } as unknown as Parameters<
+        InterceptorHandler
+      >[1],
+    );
+    expect(liveResult).toEqual([{ role: "user", content: "Live call" }]);
+
+    // pre_history places guidance right before first chat_history turn
+    await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Set tone" },
+      "u1",
+    );
+    const responseMessages = harness.rawStreamCalls[1]?.messages as LlmMessageDTO[];
+    expect(responseMessages.map((m) => m.content)).toEqual([
+      "Main Prompt",
+      "[OOC Guidance for the next response: Set tone]",
+      "Hello",
+      "Rejected old swipe",
+      "Post-History Rules",
+    ]);
+  });
+
+  test("resolves macros in instructionTemplate before substituting {{input}} and applies prompt/response regex when applyRegex is enabled", async () => {
+    const promptScript: RegexScriptDTO = {
+      id: "pr-1",
+      can_mutate: false,
+      name: "Prompt rule",
+      script_id: "pr-1",
+      find_regex: "\\bshout\\b",
+      replace_string: "WHISPER",
+      flags: "gi",
+      placement: ["user_input"],
+      scope: "global",
+      scope_id: null,
+      target: "prompt",
+      min_depth: 1,
+      max_depth: 3,
+      trim_strings: [],
+      run_on_edit: false,
+      substitute_macros: "none",
+      disabled: false,
+      sort_order: 0,
+      description: "",
+      folder: "",
+      metadata: {},
+      created_at: 1,
+      updated_at: 1,
+    };
+
+    const responseScript: RegexScriptDTO = {
+      ...promptScript,
+      id: "rr-1",
+      name: "Response rule",
+      find_regex: "rawtoken",
+      replace_string: "clean {{char}}",
+      placement: ["ai_output"],
+      target: "response",
+      min_depth: null,
+      max_depth: null,
+      substitute_macros: "raw",
+    };
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hi" })],
+      },
+      chatCharacterIds: { "chat-1": "char-alice" },
+      regexScripts: [promptScript, responseScript],
+      macrosResolveImpl: async (template) => ({
+        // Simulate host macro engine stripping unknown {{input}} if unprotected
+        text: template
+          .replaceAll("{{char}}", "Alice")
+          .replaceAll("{{input}}", ""),
+        diagnostics: [],
+      }),
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: '<font color="#ff0000>rawtoken * softly *' };
+        yield { type: "done", content: '<font color="#ff0000>rawtoken * softly *', finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const settings = createDefaultSettings();
+    settings.actions.guided_response.injectionRole = "user";
+    settings.actions.guided_response.guidancePosition = "in_history";
+    settings.actions.guided_response.guidanceDepth = 2;
+    settings.actions.guided_response.instructionTemplate = "[For {{char}}: {{input}}]";
+    settings.actions.guided_response.applyRegex = true;
+    await store.saveSettings(settings, "u1");
+
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res = await runner.run(
+      // {{char}} inside user input must remain literal if macros resolved before {{input}}
+      { actionId: "guided_response", chatId: "chat-1", inputText: "please shout {{char}}" },
+      "u1",
+    );
+
+    // instructionTemplate resolved with commit: false and characterId
+    expect(harness.macroResolveCalls[0]?.opts).toEqual({
+      chatId: "chat-1",
+      characterId: "char-alice",
+      userId: "u1",
+      commit: false,
+    });
+
+    const sent = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
+    // guidanceDepth=2 on a 1-message prompt clamps to index 0 (before "Rich prompt")
+    expect(sent[0]?.content).toBe("[For Alice: please WHISPER {{char}}]");
+    expect(res.text).toBe('<font color="#ff0000">clean Alice *softly*</font>');
+    expect(harness.chatMessages.get("chat-1")![1]?.content).toBe(
+      '<font color="#ff0000">clean Alice *softly*</font>',
+    );
+
+    // When applyRegex is false, prompt and response regex scripts are skipped
+    settings.actions.guided_response.applyRegex = false;
+    await store.saveSettings(settings, "u1");
+    const skippedRes = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "please shout" },
+      "u1",
+    );
+    const sentSkipped = harness.rawStreamCalls[1]?.messages as LlmMessageDTO[];
+    expect(sentSkipped[0]?.content).toBe("[For Alice: please shout]");
+    expect(skippedRes.text).toBe('<font color="#ff0000>rawtoken * softly *');
+  });
+
+  test("applies response regex on guided_continue before stitching, on abort-with-partial-text, and on guided_impersonate final chunk", async () => {
+    const events: BackendPushEvent[] = [];
+    let runnerRef: GuidedGenerationRunner;
+    let mode: "continue" | "abort_partial" | "impersonate" = "continue";
+
+    const responseScript: RegexScriptDTO = {
+      id: "rr-2",
+      can_mutate: false,
+      name: "Clean tag",
+      script_id: "rr-2",
+      find_regex: "\\[DROP\\]",
+      replace_string: "",
+      flags: "g",
+      placement: ["ai_output"],
+      scope: "global",
+      scope_id: null,
+      target: "response",
+      min_depth: null,
+      max_depth: null,
+      trim_strings: [],
+      run_on_edit: false,
+      substitute_macros: "none",
+      disabled: false,
+      sort_order: 0,
+      description: "",
+      folder: "",
+      metadata: {},
+      created_at: 1,
+      updated_at: 1,
+    };
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Go" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            // Existing text has [DROP] which must NOT be touched during guided_continue!
+            content: "[DROP] Base",
+            swipes: ["[DROP] Base"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      regexScripts: [responseScript],
+      rawStreamImpl: async function* () {
+        if (mode === "continue") {
+          yield { type: "token", token: "and [DROP]continued * nicely *" };
+          yield { type: "done", content: "and [DROP]continued * nicely *", finish_reason: "stop" };
+          return;
+        }
+        if (mode === "abort_partial") {
+          yield { type: "token", token: 'partial [DROP] " text "' };
+          runnerRef.abortCurrent("u1");
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        yield { type: "token", token: "I [DROP]smile * warmly *" };
+        yield { type: "done", content: "I [DROP]smile * warmly *", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    runnerRef = new GuidedGenerationRunner(harness.api, store, (ev) => events.push(ev));
+
+    mode = "continue";
+    const contRes = await runnerRef.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(contRes.text).toBe("[DROP] Base and continued *nicely*");
+
+    mode = "abort_partial";
+    const abortRes = await runnerRef.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    expect(abortRes.aborted).toBe(true);
+    expect(abortRes.text).toBe('partial  "text"');
+    const persistedAbortMsg = harness.chatMessages.get("chat-1")![2]!;
+    expect(persistedAbortMsg.content).toBe('partial  "text"');
+
+    mode = "impersonate";
+    const impRes = await runnerRef.run(
+      { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Wave" },
+      "u1",
+    );
+    expect(impRes.text).toBe("I smile *warmly*");
+    const impDone = events.filter(
+      (e) => e.type === "gg:impersonate-chunk" && e.done === true,
+    );
+    expect(impDone[impDone.length - 1]?.text).toBe("I smile *warmly*");
+  });
+
+  test("guided_swipe stops mid-stream flushes on MESSAGE_SWIPED back to old swipe and commits cleanly on completion, abort, and error", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const makeBaseChat = () => [
+      makeMessage({ id: "m1", role: "user", content: "Tell me a story" }),
+      makeMessage({
+        id: "m2",
+        role: "assistant",
+        content: "Old swipe",
+        swipes: ["Old swipe"],
+        swipe_id: 0,
+        extra: {
+          reasoningBySwipe: ["Old reasoning"],
+          reasoningDurationBySwipe: [500],
+          reasoning: "Old reasoning",
+          reasoning_duration: 500,
+        },
+      }),
+    ];
+
+    // 1. Completion after swiping back mid-stream
+    let gate1Resolve!: () => void;
+    const gate1 = new Promise<void>((r) => {
+      gate1Resolve = r;
+    });
+
+    const harness = createSpindleHarness({
+      chats: { "chat-1": makeBaseChat() },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Part 1" };
+        await gate1;
+        yield { type: "reasoning", token: "New thought" };
+        yield { type: "token", token: " Part 2" };
+        await waitMs(135);
+        yield { type: "token", token: " Part 3" };
+        yield { type: "done", content: "Part 1 Part 2 Part 3", reasoning: "New thought", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runnerRef = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    const runPromise = runnerRef.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Twist" },
+      "u1",
+    );
+    while (harness.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    expect(harness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(1);
+    // Initial slot + mid-stream flush both had skipChunkRebuild: true.
+    expect(harness.updateMessageCalls[0]!.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[1]!.patch.skipChunkRebuild).toBe(true);
+
+    // User clicks < back to old swipe 0
+    const targetMsg = harness.chatMessages.get("chat-1")![1]!;
+    targetMsg.swipe_id = 0;
+    targetMsg.content = "Old swipe";
+    targetMsg.extra.reasoning = "Old reasoning";
+    harness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      message: { ...targetMsg, swipes: [...targetMsg.swipes], extra: { ...targetMsg.extra } },
+      action: "navigated",
+      swipeId: 0,
+      previousSwipeId: 1,
+    });
+    const callsAtSwipeBack = harness.updateMessageCalls.length;
+
+    gate1Resolve();
+    const res = await runPromise;
+
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("Part 1 Part 2 Part 3");
+    expect(harness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(0);
+    // Only ONE final background commit patch after swiping back (zero mid-stream flicker!)
+    expect(harness.updateMessageCalls.length).toBe(callsAtSwipeBack + 1);
+    const finalPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect("content" in finalPatch).toBe(false);
+    expect("swipe_id" in finalPatch).toBe(false);
+    expect("reasoning" in finalPatch).toBe(false);
+    expect(finalPatch.skipChunkRebuild).toBe(true);
+    expect(finalPatch.swipe_reasoning).toEqual([
+      { text: "Old reasoning", duration: 500 },
+      { text: "New thought" },
+    ]);
+
+    expect(targetMsg.swipe_id).toBe(0);
+    expect(targetMsg.content).toBe("Old swipe");
+    expect(targetMsg.swipes).toEqual(["Old swipe", "Part 1 Part 2 Part 3"]);
+    expect(targetMsg.extra.reasoning).toBe("Old reasoning");
+    expect(targetMsg.extra.reasoningBySwipe).toEqual(["Old reasoning", "New thought"]);
+
+    // 2. Abort-with-output while viewing old swipe
+    let abortGateResolve!: () => void;
+    const abortGate = new Promise<void>((r) => {
+      abortGateResolve = r;
+    });
+    const abortHarness = createSpindleHarness({
+      chats: { "chat-1": makeBaseChat() },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Abort start" };
+        await abortGate;
+        yield { type: "token", token: " partial" };
+        abortRunner.abortCurrent("u1");
+        const err = new Error("Aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+    });
+    const abortStore = new SettingsStore(abortHarness.api);
+    const abortRunner = new GuidedGenerationRunner(abortHarness.api, abortStore, () => {});
+    const abortPromise = abortRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Twist" },
+      "u1",
+    );
+    while (abortHarness.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    const abortMsg = abortHarness.chatMessages.get("chat-1")![1]!;
+    abortMsg.swipe_id = 0;
+    abortMsg.content = "Old swipe";
+    abortHarness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      message: { ...abortMsg, swipes: [...abortMsg.swipes], extra: { ...abortMsg.extra } },
+      action: "navigated",
+      swipeId: 0,
+      previousSwipeId: 1,
+    });
+    abortGateResolve();
+    const abortRes = await abortPromise;
+    expect(abortRes.aborted).toBe(true);
+    expect(abortRes.text).toBe("Abort start partial");
+    expect(abortMsg.swipe_id).toBe(0);
+    expect(abortMsg.content).toBe("Old swipe");
+    expect(abortMsg.swipes).toEqual(["Old swipe", "Abort start partial"]);
+    expect(abortHarness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(0);
+
+    // 3. Error-with-output while viewing old swipe
+    let errGateResolve!: () => void;
+    const errGate = new Promise<void>((r) => {
+      errGateResolve = r;
+    });
+    const errHarness = createSpindleHarness({
+      chats: { "chat-1": makeBaseChat() },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Err start" };
+        await errGate;
+        yield { type: "token", token: " partial" };
+        throw new Error("Midstream drop");
+      },
+    });
+    const errStore = new SettingsStore(errHarness.api);
+    const errRunner = new GuidedGenerationRunner(errHarness.api, errStore, () => {});
+    const errPromise = errRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Twist" },
+      "u1",
+    );
+    while (errHarness.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    const errMsg = errHarness.chatMessages.get("chat-1")![1]!;
+    errMsg.swipe_id = 0;
+    errMsg.content = "Old swipe";
+    errHarness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      message: { ...errMsg, swipes: [...errMsg.swipes], extra: { ...errMsg.extra } },
+      action: "navigated",
+      swipeId: 0,
+      previousSwipeId: 1,
+    });
+    errGateResolve();
+    await expect(errPromise).rejects.toThrow("Midstream drop");
+    expect(errMsg.swipe_id).toBe(0);
+    expect(errMsg.content).toBe("Old swipe");
+    expect(errMsg.swipes).toEqual(["Old swipe", "Err start partial"]);
+    expect(errHarness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(0);
+  });
+
+  test("guided_swipe keeps swipe_id on old swipe if user navigates away before token 1 (TTFT)", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    let ttftResolve!: () => void;
+    const ttftGate = new Promise<void>((r) => {
+      ttftResolve = r;
+    });
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Swipe 1",
+            swipes: ["Swipe 0", "Swipe 1"],
+            swipe_id: 1,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        await ttftGate;
+        yield { type: "token", token: "Hello" };
+        await waitMs(135);
+        yield { type: "token", token: " world" };
+        yield { type: "done", content: "Hello world", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const runPromise = runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+
+    // Wait until rawStream has been entered (TTFT phase before token 1); eager active slot already created
+    while (harness.rawStreamCalls.length < 1) {
+      await waitMs(5);
+    }
+
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    expect(msg.swipe_id).toBe(2);
+    msg.swipe_id = 0;
+    msg.content = "Swipe 0";
+    harness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      message: { ...msg, swipes: [...msg.swipes] },
+      action: "navigated",
+      swipeId: 0,
+      previousSwipeId: 2,
+    });
+
+    ttftResolve();
+    const res = await runPromise;
+
+    expect(res.swipeId).toBe(2);
+    expect(res.text).toBe("Hello world");
+    expect(msg.swipe_id).toBe(0);
+    expect(msg.content).toBe("Swipe 0");
+    expect(msg.swipes).toEqual(["Swipe 0", "Swipe 1", "Hello world"]);
+
+    // Exactly 2 updateMessage calls: 1 eager slot creation ("") + 1 background completion commit
+    expect(harness.updateMessageCalls).toHaveLength(2);
+    expect(harness.updateMessageCalls[0]!.patch.swipe_id).toBe(2);
+    expect(harness.updateMessageCalls[0]!.patch.content).toBe("");
+    expect(harness.updateMessageCalls[0]!.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[0]!.patch.swipes).toEqual(["Swipe 0", "Swipe 1", ""]);
+
+    expect("content" in harness.updateMessageCalls[1]!.patch).toBe(false);
+    expect("swipe_id" in harness.updateMessageCalls[1]!.patch).toBe(false);
+    expect(harness.updateMessageCalls[1]!.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[1]!.patch.swipes).toEqual([
+      "Swipe 0",
+      "Swipe 1",
+      "Hello world",
+    ]);
+  });
+
+  test("guided_swipe resumes live streaming flushes when user navigates forward onto newSwipeIndex mid-stream", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    let midGateResolve!: () => void;
+    const midGate = new Promise<void>((r) => {
+      midGateResolve = r;
+    });
+
+    const harness = createSpindleHarness({
+      activePresetId: "p-swipe",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Old swipe",
+            swipes: ["Old swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Start" };
+        yield { type: "token", token: " middle" };
+        await midGate;
+        await waitMs(135);
+        yield { type: "token", token: " end" };
+        yield { type: "done", content: "Start middle end", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const runPromise = runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer", backgroundSwipe: true },
+      "u1",
+    );
+
+    // Wait for eager background slot registration and buffered tokens in rawStream
+    while (harness.rawStreamCalls.length < 1) {
+      await waitMs(5);
+    }
+    await waitMs(15);
+    expect(harness.updateMessageCalls).toHaveLength(1);
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    expect(msg.swipe_id).toBe(0);
+    expect(msg.swipes).toEqual(["Old swipe", ""]);
+    expect(msg.metadata).toEqual({
+      preset_contexts: [null, { preset_id: "p-swipe" }],
+    });
+
+    // User clicks > onto newSwipeIndex (1) mid-stream
+    msg.swipe_id = 1;
+    msg.content = "";
+    harness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      message: { ...msg, swipes: [...msg.swipes] },
+      action: "navigated",
+      swipeId: 1,
+      previousSwipeId: 0,
+    });
+
+    // Immediate flush resumes live streaming on swipe 1 without rewriting metadata
+    while (harness.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    expect(harness.updateMessageCalls[1]!.patch.swipe_id).toBe(1);
+    expect(harness.updateMessageCalls[1]!.patch.content).toBe("Start middle");
+    expect(harness.updateMessageCalls[1]!.patch.skipChunkRebuild).toBe(true);
+    expect("metadata" in harness.updateMessageCalls[1]!.patch).toBe(false);
+
+    midGateResolve();
+    const res = await runPromise;
+
+    expect(res.text).toBe("Start middle end");
+    expect(msg.swipe_id).toBe(1);
+    expect(msg.content).toBe("Start middle end");
+    const lastPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect(lastPatch.swipe_id).toBe(1);
+    expect(lastPatch.skipChunkRebuild).toBe(false);
+    expect("metadata" in lastPatch).toBe(false);
+    expect(lastPatch.content).toBe("Start middle end");
+  });
+
+  test("backgroundSwipe: true on RunActionInput starts in background mode, buffers mid-stream, and commits text + reasoning on completion", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const harness = createSpindleHarness({
+      activePresetId: "p-bg",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Old swipe",
+            swipes: ["Old swipe"],
+            swipe_id: 0,
+            extra: {
+              reasoningBySwipe: ["Old thought"],
+              reasoningDurationBySwipe: [300],
+              reasoning: "Old thought",
+              reasoning_duration: 300,
+            },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Alpha" };
+        await waitMs(135);
+        yield { type: "reasoning", token: "Bg thought" };
+        yield { type: "token", token: " Beta" };
+        yield { type: "done", content: "Alpha Beta", reasoning: "Bg thought", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res = await runner.run(
+      {
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        inputText: "Keep reading old",
+        backgroundSwipe: true,
+      },
+      "u1",
+    );
+
+    expect(res.swipeId).toBe(1);
+    expect(res.text).toBe("Alpha Beta");
+
+    // Only 2 updateMessage calls across >135ms stream: initial eager slot registration + final commit
+    expect(harness.updateMessageCalls).toHaveLength(2);
+    const [slotPatch, commitPatch] = harness.updateMessageCalls.map((c) => c.patch);
+
+    expect("content" in slotPatch!).toBe(false);
+    expect("swipe_id" in slotPatch!).toBe(false);
+    expect("reasoning" in slotPatch!).toBe(false);
+    expect("swipe_reasoning" in slotPatch!).toBe(false);
+    expect(slotPatch!.skipChunkRebuild).toBe(true);
+    expect(slotPatch!.swipes).toEqual(["Old swipe", ""]);
+    expect(slotPatch!.metadata).toEqual({
+      preset_contexts: [null, { preset_id: "p-bg" }],
+    });
+
+    expect("content" in commitPatch!).toBe(false);
+    expect("swipe_id" in commitPatch!).toBe(false);
+    expect("reasoning" in commitPatch!).toBe(false);
+    expect("metadata" in commitPatch!).toBe(false);
+    expect(commitPatch!.skipChunkRebuild).toBe(true);
+    expect(commitPatch!.swipes).toEqual(["Old swipe", "Alpha Beta"]);
+    expect(commitPatch!.swipe_reasoning).toEqual([
+      { text: "Old thought", duration: 300 },
+      { text: "Bg thought" },
+    ]);
+
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    expect(msg.swipe_id).toBe(0);
+    expect(msg.content).toBe("Old swipe");
+    expect(msg.swipes).toEqual(["Old swipe", "Alpha Beta"]);
+    expect(msg.extra.reasoning).toBe("Old thought");
+    expect(msg.extra.reasoningBySwipe).toEqual(["Old thought", "Bg thought"]);
+    expect(harness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(0);
+  });
+
+  test("guided_regenerate eagerly replaces trailing assistant before dryRun, strips blank slot, and restores cleanly without duplicate on 0-token abort/failure", async () => {
+    let streamBehavior: "abort_zero" | "fail_zero" | "succeed" = "abort_zero";
+    let sawBlankCreatedBeforeDryRun = false;
+    let runnerRef: GuidedGenerationRunner;
+
+    const harness = createSpindleHarness({
+      presets: { "p-regen": { id: "p-regen", name: "Regen Preset" } },
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Question" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Original swipe 2",
+            swipe_id: 1,
+            swipes: ["Original swipe 1", "Original swipe 2"],
+            swipe_dates: [1700000010, 1700000020],
+            extra: { reasoning: "Original thought", reasoning_duration: 1.2 },
+            metadata: { customKeep: "orig" },
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        const msgs = harness.chatMessages.get("chat-1")!;
+        const last = msgs[msgs.length - 1];
+        sawBlankCreatedBeforeDryRun =
+          msgs.length === 2 &&
+          last?.id !== "m2" &&
+          last?.role === "assistant" &&
+          last?.content === "" &&
+          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
+            ?.preset_id === "p-regen";
+        return {
+          messages: [],
+          request_messages: [
+            { role: "user", content: "Question", sourceMessageId: "m1" },
+            ...(last ? [{ role: "assistant" as const, content: "", sourceMessageId: last.id }] : []),
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        if (streamBehavior === "abort_zero") {
+          runnerRef.abortCurrent("u1");
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        if (streamBehavior === "fail_zero") {
+          throw new Error("0-token regen failure");
+        }
+        yield { type: "token", token: "Fresh " };
+        await new Promise((r) => setTimeout(r, 135));
+        yield { type: "token", token: "answer." };
+        yield { type: "done", content: "Fresh answer.", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const settings = createDefaultSettings();
+    settings.actions.guided_regenerate.presetId = "p-regen";
+    await store.saveSettings(settings, "u1");
+    runnerRef = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    // 1. 0-token abort deletes empty pre-created slot and restores snapshot without duplicate
+    streamBehavior = "abort_zero";
+    const aborted = await runnerRef.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try better" },
+      "u1",
+    );
+    expect(aborted.aborted).toBe(true);
+    expect(aborted.messageId).toBeUndefined();
+    expect(sawBlankCreatedBeforeDryRun).toBe(true);
+    const afterAbort = harness.chatMessages.get("chat-1")!;
+    expect(afterAbort).toHaveLength(2);
+    expect(afterAbort[1]?.content).toBe("Original swipe 2");
+    expect(afterAbort[1]?.swipes).toEqual(["Original swipe 1", "Original swipe 2"]);
+    expect(afterAbort[1]?.swipe_id).toBe(1);
+    expect(afterAbort[1]?.metadata).toEqual({ customKeep: "orig" });
+
+    // 2. 0-token failure also cleans up empty slot and restores snapshot
+    streamBehavior = "fail_zero";
+    await expect(
+      runnerRef.run({ actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try better" }, "u1"),
+    ).rejects.toThrow("0-token regen failure");
+    expect(harness.chatMessages.get("chat-1")).toHaveLength(2);
+    expect(harness.chatMessages.get("chat-1")![1]?.content).toBe("Original swipe 2");
+
+    // 3. Successful stream strips blank slot from dryRun prompt and streams into pre-created slot
+    harness.updateMessageCalls.length = 0;
+    streamBehavior = "succeed";
+    const ok = await runnerRef.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try better" },
+      "u1",
+    );
+    expect(ok.aborted).toBe(false);
+    expect(ok.text).toBe("Fresh answer.");
+    const sent = harness.rawStreamCalls[2]?.messages as LlmMessageDTO[];
+    expect(sent.some((m) => m.role === "assistant")).toBe(false);
+
+    const finalMsgs = harness.chatMessages.get("chat-1")!;
+    expect(finalMsgs).toHaveLength(2);
+    expect(finalMsgs[1]?.content).toBe("Fresh answer.");
+    expect(finalMsgs[1]?.metadata).toEqual({
+      preset_contexts: [{ preset_id: "p-regen" }],
+    });
+    expect(harness.updateMessageCalls.length).toBeGreaterThanOrEqual(2);
+    for (let i = 0; i < harness.updateMessageCalls.length - 1; i += 1) {
+      expect(harness.updateMessageCalls[i]!.patch.skipChunkRebuild).toBe(true);
+      expect("metadata" in harness.updateMessageCalls[i]!.patch).toBe(false);
+    }
+    const lastRegenPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect(lastRegenPatch.skipChunkRebuild).toBe(false);
+    expect("metadata" in lastRegenPatch).toBe(false);
+  });
+
+  test("guided_continue patches missing preset_contexts once before streaming, preserves existing preset_contexts, and uses skipChunkRebuild", async () => {
+    const harness = createSpindleHarness({
+      activePresetId: "p-cont",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Go" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Line one",
+            swipes: ["Line one"],
+            swipe_id: 0,
+            metadata: { existingFlag: true },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "line " };
+        await new Promise((r) => setTimeout(r, 135));
+        yield { type: "token", token: "two." };
+        yield { type: "done", content: "line two.", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res1 = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(res1.text).toBe("Line one line two.");
+
+    // First updateMessage call patched metadata once (without overwriting content/swipes)
+    expect(harness.updateMessageCalls[0]!.patch).toEqual({
+      metadata: {
+        existingFlag: true,
+        preset_contexts: [{ preset_id: "p-cont" }],
+      },
+      skipChunkRebuild: true,
+    });
+    // Mid-stream flush had skipChunkRebuild: true and no metadata; final flush had skipChunkRebuild: false and no metadata
+    for (let i = 1; i < harness.updateMessageCalls.length - 1; i += 1) {
+      expect(harness.updateMessageCalls[i]!.patch.skipChunkRebuild).toBe(true);
+      expect("metadata" in harness.updateMessageCalls[i]!.patch).toBe(false);
+    }
+    const lastPatch1 = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect(lastPatch1.skipChunkRebuild).toBe(false);
+    expect("metadata" in lastPatch1).toBe(false);
+
+    // Second continue when preset_contexts[0] is ALREADY set must NOT touch metadata at all (preserves presetIdentity!)
+    harness.updateMessageCalls.length = 0;
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    msg.metadata = {
+      existingFlag: true,
+      preset_contexts: [{ preset_id: "p-original-kept" }],
+    };
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(harness.updateMessageCalls.every((c) => !("metadata" in c.patch))).toBe(true);
+    expect(msg.metadata).toEqual({
+      existingFlag: true,
+      preset_contexts: [{ preset_id: "p-original-kept" }],
+    });
+  });
+
+  test("omits preset_contexts when configured preset is deleted or presets.getActive returns null/throws, and handleRpc parses backgroundSwipe", async () => {
+    const harness = createSpindleHarness({
+      presets: {},
+      getActivePresetThrows: true,
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Swipe 0",
+            swipes: ["Swipe 0"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+    });
+    const { handleRpc } = registerBackend(harness.api);
+
+    // Deleted presetId configured -> must NOT write invalid preset_id into preset_contexts
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "req-save",
+        action: "save_settings",
+        input: {
+          actions: {
+            guided_response: { presetId: "deleted-preset-id" },
+          },
+        },
+      },
+      "u1",
+    );
+
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "req-resp",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-1", inputText: "Hello" },
+      },
+      "u1",
+    );
+    const respMsg = harness.chatMessages.get("chat-1")![2]!;
+    expect(respMsg.metadata).toBeUndefined();
+
+    // handleRpc forwards backgroundSwipe: true onto RunActionInput for guided_swipe
+    harness.chatMessages.get("chat-1")!.splice(2);
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "req-bg-swipe",
+        action: "run_action",
+        input: {
+          actionId: "guided_swipe",
+          chatId: "chat-1",
+          inputText: "Bg via rpc",
+          backgroundSwipe: true,
+        },
+      },
+      "u1",
+    );
+    const swipedMsg = harness.chatMessages.get("chat-1")![1]!;
+    expect(swipedMsg.swipe_id).toBe(0);
+    expect(swipedMsg.content).toBe("Swipe 0");
+    expect(swipedMsg.swipes).toEqual(["Swipe 0", "Generated reply."]);
+  });
+
+  test("SettingsStore continue history enforces LIFO stack per swipe, MAX_CONTINUE_ENTRIES cap, write serialization, and userId isolation", async () => {
+    let failWrite = false;
+    const harness = createSpindleHarness({
+      writeDelayMs: 5,
+      writeError: (path) =>
+        failWrite && path === "continue-history.json"
+          ? new Error("disk full")
+          : null,
+    });
+    const store = new SettingsStore(harness.api);
+
+    await Promise.all([
+      store.pushContinueEntry(
+        {
+          chatId: "chat-1",
+          messageId: "m-1",
+          swipeIndex: 0,
+          baseText: "Base",
+          resultText: "Base One",
+          baseReasoning: "R0",
+          baseReasoningDuration: 1.5,
+          inputText: "first",
+        },
+        "user-a",
+      ),
+      store.pushContinueEntry(
+        {
+          chatId: "chat-1",
+          messageId: "m-1",
+          swipeIndex: 0,
+          baseText: "Base One",
+          resultText: "Base One Two",
+          baseReasoning: "R1",
+          baseReasoningDuration: 2.0,
+          inputText: "second",
+        },
+        "user-a",
+      ),
+      store.pushContinueEntry(
+        {
+          chatId: "chat-1",
+          messageId: "m-1",
+          swipeIndex: 1,
+          baseText: "Swipe 1",
+          resultText: "Swipe 1 Cont",
+          baseReasoning: null,
+          baseReasoningDuration: null,
+          inputText: "other swipe",
+        },
+        "user-a",
+      ),
+    ]);
+
+    expect(await store.peekContinueEntry("chat-1", "m-1", 0, "user-b")).toBeNull();
+
+    const topSwipe0 = await store.peekContinueEntry("chat-1", "m-1", 0, "user-a");
+    expect(topSwipe0?.resultText).toBe("Base One Two");
+
+    // Failed write must not mutate in-memory cache.
+    failWrite = true;
+    await expect(
+      store.pushContinueEntry(
+        {
+          chatId: "chat-1",
+          messageId: "m-1",
+          swipeIndex: 0,
+          baseText: "X",
+          resultText: "Y",
+          baseReasoning: null,
+          baseReasoningDuration: null,
+          inputText: "",
+        },
+        "user-a",
+      ),
+    ).rejects.toThrow("disk full");
+    failWrite = false;
+
+    expect((await store.peekContinueEntry("chat-1", "m-1", 0, "user-a"))?.id).toBe(
+      topSwipe0?.id,
+    );
+
+    // Replace top entry atomically.
+    const replaced = await store.replaceTopContinueEntry(
+      "chat-1",
+      "m-1",
+      0,
+      topSwipe0!.id,
+      {
+        chatId: "chat-1",
+        messageId: "m-1",
+        swipeIndex: 0,
+        baseText: "Base One",
+        resultText: "Base One Replaced",
+        baseReasoning: "R1",
+        baseReasoningDuration: 2.0,
+        inputText: "second",
+      },
+      "user-a",
+    );
+    expect(replaced.resultText).toBe("Base One Replaced");
+    expect((await store.peekContinueEntry("chat-1", "m-1", 0, "user-a"))?.id).toBe(
+      replaced.id,
+    );
+
+    // Mismatched expectedId does not pop.
+    expect(
+      await store.popContinueEntry("chat-1", "m-1", 0, "wrong-id", "user-a"),
+    ).toBeNull();
+
+    const popped1 = await store.popContinueEntry(
+      "chat-1",
+      "m-1",
+      0,
+      replaced.id,
+      "user-a",
+    );
+    expect(popped1?.resultText).toBe("Base One Replaced");
+    const popped2 = await store.popContinueEntry("chat-1", "m-1", 0, undefined, "user-a");
+    expect(popped2?.resultText).toBe("Base One");
+    expect(await store.peekContinueEntry("chat-1", "m-1", 0, "user-a")).toBeNull();
+    // Swipe 1 remains untouched.
+    expect((await store.peekContinueEntry("chat-1", "m-1", 1, "user-a"))?.inputText).toBe(
+      "other swipe",
+    );
+
+    // Evicts oldest entries beyond MAX_CONTINUE_ENTRIES.
+    for (let i = 0; i < MAX_CONTINUE_ENTRIES + 5; i += 1) {
+      await store.pushContinueEntry(
+        {
+          chatId: "chat-cap",
+          messageId: "m-cap",
+          swipeIndex: 0,
+          baseText: `B${i}`,
+          resultText: `R${i}`,
+          baseReasoning: null,
+          baseReasoningDuration: null,
+          inputText: `${i}`,
+        },
+        "user-cap",
+      );
+    }
+    const capped = await store.getContinueHistory("user-cap");
+    expect(capped.length).toBe(MAX_CONTINUE_ENTRIES);
+    expect(capped[0]?.resultText).toBe(`R${MAX_CONTINUE_ENTRIES + 4}`);
+    expect(capped[capped.length - 1]?.resultText).toBe("R5");
+  });
+
+  test("guided_continue LIFO stack records continues and remove_last_continue restores baseText, reasoning, and duration one step at a time", async () => {
+    let streamCount = 0;
+    const harness = createSpindleHarness({
+      presets: { "p-cont": { id: "p-cont", name: "Continue Preset" } },
+      activePresetId: "p-cont",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Tell a story." }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "She opened the door.",
+            swipes: ["She opened the door.", "Alt swipe."],
+            swipe_id: 0,
+            extra: {
+              reasoningBySwipe: ["Initial thought", "Alt thought"],
+              reasoningDurationBySwipe: [1.5, 0.8],
+              reasoning: "Initial thought",
+              reasoningDuration: 1.5,
+            },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        streamCount += 1;
+        if (streamCount === 1) {
+          yield { type: "reasoning", token: "Cont 1 thought" };
+          yield { type: "token", token: "Cold wind rushed in." };
+          yield { type: "done", content: "Cold wind rushed in.", reasoning: "Cont 1 thought", finish_reason: "stop" };
+        } else {
+          yield { type: "reasoning", token: "Cont 2 thought" };
+          yield { type: "token", token: "A shadow moved." };
+          yield { type: "done", content: "A shadow moved.", reasoning: "Cont 2 thought", finish_reason: "stop" };
+        }
+      },
+    });
+    const { runner, handleRpc } = registerBackend(harness.api);
+
+    // First guided_continue
+    const res1 = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Add atmosphere" },
+      "u1",
+    );
+    expect(res1.text).toBe("She opened the door. Cold wind rushed in.");
+    const msgAfter1 = harness.chatMessages.get("chat-1")![1]!;
+    expect(msgAfter1.extra.reasoning).toBe("Cont 1 thought");
+    expect(msgAfter1.metadata).toEqual({ preset_contexts: [{ preset_id: "p-cont" }] });
+
+    // Second guided_continue on top of first
+    const res2 = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Add danger" },
+      "u1",
+    );
+    expect(res2.text).toBe("She opened the door. Cold wind rushed in. A shadow moved.");
+    expect(harness.chatMessages.get("chat-1")![1]!.extra.reasoning).toBe("Cont 2 thought");
+
+    // Remove #1 -> pops second continue back to first continue state
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "rem-1",
+        action: "remove_last_continue",
+        input: { chatId: "chat-1" },
+      },
+      "u1",
+    );
+    const reply1 = harness.sentFrontend.find(
+      (e) => (e.payload as RpcReplyEnvelope).requestId === "rem-1",
+    )?.payload as RpcReplyEnvelope;
+    expect(reply1.error).toBeUndefined();
+    expect(reply1.result as RemoveContinueResult).toEqual({
+      removed: true,
+      messageId: "m2",
+      swipeIndex: 0,
+      text: "She opened the door. Cold wind rushed in.",
+    });
+
+    const afterRem1 = harness.chatMessages.get("chat-1")![1]!;
+    expect(afterRem1.content).toBe("She opened the door. Cold wind rushed in.");
+    expect(afterRem1.swipes[0]).toBe("She opened the door. Cold wind rushed in.");
+    expect(afterRem1.swipes[1]).toBe("Alt swipe.");
+    expect(afterRem1.extra.reasoning).toBe("Cont 1 thought");
+    expect(afterRem1.metadata).toEqual({ preset_contexts: [{ preset_id: "p-cont" }] });
+
+    // Remove #2 -> pops first continue back to original message + original reasoning + duration
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "rem-2",
+        action: "remove_last_continue",
+        input: { chatId: "chat-1" },
+      },
+      "u1",
+    );
+    const reply2 = harness.sentFrontend.find(
+      (e) => (e.payload as RpcReplyEnvelope).requestId === "rem-2",
+    )?.payload as RpcReplyEnvelope;
+    expect(reply2.error).toBeUndefined();
+    expect((reply2.result as RemoveContinueResult).text).toBe("She opened the door.");
+
+    const afterRem2 = harness.chatMessages.get("chat-1")![1]!;
+    expect(afterRem2.content).toBe("She opened the door.");
+    expect(afterRem2.extra.reasoning).toBe("Initial thought");
+    expect(afterRem2.extra.reasoning_duration).toBe(1.5);
+    expect(afterRem2.extra.reasoningBySwipe).toEqual(["Initial thought", "Alt thought"]);
+    expect(afterRem2.extra.reasoningDurationBySwipe).toEqual([1.5, 0.8]);
+    const finalPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect(finalPatch.skipChunkRebuild).toBe(false);
+    expect("metadata" in finalPatch).toBe(false);
+
+    // Remove #3 -> empty stack throws friendly error
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "rem-3",
+        action: "remove_last_continue",
+        input: { chatId: "chat-1" },
+      },
+      "u1",
+    );
+    const reply3 = harness.sentFrontend.find(
+      (e) => (e.payload as RpcReplyEnvelope).requestId === "rem-3",
+    )?.payload as RpcReplyEnvelope;
+    expect(reply3.error).toBe("No continue history found for the current swipe.");
+  });
+
+  test("guided_continue does not push history on 0-token abort/error, pushes on abort/error with output, and remove_last_continue guards incompatible edits", async () => {
+    let mode: "zero_abort" | "zero_error" | "error_with_output" | "abort_with_output" = "zero_abort";
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Go on." }),
+          makeMessage({ id: "m2", role: "assistant", content: "Original line.", swipes: ["Original line."], swipe_id: 0 }),
+        ],
+      },
+      rawStreamImpl: async function* ({ signal }) {
+        if (mode === "zero_abort") {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        if (mode === "zero_error") {
+          throw new Error("Upstream 502");
+        }
+        if (mode === "error_with_output") {
+          yield { type: "token", token: "Partial error output." };
+          throw new Error("Midstream drop");
+        }
+        if (mode === "abort_with_output") {
+          yield { type: "token", token: "Partial abort" };
+          if (signal?.aborted) return;
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+      },
+    });
+    const { store, runner } = registerBackend(harness.api);
+
+    mode = "zero_abort";
+    const zeroAbortRes = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "x" },
+      "u1",
+    );
+    expect(zeroAbortRes.aborted).toBe(true);
+    expect(await store.peekContinueEntry("chat-1", "m2", 0, "u1")).toBeNull();
+
+    mode = "zero_error";
+    await expect(
+      runner.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "x" }, "u1"),
+    ).rejects.toThrow("Upstream 502");
+    expect(await store.peekContinueEntry("chat-1", "m2", 0, "u1")).toBeNull();
+
+    // Error with output must record history so user can undo the partial output.
+    mode = "error_with_output";
+    await expect(
+      runner.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "Recoverable" }, "u1"),
+    ).rejects.toThrow("Midstream drop");
+    const errEntry = await store.peekContinueEntry("chat-1", "m2", 0, "u1");
+    expect(errEntry?.baseText).toBe("Original line.");
+    expect(errEntry?.resultText).toBe("Original line. Partial error output.");
+    expect(errEntry?.inputText).toBe("Recoverable");
+
+    // Undo clears partial output and restores null reasoning.
+    const removedErr = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removedErr.text).toBe("Original line.");
+    expect(harness.chatMessages.get("chat-1")![1]!.content).toBe("Original line.");
+
+    // Abort with output records history too.
+    mode = "abort_with_output";
+    const abortOutRes = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Abortable" },
+      "u1",
+    );
+    expect(abortOutRes.aborted).toBe(true);
+    expect(abortOutRes.text).toBe("Original line. Partial abort");
+    expect((await store.peekContinueEntry("chat-1", "m2", 0, "u1"))?.resultText).toBe(
+      "Original line. Partial abort",
+    );
+
+    // Incompatible manual edit blocks remove_last_continue without popping stack.
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    msg.content = "Completely rewritten text.";
+    msg.swipes[0] = "Completely rewritten text.";
+    await expect(
+      runner.removeLastContinue({ chatId: "chat-1" }, "u1"),
+    ).rejects.toThrow("The message was edited after the last continue; cannot safely remove it.");
+    expect(await store.peekContinueEntry("chat-1", "m2", 0, "u1")).not.toBeNull();
+
+    // Compatible tail edit (still starts with baseText) is allowed.
+    msg.content = "Original line. Tweaked ending.";
+    msg.swipes[0] = "Original line. Tweaked ending.";
+    const removedTail = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removedTail.text).toBe("Original line.");
+    expect(await store.peekContinueEntry("chat-1", "m2", 0, "u1")).toBeNull();
+  });
+
+  test("regenerate_last_continue reverts eagerly to baseText, reuses saved inputText without touching inputRecovery, and updates stack on success", async () => {
+    let streamCount = 0;
+    let promptSeenOnRegen: LlmMessageDTO[] = [];
+    const seenTextsDuringStream: string[] = [];
+
+    const harness = createSpindleHarness({
+      presets: { "p-cont": { id: "p-cont", name: "Continue Preset" } },
+      activePresetId: "p-cont",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base start.",
+            swipes: ["Base start."],
+            swipe_id: 0,
+            extra: {
+              reasoning: "Base reasoning",
+              reasoningDuration: 2.25,
+            },
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        // Observe the eagerly reverted message state before dryRun finishes!
+        seenTextsDuringStream.push(harness.chatMessages.get("chat-1")![1]!.content);
+        return {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: harness.chatMessages.get("chat-1")![1]!.content },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        streamCount += 1;
+        if (streamCount === 1) {
+          yield { type: "reasoning", token: "First cont reasoning" };
+          yield { type: "token", token: "First continuation." };
+          yield { type: "done", content: "First continuation.", reasoning: "First cont reasoning", finish_reason: "stop" };
+        } else {
+          promptSeenOnRegen = input.messages as LlmMessageDTO[];
+          yield { type: "reasoning", token: "Second cont reasoning" };
+          yield { type: "token", token: "Fresh continuation." };
+          yield { type: "done", content: "Fresh continuation.", reasoning: "Second cont reasoning", finish_reason: "stop" };
+        }
+      },
+    });
+    const { store, runner, handleRpc } = registerBackend(harness.api);
+
+    // Run initial guided_continue with inputText (pushes to inputRecovery once).
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep it spooky" },
+      "u1",
+    );
+    const recoveryBeforeRegen = await store.getRecovery("u1");
+    expect(recoveryBeforeRegen.length).toBe(1);
+    expect(recoveryBeforeRegen[0]?.text).toBe("Keep it spooky");
+
+    harness.updateMessageCalls.length = 0;
+    harness.sentFrontend.length = 0;
+    seenTextsDuringStream.length = 0;
+
+    // Regenerate last continue via RPC.
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "regen-1",
+        action: "regenerate_last_continue",
+        input: { chatId: "chat-1" },
+      },
+      "u1",
+    );
+
+    const regenReply = harness.sentFrontend.find(
+      (e) => (e.payload as RpcReplyEnvelope).requestId === "regen-1",
+    )?.payload as RpcReplyEnvelope;
+    expect(regenReply.error).toBeUndefined();
+    expect((regenReply.result as { text: string }).text).toBe(
+      "Base start. Fresh continuation.",
+    );
+
+    // Eager revert happened before dryRun with skipChunkRebuild: true and base reasoning/duration.
+    expect(seenTextsDuringStream[0]).toBe("Base start.");
+    expect(harness.updateMessageCalls[0]?.patch.content).toBe("Base start.");
+    expect(harness.updateMessageCalls[0]?.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[0]?.patch.reasoning).toEqual({
+      text: "Base reasoning",
+      duration: 2.25,
+    });
+
+    // Reused saved inputText in prompt without adding duplicate/new entry to inputRecovery.
+    expect(
+      promptSeenOnRegen.some(
+        (m) => typeof m.content === "string" && m.content.includes("Keep it spooky"),
+      ),
+    ).toBe(true);
+    expect(await store.getRecovery("u1")).toEqual(recoveryBeforeRegen);
+
+    // Emitted gg:status lifecycle with guided_continue.
+    const statusEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+      .map((e) => (e.payload as BackendPushEvent).run);
+    expect(statusEvents[0]?.actionId).toBe("guided_continue");
+    expect(statusEvents[statusEvents.length - 1]).toBeNull();
+
+    // Stack top now has updated resultText while keeping original baseText/baseReasoning/inputText.
+    const topEntry = await store.peekContinueEntry("chat-1", "m2", 0, "u1");
+    expect(topEntry?.baseText).toBe("Base start.");
+    expect(topEntry?.resultText).toBe("Base start. Fresh continuation.");
+    expect(topEntry?.baseReasoning).toBe("Base reasoning");
+    expect(topEntry?.baseReasoningDuration).toBe(2.25);
+    expect(topEntry?.inputText).toBe("Keep it spooky");
+
+    // Removing after regenerate reverts all the way back to original base state.
+    const removed = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removed.text).toBe("Base start.");
+    const msgFinal = harness.chatMessages.get("chat-1")![1]!;
+    expect(msgFinal.content).toBe("Base start.");
+    expect(msgFinal.extra.reasoning).toBe("Base reasoning");
+    expect(msgFinal.extra.reasoning_duration).toBe(2.25);
+  });
+
+  test("regenerate_last_continue restores preRegen message and keeps stack entry on 0-token abort or failure", async () => {
+    let failDryRun = false;
+    let streamMode: "normal" | "zero_abort" | "zero_error" = "normal";
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base line.",
+            swipes: ["Base line."],
+            swipe_id: 0,
+            extra: { reasoning: "Base R", reasoning_duration: 1.0 },
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        if (failDryRun) throw new Error("DryRun failed");
+        return {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Base line." },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        if (streamMode === "normal") {
+          yield { type: "reasoning", token: "Prev cont R" };
+          yield { type: "token", token: "Existing continue." };
+          yield { type: "done", content: "Existing continue.", reasoning: "Prev cont R", finish_reason: "stop" };
+          return;
+        }
+        if (streamMode === "zero_abort") {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        throw new Error("Provider error");
+      },
+    });
+    const { store, runner } = registerBackend(harness.api);
+
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Original input" },
+      "u1",
+    );
+    const originalEntry = await store.peekContinueEntry("chat-1", "m2", 0, "u1");
+    expect(originalEntry?.resultText).toBe("Base line. Existing continue.");
+
+    // 1. 0-token abort during regenerate -> restores preRegen and keeps originalEntry.
+    streamMode = "zero_abort";
+    const abortRes = await runner.regenerateLastContinue({ chatId: "chat-1" }, "u1");
+    expect(abortRes.aborted).toBe(true);
+    expect(abortRes.text).toBe("Base line. Existing continue.");
+    const msgAfterAbort = harness.chatMessages.get("chat-1")![1]!;
+    expect(msgAfterAbort.content).toBe("Base line. Existing continue.");
+    expect(msgAfterAbort.extra.reasoning).toBe("Prev cont R");
+    expect((await store.peekContinueEntry("chat-1", "m2", 0, "u1"))?.id).toBe(
+      originalEntry?.id,
+    );
+
+    // 2. dryRun error -> restores preRegen and keeps originalEntry.
+    failDryRun = true;
+    await expect(
+      runner.regenerateLastContinue({ chatId: "chat-1" }, "u1"),
+    ).rejects.toThrow("DryRun failed");
+    failDryRun = false;
+    expect(harness.chatMessages.get("chat-1")![1]!.content).toBe(
+      "Base line. Existing continue.",
+    );
+    expect(harness.chatMessages.get("chat-1")![1]!.extra.reasoning).toBe("Prev cont R");
+    expect((await store.peekContinueEntry("chat-1", "m2", 0, "u1"))?.id).toBe(
+      originalEntry?.id,
+    );
+
+    // 3. 0-token stream error -> restores preRegen and keeps originalEntry.
+    streamMode = "zero_error";
+    await expect(
+      runner.regenerateLastContinue({ chatId: "chat-1" }, "u1"),
+    ).rejects.toThrow("Provider error");
+    expect(harness.chatMessages.get("chat-1")![1]!.content).toBe(
+      "Base line. Existing continue.",
+    );
+    expect(harness.chatMessages.get("chat-1")![1]!.extra.reasoning).toBe("Prev cont R");
+    expect((await store.peekContinueEntry("chat-1", "m2", 0, "u1"))?.id).toBe(
+      originalEntry?.id,
+    );
+    const lastPatch = harness.updateMessageCalls[harness.updateMessageCalls.length - 1]!.patch;
+    expect(lastPatch.skipChunkRebuild).toBe(false);
+  });
+
+  test("gg:status emits messageId, swipeId, and hasContentOutput lifecycle for guided_response and guided_regenerate", async () => {
+    for (const actionId of ["guided_response", "guided_regenerate"] as const) {
+      let runAtDryRun = null as ActiveRunState | null;
+      let statusAtDryRun: Array<ActiveRunState | null> = [];
+      let runAfterReasoning = null as ActiveRunState | null;
+      let statusCountAfterReasoning = 0;
+      let runAfterEmptyToken = null as ActiveRunState | null;
+      let statusCountAfterEmptyToken = 0;
+      let runAfterFirstToken = null as ActiveRunState | null;
+      let statusCountAfterFirstToken = 0;
+      let statusCountAfterSecondToken = 0;
+
+      const harness = createSpindleHarness({
+        chats: {
+          "chat-1": [
+            makeMessage({ id: "m1", role: "user", content: "Hello" }),
+            ...(actionId === "guided_regenerate"
+              ? [makeMessage({ id: "m2", role: "assistant", content: "Old reply", swipes: ["Old reply"] })]
+              : []),
+          ],
+        },
+        dryRunImpl: async () => {
+          runAtDryRun = runner.getActiveRun("u1");
+          statusAtDryRun = harness.sentFrontend
+            .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+            .map((e) => (e.payload as BackendPushEvent).run ?? null);
+          return {
+            messages: [{ role: "user", content: "Hello" }],
+            parameters: {},
+            model: "gpt-4o",
+            provider: "openai",
+          };
+        },
+        rawStreamImpl: async function* () {
+          yield { type: "reasoning", token: "Thinking..." };
+          runAfterReasoning = runner.getActiveRun("u1");
+          statusCountAfterReasoning = harness.sentFrontend.filter(
+            (e) => (e.payload as BackendPushEvent).type === "gg:status",
+          ).length;
+
+          yield { type: "token", token: "" };
+          runAfterEmptyToken = runner.getActiveRun("u1");
+          statusCountAfterEmptyToken = harness.sentFrontend.filter(
+            (e) => (e.payload as BackendPushEvent).type === "gg:status",
+          ).length;
+
+          yield { type: "token", token: "Hello" };
+          runAfterFirstToken = runner.getActiveRun("u1");
+          statusCountAfterFirstToken = harness.sentFrontend.filter(
+            (e) => (e.payload as BackendPushEvent).type === "gg:status",
+          ).length;
+
+          yield { type: "token", token: " world" };
+          statusCountAfterSecondToken = harness.sentFrontend.filter(
+            (e) => (e.payload as BackendPushEvent).type === "gg:status",
+          ).length;
+
+          yield { type: "done", content: "Hello world", reasoning: "Thinking...", finish_reason: "stop" };
+        },
+      });
+      const { runner } = registerBackend(harness.api);
+
+      const res = await runner.run(
+        { actionId, chatId: "chat-1", inputText: "Be concise" },
+        "u1",
+      );
+
+      expect(res.messageId).toBeDefined();
+      expect(statusAtDryRun).toHaveLength(2);
+      expect(statusAtDryRun[0]?.messageId).toBeUndefined();
+      expect(statusAtDryRun[1]?.messageId).toBe(res.messageId);
+      expect(statusAtDryRun[1]?.swipeId).toBe(0);
+      expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
+      expect(runAtDryRun?.messageId).toBe(res.messageId);
+      expect(runAtDryRun?.swipeId).toBe(0);
+
+      // Reasoning-only and empty token chunks keep hasContentOutput falsy and do not emit extra gg:status.
+      expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
+      expect(statusCountAfterReasoning).toBe(2);
+      expect(runAfterEmptyToken?.hasContentOutput).toBeFalsy();
+      expect(statusCountAfterEmptyToken).toBe(2);
+
+      // First non-empty content token emits gg:status with hasContentOutput: true once.
+      expect(runAfterFirstToken?.hasContentOutput).toBe(true);
+      expect(statusCountAfterFirstToken).toBe(3);
+      expect(statusCountAfterSecondToken).toBe(3);
+
+      const allStatusRuns = harness.sentFrontend
+        .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+        .map((e) => (e.payload as BackendPushEvent).run ?? null);
+      expect(allStatusRuns[2]?.hasContentOutput).toBe(true);
+      expect(allStatusRuns[allStatusRuns.length - 1]).toBeNull();
+    }
+  });
+
+  test("gg:status emits messageId, swipeId, backgroundSwipe, and hasContentOutput on done-only stream for guided_swipe", async () => {
+    for (const backgroundSwipe of [false, true] as const) {
+      let statusAtDryRun: Array<ActiveRunState | null> = [];
+      let runAfterReasoning = null as ActiveRunState | null;
+      let statusCountAfterReasoning = 0;
+
+      const harness = createSpindleHarness({
+        chats: {
+          "chat-1": [
+            makeMessage({ id: "m1", role: "user", content: "Hello" }),
+            makeMessage({
+              id: "m2",
+              role: "assistant",
+              content: "First swipe",
+              swipes: ["First swipe"],
+              swipe_id: 0,
+            }),
+          ],
+        },
+        dryRunImpl: async () => {
+          statusAtDryRun = harness.sentFrontend
+            .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+            .map((e) => (e.payload as BackendPushEvent).run ?? null);
+          return {
+            messages: [{ role: "user", content: "Hello" }],
+            parameters: {},
+            model: "gpt-4o",
+            provider: "openai",
+          };
+        },
+        rawStreamImpl: async function* () {
+          yield { type: "reasoning", token: "Pondering swipe..." };
+          runAfterReasoning = runner.getActiveRun("u1");
+          statusCountAfterReasoning = harness.sentFrontend.filter(
+            (e) => (e.payload as BackendPushEvent).type === "gg:status",
+          ).length;
+
+          yield { type: "done", content: "Second swipe", reasoning: "Pondering swipe...", finish_reason: "stop" };
+        },
+      });
+      const { runner } = registerBackend(harness.api);
+
+      const res = await runner.run(
+        { actionId: "guided_swipe", chatId: "chat-1", inputText: "Try another angle", backgroundSwipe },
+        "u1",
+      );
+
+      expect(res.messageId).toBe("m2");
+      expect(res.swipeId).toBe(1);
+      expect(statusAtDryRun).toHaveLength(2);
+      expect(statusAtDryRun[1]?.messageId).toBe("m2");
+      expect(statusAtDryRun[1]?.swipeId).toBe(1);
+      expect(statusAtDryRun[1]?.backgroundSwipe).toBe(backgroundSwipe);
+      expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
+
+      expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
+      expect(statusCountAfterReasoning).toBe(2);
+
+      const allStatusRuns = harness.sentFrontend
+        .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+        .map((e) => (e.payload as BackendPushEvent).run ?? null);
+      expect(allStatusRuns).toHaveLength(4);
+      expect(allStatusRuns[2]?.hasContentOutput).toBe(true);
+      expect(allStatusRuns[2]?.backgroundSwipe).toBe(backgroundSwipe);
+      expect(allStatusRuns[3]).toBeNull();
+    }
+  });
+
+  test("gg:status emits messageId, swipeId, and hasContentOutput lifecycle for guided_continue", async () => {
+    let runAtDryRun = null as ActiveRunState | null;
+    let statusAtDryRun: Array<ActiveRunState | null> = [];
+    let runAfterReasoning = null as ActiveRunState | null;
+    let statusCountAfterReasoning = 0;
+    let runAfterEmptyToken = null as ActiveRunState | null;
+    let statusCountAfterEmptyToken = 0;
+    let runAfterFirstToken = null as ActiveRunState | null;
+    let statusCountAfterFirstToken = 0;
+    let statusCountAfterSecondToken = 0;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Initial text.",
+            swipes: ["Alt swipe", "Initial text."],
+            swipe_id: 1,
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        runAtDryRun = runner.getActiveRun("u1");
+        statusAtDryRun = harness.sentFrontend
+          .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+          .map((e) => (e.payload as BackendPushEvent).run ?? null);
+        return {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Initial text." },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "reasoning", token: "Thinking continue..." };
+        runAfterReasoning = runner.getActiveRun("u1");
+        statusCountAfterReasoning = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: "" };
+        runAfterEmptyToken = runner.getActiveRun("u1");
+        statusCountAfterEmptyToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: "More" };
+        runAfterFirstToken = runner.getActiveRun("u1");
+        statusCountAfterFirstToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: " details." };
+        statusCountAfterSecondToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield {
+          type: "done",
+          content: "More details.",
+          reasoning: "Thinking continue...",
+          finish_reason: "stop",
+        };
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" },
+      "u1",
+    );
+
+    expect(res.messageId).toBe("m2");
+    expect(res.swipeId).toBe(1);
+    expect(statusAtDryRun).toHaveLength(2);
+    expect(statusAtDryRun[0]?.messageId).toBeUndefined();
+    expect(statusAtDryRun[1]?.messageId).toBe("m2");
+    expect(statusAtDryRun[1]?.swipeId).toBe(1);
+    expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
+    expect(runAtDryRun?.messageId).toBe("m2");
+    expect(runAtDryRun?.swipeId).toBe(1);
+
+    // Reasoning-only and empty token chunks keep hasContentOutput falsy and do not emit extra gg:status.
+    expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
+    expect(statusCountAfterReasoning).toBe(2);
+    expect(runAfterEmptyToken?.hasContentOutput).toBeFalsy();
+    expect(statusCountAfterEmptyToken).toBe(2);
+
+    // First non-empty content token emits gg:status with hasContentOutput: true once.
+    expect(runAfterFirstToken?.hasContentOutput).toBe(true);
+    expect(statusCountAfterFirstToken).toBe(3);
+    expect(statusCountAfterSecondToken).toBe(3);
+
+    const allStatusRuns = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+      .map((e) => (e.payload as BackendPushEvent).run ?? null);
+    expect(allStatusRuns).toHaveLength(4);
+    expect(allStatusRuns[2]?.hasContentOutput).toBe(true);
+    expect(allStatusRuns[3]).toBeNull();
+  });
+
+  test("gg:status emits messageId, swipeId, and hasContentOutput lifecycle for regenerate_last_continue", async () => {
+    let phase: "initial" | "regen" = "initial";
+    let runAtDryRun = null as ActiveRunState | null;
+    let statusAtDryRun: Array<ActiveRunState | null> = [];
+    let runAfterReasoning = null as ActiveRunState | null;
+    let statusCountAfterReasoning = 0;
+    let runAfterEmptyToken = null as ActiveRunState | null;
+    let statusCountAfterEmptyToken = 0;
+    let runAfterFirstToken = null as ActiveRunState | null;
+    let statusCountAfterFirstToken = 0;
+    let statusCountAfterSecondToken = 0;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base line.",
+            swipes: ["Alt swipe", "Base line."],
+            swipe_id: 1,
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        if (phase === "regen") {
+          runAtDryRun = runner.getActiveRun("u1");
+          statusAtDryRun = harness.sentFrontend
+            .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+            .map((e) => (e.payload as BackendPushEvent).run ?? null);
+        }
+        return {
+          messages: [
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Base line." },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        if (phase === "initial") {
+          yield { type: "token", token: "First try." };
+          yield { type: "done", content: "First try.", finish_reason: "stop" };
+          return;
+        }
+
+        yield { type: "reasoning", token: "Rethinking continue..." };
+        runAfterReasoning = runner.getActiveRun("u1");
+        statusCountAfterReasoning = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: "" };
+        runAfterEmptyToken = runner.getActiveRun("u1");
+        statusCountAfterEmptyToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: "Better" };
+        runAfterFirstToken = runner.getActiveRun("u1");
+        statusCountAfterFirstToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield { type: "token", token: " ending." };
+        statusCountAfterSecondToken = harness.sentFrontend.filter(
+          (e) => (e.payload as BackendPushEvent).type === "gg:status",
+        ).length;
+
+        yield {
+          type: "done",
+          content: "Better ending.",
+          reasoning: "Rethinking continue...",
+          finish_reason: "stop",
+        };
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" },
+      "u1",
+    );
+    harness.sentFrontend.length = 0;
+    phase = "regen";
+
+    const res = await runner.regenerateLastContinue({ chatId: "chat-1" }, "u1");
+
+    expect(res.messageId).toBe("m2");
+    expect(res.swipeId).toBe(1);
+    expect(statusAtDryRun).toHaveLength(2);
+    expect(statusAtDryRun[0]?.messageId).toBeUndefined();
+    expect(statusAtDryRun[1]?.messageId).toBe("m2");
+    expect(statusAtDryRun[1]?.swipeId).toBe(1);
+    expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
+    expect(runAtDryRun?.messageId).toBe("m2");
+    expect(runAtDryRun?.swipeId).toBe(1);
+
+    expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
+    expect(statusCountAfterReasoning).toBe(2);
+    expect(runAfterEmptyToken?.hasContentOutput).toBeFalsy();
+    expect(statusCountAfterEmptyToken).toBe(2);
+
+    expect(runAfterFirstToken?.hasContentOutput).toBe(true);
+    expect(statusCountAfterFirstToken).toBe(3);
+    expect(statusCountAfterSecondToken).toBe(3);
+
+    const allStatusRuns = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+      .map((e) => (e.payload as BackendPushEvent).run ?? null);
+    expect(allStatusRuns).toHaveLength(4);
+    expect(allStatusRuns[2]?.hasContentOutput).toBe(true);
+    expect(allStatusRuns[3]).toBeNull();
+  });
+
+  test("guided_regenerate clears activeRun via gg:status run:null when dryRun fails after eager slot creation", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Keep me", swipes: ["Keep me"] }),
+        ],
+      },
+      dryRunImpl: async () => {
+        throw new Error("DryRun exploded");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    await expect(
+      runner.run({ actionId: "guided_regenerate", chatId: "chat-1", inputText: "Retry" }, "u1"),
+    ).rejects.toThrow("DryRun exploded");
+
+    const statusPayloads = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+      .map((e) => e.payload as BackendPushEvent);
+    expect(statusPayloads[1]?.run?.messageId).toBeDefined();
+    expect(statusPayloads[1]?.run?.swipeId).toBe(0);
+    expect(statusPayloads[statusPayloads.length - 1]?.run).toBeNull();
+    expect(runner.getActiveRun("u1")).toBeNull();
+    expect(harness.chatMessages.get("chat-1")![1]!.content).toBe("Keep me");
+  });
+});
+
+describe("generation metrics helpers and gg:generation_metrics emission", () => {
+  test("calculateGenerationTimingMetrics and resolveGenerationTokenCounts match Lumiverse semantics", () => {
+    expect(
+      calculateGenerationTimingMetrics(
+        {
+          streamingStartedAt: 1_000,
+          firstTokenAt: 1_300,
+          firstContentTokenAt: 2_000,
+          responseStoppedAt: 4_000,
+          completedAt: 4_500,
+          wasStreaming: true,
+        },
+        30,
+      ),
+    ).toEqual({
+      durationMs: 3_500,
+      wasStreaming: true,
+      ttft: 300,
+      tps: 15,
+    });
+
+    expect(
+      calculateGenerationTimingMetrics(
+        {
+          streamingStartedAt: 1_000,
+          firstTokenAt: 1_200,
+          firstContentTokenAt: 1_500,
+          responseStoppedAt: 3_000,
+          completedAt: 3_200,
+          wasStreaming: true,
+        },
+        1,
+      ).tps,
+    ).toBeUndefined();
+
+    expect(
+      calculateGenerationTimingMetrics(
+        {
+          streamingStartedAt: 1_000,
+          firstTokenAt: 1_200,
+          firstContentTokenAt: 1_500,
+          responseStoppedAt: 3_000,
+          completedAt: 3_200,
+          wasStreaming: false,
+        },
+        40,
+      ),
+    ).toEqual({
+      durationMs: 2_200,
+      wasStreaming: false,
+    });
+
+    expect(
+      resolveGenerationTokenCounts(
+        128,
+        { messageTokenCount: 50, responseTokenCount: 40 },
+        {
+          hasReasoning: true,
+          providerRaw: { completion_tokens_details: { reasoning_tokens: 108 } },
+        },
+      ),
+    ).toEqual({
+      messageTokenCount: 128,
+      responseTokenCount: 20,
+    });
+
+    expect(
+      resolveGenerationTokenCounts(
+        128,
+        { responseTokenCount: 35 },
+        {
+          hasDelimitedReasoning: true,
+          providerRaw: { output_tokens_details: { thinking_tokens: 100 } },
+        },
+      ),
+    ).toEqual({
+      messageTokenCount: 128,
+      responseTokenCount: 35,
+    });
+  });
+
+  test("guided_response emits gg:generation_metrics with usage, timing, model, provider, and preset metadata", async () => {
+    const harness = createSpindleHarness({
+      presets: { "p-1": { id: "p-1", name: "Storyteller Preset" } },
+      activePresetId: "p-1",
+      connections: [
+        {
+          id: "conn-1",
+          name: "Anthropic Main",
+          provider: "anthropic",
+          model: "claude-3-7-sonnet",
+          is_default: true,
+        },
+      ],
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Begin." })],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Begin." }],
+        parameters: { temperature: 0.8 },
+        model: "claude-3-7-sonnet",
+        provider: "anthropic",
+      }),
+      rawStreamImpl: async function* () {
+        await new Promise((r) => setTimeout(r, 15));
+        yield { type: "reasoning", token: "Thinking..." };
+        await new Promise((r) => setTimeout(r, 20));
+        yield { type: "token", token: "   " };
+        await new Promise((r) => setTimeout(r, 10));
+        yield { type: "token", token: "Hello " };
+        await new Promise((r) => setTimeout(r, 30));
+        yield { type: "token", token: "world!" };
+        yield {
+          type: "done",
+          content: "Hello world!",
+          reasoning: "Thinking...",
+          finish_reason: "stop",
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 45,
+            total_tokens: 55,
+            provider_raw: {
+              completion_tokens_details: { reasoning_tokens: 25 },
+            },
+          },
+        } as unknown as StreamChunkDTO;
+      },
+      countTextImpl: async () => {
+        throw new Error("countText should not be needed when usage has details");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Keep it atmospheric" },
+      "u1",
+    );
+
+    const metricEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+
+    expect(metricEvents).toHaveLength(1);
+    const evt = metricEvents[0]!;
+    expect(evt.chatId).toBe("chat-1");
+    expect(res.messageId).toBeDefined();
+    expect(evt.messageId).toBe(res.messageId!);
+    expect(evt.swipeId).toBe(0);
+    expect(evt.tokenCount).toBe(45);
+    expect(evt.generationMetrics?.wasStreaming).toBe(true);
+    expect(evt.generationMetrics?.durationMs).toBeGreaterThanOrEqual(40);
+    expect(evt.generationMetrics?.ttft).toBeGreaterThanOrEqual(10);
+    expect(evt.generationMetrics?.ttft).toBeLessThanOrEqual(evt.generationMetrics!.durationMs);
+    expect(evt.generationMetrics?.tps).toBeGreaterThan(0);
+    expect(evt.generationMetrics?.model).toBe("claude-3-7-sonnet");
+    expect(evt.generationMetrics?.provider).toBe("anthropic");
+    expect(evt.generationMetrics?.presetId).toBe("p-1");
+    expect(evt.generationMetrics?.presetName).toBe("Storyteller Preset");
+    expect(harness.countTextCalls).toHaveLength(0);
+  });
+
+  test("guided_regenerate and guided_swipe fall back to spindle.tokens.countText when usage is missing and handle non-streaming", async () => {
+    const harness = createSpindleHarness({
+      presets: { "p-regen": { id: "p-regen", name: "Regen Preset" } },
+      activePresetId: "p-regen",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Old", swipes: ["Old"], swipe_id: 0 }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Fresh " };
+        await new Promise((r) => setTimeout(r, 20));
+        yield { type: "token", token: "response." };
+        yield { type: "done", content: "Fresh response.", finish_reason: "stop" };
+      },
+      countTextImpl: async (text) => ({
+        total_tokens: Math.max(2, text.split(/\s+/).length * 4),
+      }),
+    });
+    const { store, runner } = registerBackend(harness.api);
+
+    const settings = await store.getSettings("u1");
+    settings.actions.guided_regenerate.presetId = "p-regen";
+    await store.saveSettings(settings, "u1");
+
+    const regenRes = await runner.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try again" },
+      "u1",
+    );
+
+    // Raw delta === finalText, so countText should only be called once and reused for TPS.
+    expect(harness.countTextCalls).toHaveLength(1);
+    expect(harness.countTextCalls[0]?.text).toBe("Fresh response.");
+    expect(harness.countTextCalls[0]?.opts).toEqual({ model: "gpt-4o", userId: "u1" });
+
+    let metricEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(metricEvents).toHaveLength(1);
+    expect(regenRes.messageId).toBeDefined();
+    expect(metricEvents[0]?.messageId).toBe(regenRes.messageId!);
+    expect(metricEvents[0]?.swipeId).toBe(0);
+    expect(metricEvents[0]?.tokenCount).toBe(8);
+    expect(metricEvents[0]?.generationMetrics?.tps).toBeGreaterThan(0);
+    expect(metricEvents[0]?.generationMetrics?.presetId).toBe("p-regen");
+    expect(metricEvents[0]?.generationMetrics?.presetName).toBe("Regen Preset");
+
+    // Now test non-streaming guided_swipe in background mode
+    const nonStreamHarness = createSpindleHarness({
+      presets: { "p-regen": { id: "p-regen", name: "Regen Preset" } },
+      activePresetId: "p-regen",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({ id: "m2", role: "assistant", content: "First", swipes: ["First"], swipe_id: 0 }),
+        ],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Hi" }],
+        parameters: { _streaming: false },
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawStreamImpl: async function* () {
+        await new Promise((r) => setTimeout(r, 15));
+        yield { type: "token", token: "Second swipe" };
+        yield {
+          type: "done",
+          content: "Second swipe",
+          finish_reason: "stop",
+          usage: { prompt_tokens: 5, completion_tokens: 14, total_tokens: 19 },
+        };
+      },
+    });
+    const nonStreamBackend = registerBackend(nonStreamHarness.api);
+    const swipeRes = await nonStreamBackend.runner.run(
+      {
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        inputText: "Another angle",
+        backgroundSwipe: true,
+      },
+      "u1",
+    );
+
+    expect(swipeRes.swipeId).toBe(1);
+    metricEvents = nonStreamHarness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(metricEvents).toHaveLength(1);
+    expect(metricEvents[0]?.messageId).toBe("m2");
+    expect(metricEvents[0]?.swipeId).toBe(1);
+    expect(metricEvents[0]?.tokenCount).toBe(14);
+    expect(metricEvents[0]?.generationMetrics?.wasStreaming).toBe(false);
+    expect(metricEvents[0]?.generationMetrics?.ttft).toBeUndefined();
+    expect(metricEvents[0]?.generationMetrics?.tps).toBeUndefined();
+    expect(metricEvents[0]?.generationMetrics?.durationMs).toBeGreaterThanOrEqual(10);
+  });
+
+  test("guided_continue and regenerate_last_continue compute combined tokenCount and raw delta TPS", async () => {
+    const harness = createSpindleHarness({
+      presets: { "p-cont": { id: "p-cont", name: "Continue Preset" } },
+      activePresetId: "p-cont",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Go on." }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "She opened the door.",
+            swipes: ["She opened the door."],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        await new Promise((r) => setTimeout(r, 10));
+        yield { type: "token", token: "The hallway " };
+        await new Promise((r) => setTimeout(r, 25));
+        yield { type: "token", token: "was silent." };
+        yield {
+          type: "done",
+          content: "The hallway was silent.",
+          finish_reason: "stop",
+          // Provider completion_tokens only reflects the delta; continue must count combined finalText.
+          usage: { prompt_tokens: 20, completion_tokens: 6, total_tokens: 26 },
+        };
+      },
+      countTextImpl: async (text) => {
+        if (text === "She opened the door. The hallway was silent.") {
+          return { total_tokens: 18 };
+        }
+        if (text === "The hallway was silent.") {
+          return { total_tokens: 6 };
+        }
+        if (text === "She opened the door.") {
+          return { total_tokens: 12 };
+        }
+        return { total_tokens: 4 };
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Describe the hall" },
+      "u1",
+    );
+
+    const continueMetrics = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+
+    expect(continueMetrics).toHaveLength(1);
+    expect(continueMetrics[0]?.messageId).toBe("m2");
+    expect(continueMetrics[0]?.swipeId).toBe(0);
+    expect(continueMetrics[0]?.tokenCount).toBe(18);
+    expect(continueMetrics[0]?.generationMetrics?.tps).toBeGreaterThan(0);
+    expect(continueMetrics[0]?.generationMetrics?.ttft).toBeGreaterThanOrEqual(5);
+    expect(continueMetrics[0]?.generationMetrics?.presetId).toBe("p-cont");
+    expect(continueMetrics[0]?.generationMetrics?.presetName).toBe("Continue Preset");
+
+    // Regenerate last continue should also emit metrics for the new continuation.
+    await runner.regenerateLastContinue({ chatId: "chat-1" }, "u1");
+    const afterRegenMetrics = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(afterRegenMetrics).toHaveLength(2);
+    expect(afterRegenMetrics[1]?.tokenCount).toBe(18);
+    expect(afterRegenMetrics[1]?.generationMetrics?.tps).toBeGreaterThan(0);
+  });
+
+  test("removeLastContinue emits gg:generation_metrics with restored tokenCount (or null) and generationMetrics: null", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Tell me more." }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Original line.",
+            swipes: ["Original line."],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Extra line." };
+        yield { type: "done", content: "Extra line.", finish_reason: "stop" };
+      },
+      countTextImpl: async (text) => {
+        if (text === "Original line.") return { total_tokens: 7 };
+        return { total_tokens: 11 };
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "More" },
+      "u1",
+    );
+    const removed = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removed.removed).toBe(true);
+    expect(removed.text).toBe("Original line.");
+
+    const metricEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(metricEvents).toHaveLength(2);
+    expect(metricEvents[1]).toEqual({
+      type: "gg:generation_metrics",
+      chatId: "chat-1",
+      messageId: "m2",
+      swipeId: 0,
+      tokenCount: 7,
+      generationMetrics: null,
+    });
+
+    // When countText is unavailable or throws, removeLastContinue still clears metrics with tokenCount: null.
+    const noTokenizerHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Tell me more." }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Original line.",
+            swipes: ["Original line."],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Extra line." };
+        yield { type: "done", content: "Extra line.", finish_reason: "stop" };
+      },
+      countTextImpl: async () => {
+        throw new Error("tokenizer offline");
+      },
+    });
+    const noTokBackend = registerBackend(noTokenizerHarness.api);
+    await noTokBackend.runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "More" },
+      "u1",
+    );
+    await noTokBackend.runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    const noTokEvents = noTokenizerHarness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(noTokEvents[1]).toEqual({
+      type: "gg:generation_metrics",
+      chatId: "chat-1",
+      messageId: "m2",
+      swipeId: 0,
+      tokenCount: null,
+      generationMetrics: null,
+    });
+  });
+
+  test("aborted, errored, and impersonate runs do not emit gg:generation_metrics", async () => {
+    const abortHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Start" })],
+      },
+      rawStreamImpl: async function* ({ signal }) {
+        yield { type: "token", token: "Partial " };
+        abortBackend.runner.abortCurrent("u1");
+        if (signal?.aborted) {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        yield { type: "done", content: "Partial ", finish_reason: "stop" };
+      },
+    });
+    const abortBackend = registerBackend(abortHarness.api);
+    const abortRes = await abortBackend.runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+    expect(abortRes.aborted).toBe(true);
+    expect(
+      abortHarness.sentFrontend.some(
+        (e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics",
+      ),
+    ).toBe(false);
+
+    const errHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Start" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Partial " };
+        throw new Error("Upstream stream crash");
+      },
+    });
+    const errBackend = registerBackend(errHarness.api);
+    await expect(
+      errBackend.runner.run(
+        { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+        "u1",
+      ),
+    ).rejects.toThrow("Upstream stream crash");
+    expect(
+      errHarness.sentFrontend.some(
+        (e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics",
+      ),
+    ).toBe(false);
+
+    const impHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Start" })],
+      },
+    });
+    const impBackend = registerBackend(impHarness.api);
+    await impBackend.runner.run(
+      { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Act cool" },
+      "u1",
+    );
+    expect(
+      impHarness.sentFrontend.some(
+        (e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics",
+      ),
+    ).toBe(false);
+  });
+
+  test("emitMetricsForCompletedStream passes hasDelimitedReasoning when <think>...</think> is in rawDeltaText", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Think and answer." })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "<think>hidden chain of thought</think>" };
+        await new Promise((r) => setTimeout(r, 35));
+        yield { type: "token", token: "Visible answer." };
+        yield {
+          type: "done",
+          content: "<think>hidden chain of thought</think>Visible answer.",
+          finish_reason: "stop",
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 5000,
+            total_tokens: 5010,
+          },
+        };
+      },
+      countTextImpl: async () => ({ total_tokens: 4 }),
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Solve carefully" },
+      "u1",
+    );
+
+    expect(harness.countTextCalls).toHaveLength(1);
+    expect(harness.countTextCalls[0]?.text).toBe(
+      "<think>hidden chain of thought</think>Visible answer.",
+    );
+
+    const metricEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(metricEvents).toHaveLength(1);
+    const evt = metricEvents[0]!;
+    expect(res.messageId).toBeDefined();
+    expect(evt.messageId).toBe(res.messageId!);
+    expect(evt.tokenCount).toBe(5000);
+    expect(evt.generationMetrics?.tps).toBeGreaterThan(0);
+    expect(evt.generationMetrics?.tps).toBeLessThan(1000);
+  });
+});
+
+describe("Step 1 audit regression tests", () => {
+  test("save_settings lowering inputRecovery.maxEntries trims persisted recovery on disk and cache and emits gg:recovery-updated", async () => {
+    const harness = createSpindleHarness();
+    const { store, handleRpc } = registerBackend(harness.api);
+
+    for (const text of ["first", "second", "third", "fourth"]) {
+      await store.pushRecovery({ text, actionId: "guided_response", chatId: "chat-1" }, "u1");
+    }
+    expect((await store.getRecovery("u1")).map((e) => e.text)).toEqual([
+      "fourth",
+      "third",
+      "second",
+      "first",
+    ]);
+
+    harness.sentFrontend.length = 0;
+    const lowered = await store.getSettings("u1");
+    lowered.inputRecovery.maxEntries = 2;
+
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "save-trim-1",
+        action: "save_settings",
+        input: lowered,
+      },
+      "u1",
+    );
+
+    expect((await store.getRecovery("u1")).map((e) => e.text)).toEqual(["fourth", "third"]);
+
+    const diskRecovery = JSON.parse(harness.userFiles.get("u1")!.get("recovery.json")!) as Array<{
+      text: string;
+    }>;
+    expect(diskRecovery.map((e) => e.text)).toEqual(["fourth", "third"]);
+
+    const freshStore = new SettingsStore(harness.api);
+    expect((await freshStore.getRecovery("u1")).map((e) => e.text)).toEqual(["fourth", "third"]);
+
+    const recoveryEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:recovery-updated")
+      .map((e) => e.payload as BackendPushEvent);
+    expect(recoveryEvents).toHaveLength(1);
+    expect(recoveryEvents[0]?.recovery?.map((e) => e.text)).toEqual(["fourth", "third"]);
+    expect(
+      harness.sentFrontend.some((e) => (e.payload as BackendPushEvent).type === "gg:changed"),
+    ).toBe(false);
+
+    // Raising maxEntries afterward does not resurrect pruned entries or emit gg:recovery-updated
+    harness.sentFrontend.length = 0;
+    const raised = await store.getSettings("u1");
+    raised.inputRecovery.maxEntries = 10;
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "save-raise-1",
+        action: "save_settings",
+        input: raised,
+      },
+      "u1",
+    );
+    expect((await store.getRecovery("u1")).map((e) => e.text)).toEqual(["fourth", "third"]);
+    expect(
+      harness.sentFrontend.some(
+        (e) => (e.payload as BackendPushEvent).type === "gg:recovery-updated",
+      ),
+    ).toBe(false);
+  });
+
+  test("restoreTrailingAssistant preserves multi-swipe reasoningBySwipe/reasoningDurationBySwipe and rebinds continue-history to restored.id", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Swipe one",
+            swipes: ["Swipe zero", "Swipe one"],
+            swipe_id: 1,
+            swipe_dates: [1700000000, 1700000100],
+            extra: {
+              reasoningBySwipe: ["Thought 0", "Thought 1"],
+              reasoningDurationBySwipe: [1.5, 2.75],
+              reasoning: "Thought 1",
+              reasoningDuration: 2.75,
+            },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        throw new Error("Provider failed before token 1");
+      },
+    });
+    const { store, runner } = registerBackend(harness.api);
+
+    await store.pushContinueEntry(
+      {
+        chatId: "chat-1",
+        messageId: "m2",
+        swipeIndex: 1,
+        baseText: "Base one",
+        resultText: "Swipe one",
+        baseReasoning: "Base thought 1",
+        baseReasoningDuration: 1.25,
+        inputText: "continue note",
+      },
+      "u1",
+    );
+
+    await expect(
+      runner.run({ actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try again" }, "u1"),
+    ).rejects.toThrow("Provider failed before token 1");
+
+    const restored = harness.chatMessages.get("chat-1")![1]!;
+    expect(restored.id).not.toBe("m2");
+    expect(restored.swipes).toEqual(["Swipe zero", "Swipe one"]);
+    expect(restored.swipe_id).toBe(1);
+    expect(restored.content).toBe("Swipe one");
+    expect(restored.extra.reasoningBySwipe).toEqual(["Thought 0", "Thought 1"]);
+    expect(restored.extra.reasoningDurationBySwipe).toEqual([1.5, 2.75]);
+
+    expect(await store.peekContinueEntry("chat-1", "m2", 1, "u1")).toBeNull();
+    const rebound = await store.peekContinueEntry("chat-1", restored.id, 1, "u1");
+    expect(rebound).not.toBeNull();
+    expect(rebound?.messageId).toBe(restored.id);
+    expect(rebound?.baseText).toBe("Base one");
+
+    const removed = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removed.messageId).toBe(restored.id);
+    expect(removed.text).toBe("Base one");
+  });
+
+  test("abortCurrent cancels a run while still in the pendingUsers startup window", async () => {
+    let releaseChatLookup!: () => void;
+    const chatLookupGate = new Promise<void>((resolve) => {
+      releaseChatLookup = resolve;
+    });
+    let notifyLookupEntered!: () => void;
+    const lookupEntered = new Promise<void>((resolve) => {
+      notifyLookupEntered = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+    });
+    const origChatsGet = harness.api.chats.get;
+    harness.api.chats.get = async (chatId, userId) => {
+      notifyLookupEntered();
+      await chatLookupGate;
+      return origChatsGet(chatId, userId);
+    };
+
+    const { runner } = registerBackend(harness.api);
+
+    const runPromise = runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await lookupEntered;
+
+    expect(runner.getActiveRun("u1")).toBeNull();
+    expect(runner.abortCurrent("u1")).toBe(true);
+    releaseChatLookup();
+
+    const res = await runPromise;
+    expect(res.aborted).toBe(true);
+    expect(res.text).toBe("");
+    expect(harness.dryRunCalls).toHaveLength(0);
+    expect(harness.rawStreamCalls).toHaveLength(0);
+    expect(harness.chatMessages.get("chat-1")).toHaveLength(1);
+    expect(runner.getActiveRun("u1")).toBeNull();
+  });
+
+  test("removeLastContinue rejects edits when entry.baseText is empty while allowing compatible tail edits for non-empty baseText", async () => {
+    let streamCount = 0;
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Start" }),
+          makeMessage({ id: "m2", role: "assistant", content: "", swipes: [""], swipe_id: 0 }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        streamCount += 1;
+        const text = streamCount === 1 ? "From empty base." : "Tail continuation.";
+        yield { type: "token", token: text };
+        yield { type: "done", content: text, finish_reason: "stop" };
+      },
+    });
+    const { store, runner } = registerBackend(harness.api);
+
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Continue empty" },
+      "u1",
+    );
+    const emptyBaseMsg = harness.chatMessages.get("chat-1")![1]!;
+    expect(emptyBaseMsg.content).toBe("From empty base.");
+
+    emptyBaseMsg.content = "From empty base. Edited manually!";
+    emptyBaseMsg.swipes[0] = "From empty base. Edited manually!";
+    await expect(runner.removeLastContinue({ chatId: "chat-1" }, "u1")).rejects.toThrow(
+      "The message was edited after the last continue; cannot safely remove it.",
+    );
+    expect((await store.peekContinueEntry("chat-1", "m2", 0, "u1"))?.baseText).toBe("");
+
+    // Non-empty baseText still allows compatible tail edits starting with entry.baseText
+    harness.chatMessages.set("chat-1", [
+      makeMessage({ id: "m1", role: "user", content: "Start" }),
+      makeMessage({
+        id: "m3",
+        role: "assistant",
+        content: "Existing start.",
+        swipes: ["Existing start."],
+        swipe_id: 0,
+      }),
+    ]);
+    await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Continue non-empty" },
+      "u1",
+    );
+    const nonEmptyMsg = harness.chatMessages.get("chat-1")![1]!;
+    expect(nonEmptyMsg.content).toBe("Existing start. Tail continuation.");
+
+    nonEmptyMsg.content = "Existing start. User tweaked tail.";
+    nonEmptyMsg.swipes[0] = "Existing start. User tweaked tail.";
+    const removed = await runner.removeLastContinue({ chatId: "chat-1" }, "u1");
+    expect(removed.text).toBe("Existing start.");
+    expect(nonEmptyMsg.content).toBe("Existing start.");
+  });
+
+  test("executeImpersonate emits terminal done:true aborted:true chunk when rawStream throws", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Half drafted" };
+        throw new Error("Impersonate stream boom");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    await expect(
+      runner.run(
+        { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Reply" },
+        "u1",
+      ),
+    ).rejects.toThrow("Impersonate stream boom");
+
+    const chunks = harness.sentFrontend
+      .map((e) => e.payload as BackendPushEvent)
+      .filter((e) => e.type === "gg:impersonate-chunk");
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    expect(chunks[chunks.length - 1]).toEqual({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-1",
+      text: "Half drafted",
+      done: true,
+      aborted: true,
+    });
   });
 });

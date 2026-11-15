@@ -6,12 +6,16 @@ import type {
   GuidedActionId,
   GuidedGenerationsSettings,
   RecoveryEntry,
+  RegenerateContinueInput,
+  RemoveContinueResult,
   RpcActionName,
   RunActionInput,
 } from "./shared/types";
 import { InputToolbarController } from "./frontend/input-toolbar";
+import { PillMetricsController } from "./frontend/pill-metrics";
 import { pickRecoveryEntry } from "./frontend/recovery-store";
 import { SettingsDrawerController } from "./frontend/settings-drawer";
+import { StreamingIndicatorController } from "./frontend/streaming-indicator";
 import { GUIDED_GENERATIONS_CSS } from "./frontend/styles";
 
 interface HostComposerState {
@@ -44,6 +48,17 @@ type FrontendContextWithHostExtensions = SpindleFrontendContext & {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function extractChatIdFromPayload(rawPayload: unknown): string | null {
+  if (!isRecord(rawPayload)) return null;
+  if (typeof rawPayload.chatId === "string" && rawPayload.chatId) {
+    return rawPayload.chatId;
+  }
+  if (isRecord(rawPayload.chat) && typeof rawPayload.chat.id === "string") {
+    return rawPayload.chat.id;
+  }
+  return null;
 }
 
 function withFrontendConnectionFallback(
@@ -279,6 +294,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
       view = mergedNext;
       activeRun = resolvedActiveRun;
+      indicator.sync(activeRun);
       if (!coreUnchanged) {
         drawer.render(view);
       } else if (!recoveryUnchanged) {
@@ -292,7 +308,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
   }
 
-  async function triggerAction(actionId: GuidedActionId): Promise<void> {
+  async function triggerAction(
+    actionId: GuidedActionId,
+    options?: { backgroundSwipe?: boolean },
+  ): Promise<void> {
     if (destroyed || activeRun || isLaunching) return;
     isLaunching = true;
     try {
@@ -346,6 +365,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         chatId,
         activeConnectionId,
         inputText,
+        ...(actionId === "guided_swipe" && options?.backgroundSwipe
+          ? { backgroundSwipe: true }
+          : {}),
       };
 
       try {
@@ -397,18 +419,107 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     clearBanner();
   }
 
+  function clearCurrentInput(): void {
+    if (destroyed || !view || activeRun) return;
+    if (!view.settings.inputRecovery.enabled) return;
+
+    const state = safeGetComposerState();
+    if (!isComposerAvailable(state)) {
+      showBanner(
+        "Composer is unavailable right now — cannot clear input.",
+        "warn",
+      );
+      return;
+    }
+
+    if (!state.text) {
+      safeFocusComposer();
+      clearBanner();
+      return;
+    }
+
+    if (!safeSetComposerText("")) {
+      showBanner(
+        "Composer is unavailable right now — cannot clear input.",
+        "warn",
+      );
+      return;
+    }
+
+    safeFocusComposer();
+    clearBanner();
+  }
+
+  async function removeLastContinue(): Promise<void> {
+    if (destroyed || activeRun || isLaunching) return;
+    isLaunching = true;
+    try {
+      const { chatId } = ctx.getActiveChat();
+      if (!chatId) {
+        showBanner("Open a chat before removing the last continue.", "warn");
+        return;
+      }
+      clearBanner();
+      await rpc<RemoveContinueResult>("remove_last_continue", { chatId });
+    } catch (error) {
+      if (destroyed) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      showBanner(msg, "warn", 7_000);
+    } finally {
+      isLaunching = false;
+    }
+  }
+
+  async function regenerateLastContinue(): Promise<void> {
+    if (destroyed || activeRun || isLaunching) return;
+    isLaunching = true;
+    try {
+      const { chatId } = ctx.getActiveChat();
+      if (!chatId) {
+        showBanner("Open a chat before regenerating the last continue.", "warn");
+        return;
+      }
+      clearBanner();
+      const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
+      const payload: RegenerateContinueInput = {
+        chatId,
+        activeConnectionId,
+      };
+      await rpc("regenerate_last_continue", payload, 300_000);
+    } catch (error) {
+      if (destroyed) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      showBanner(msg, "error", 7_000);
+    } finally {
+      isLaunching = false;
+    }
+  }
+
+  const indicator = new StreamingIndicatorController(ctx);
+  const pillMetrics = new PillMetricsController(ctx);
+
   const toolbar = new InputToolbarController(ctx, {
-    onTriggerAction: (actionId) => {
-      void triggerAction(actionId);
+    onTriggerAction: (actionId, options) => {
+      void triggerAction(actionId, options);
     },
     onAbortAction: (runId) => {
       if (destroyed) return;
       void rpc("abort_action", { runId }).catch(() => undefined);
     },
     onRestoreLatest: () => {
-      if (destroyed || !view) return;
+      if (destroyed || !view || activeRun) return;
       const latest = pickRecoveryEntry(view.recovery);
-      if (latest) restoreRecoveryEntry(latest);
+      if (latest) {
+        restoreRecoveryEntry(latest);
+      } else {
+        clearCurrentInput();
+      }
+    },
+    onRemoveLastContinue: () => {
+      void removeLastContinue();
+    },
+    onRegenerateLastContinue: () => {
+      void regenerateLastContinue();
     },
   });
 
@@ -495,6 +606,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           statusSeq += 1;
           activeRun = event.run ?? null;
           if (view) view = { ...view, activeRun };
+          indicator.sync(activeRun);
           renderToolbar();
           if (event.error) {
             showBanner(event.error, "error", 7_000);
@@ -534,18 +646,46 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           void refresh({ onlyIfChanged: true });
           return;
         }
+        case "gg:generation_metrics": {
+          if (
+            typeof event.chatId === "string" &&
+            typeof event.messageId === "string" &&
+            typeof event.swipeId === "number"
+          ) {
+            pillMetrics.handleMetricsEvent(event);
+          }
+          return;
+        }
       }
     }),
   );
 
   disposers.push(
-    ctx.events.on("CHAT_SWITCHED", () => {
-      if (!destroyed) renderToolbar();
+    ctx.events.on("CHAT_SWITCHED", (payload) => {
+      if (destroyed) return;
+      renderToolbar();
+      pillMetrics.onChatChanged(
+        extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
+      );
     }),
   );
   disposers.push(
-    ctx.events.on("CHAT_CHANGED", () => {
-      if (!destroyed) renderToolbar();
+    ctx.events.on("CHAT_CHANGED", (payload) => {
+      if (destroyed) return;
+      renderToolbar();
+      pillMetrics.onChatChanged(
+        extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
+      );
+    }),
+  );
+  disposers.push(
+    ctx.events.on("MESSAGE_SWIPED", (payload) => {
+      if (!destroyed) pillMetrics.onMessageEvent(payload);
+    }),
+  );
+  disposers.push(
+    ctx.events.on("MESSAGE_EDITED", (payload) => {
+      if (!destroyed) pillMetrics.onMessageEvent(payload);
     }),
   );
 
@@ -562,7 +702,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     if (ctx.state) {
       disposers.push(
         ctx.state.subscribe("chat.active", () => {
-          if (!destroyed) renderToolbar();
+          if (!destroyed) {
+            indicator.sync(activeRun);
+            renderToolbar();
+          }
         }),
       );
       stateSubscribed = true;
@@ -577,6 +720,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       const nextChatId = ctx.getActiveChat().chatId;
       if (nextChatId !== lastChatId) {
         lastChatId = nextChatId;
+        indicator.sync(activeRun);
         renderToolbar();
       }
     }, 600);
@@ -587,6 +731,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   void refresh();
 
   return () => {
+    drawer.flushPendingSaves();
     destroyed = true;
     if (noticeTimer) {
       clearTimeout(noticeTimer);
@@ -598,6 +743,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       waiter.reject(new Error("Guided Generations unloaded."));
     }
     pending.clear();
+    pillMetrics.destroy();
+    indicator.destroy();
     toolbar.destroy();
     drawer.destroy();
     composerAlertMount?.replaceChildren();

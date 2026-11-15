@@ -7,6 +7,47 @@ var GUIDED_ACTION_ORDER = [
   "guided_impersonate"
 ];
 var DEFAULT_TOOLBAR_PLACEMENT = "after_native";
+var DEFAULT_GUIDANCE_POSITION = "before_post_history";
+var DEFAULT_GUIDANCE_DEPTH = 0;
+var DEFAULT_APPLY_REGEX = true;
+var GUIDANCE_POSITION_OPTIONS = [
+  {
+    value: "before_post_history",
+    label: "Before Post-History (after chat history)",
+    shortLabel: "Before Post-History",
+    sublabel: "Places guidance right after chat history and before post-history preset blocks."
+  },
+  {
+    value: "in_history",
+    label: "In History (at depth)",
+    shortLabel: "In History",
+    sublabel: "Splices guidance inside chat history N messages back from the end."
+  },
+  {
+    value: "pre_history",
+    label: "Pre-History (before chat history)",
+    shortLabel: "Pre-History",
+    sublabel: "Places guidance after pre-history system prompts and before the first chat turn."
+  },
+  {
+    value: "post_history",
+    label: "Post-History (end of prompt)",
+    shortLabel: "Post-History",
+    sublabel: "Appends guidance at the very end of the assembled prompt (before any trailing prefill)."
+  }
+];
+function normalizeGuidancePosition(value, fallback = DEFAULT_GUIDANCE_POSITION) {
+  if (value === "before_post_history" || value === "in_history" || value === "pre_history" || value === "post_history") {
+    return value;
+  }
+  return fallback;
+}
+function normalizeGuidanceDepth(value, fallback = DEFAULT_GUIDANCE_DEPTH) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.min(999, Math.floor(value)));
+  }
+  return Math.max(0, Math.min(999, Math.floor(fallback)));
+}
 var DEFAULT_BUTTON_ORDER = [
   ...GUIDED_ACTION_ORDER,
   "input_recovery"
@@ -117,6 +158,10 @@ var TOOLBAR_ICONS = {
   guided_impersonate: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
   input_recovery: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>`
 };
+var CONTINUE_MENU_ICONS = {
+  remove_last_continue: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>`,
+  regenerate_last_continue: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>`
+};
 
 // src/frontend/input-toolbar.ts
 var HOST_CLASSES = [
@@ -125,6 +170,9 @@ var HOST_CLASSES = [
   "is-before-native",
   "is-right"
 ];
+var HOLD_DURATION_MS = 450;
+var HOLD_MOVE_TOLERANCE_PX = 10;
+var MENU_DISMISS_GRACE_MS = 150;
 
 class InputToolbarController {
   ctx;
@@ -134,6 +182,12 @@ class InputToolbarController {
   toolbarEl;
   buttons = [];
   activeActionId = null;
+  activeHoldCancel = null;
+  suppressNextHoldClick = false;
+  clearSuppressHoldClickTimer = null;
+  holdReleaseCleanup = null;
+  postHoldCleanup = null;
+  continueMenu = null;
   onKeyDown;
   onFocusIn;
   constructor(ctx, handlers) {
@@ -164,6 +218,8 @@ class InputToolbarController {
     this.actionsMountRoot.replaceChildren(this.toolbarEl);
   }
   render(state) {
+    this.closeContinueMenu({ restoreFocus: false });
+    this.clearActiveHold();
     const buttons = [];
     const order = normalizeButtonOrder(state.settings.buttonOrder);
     for (const optionId of order) {
@@ -192,6 +248,8 @@ class InputToolbarController {
     }
   }
   handleToolbarKeyDown(event) {
+    if (event.altKey || event.ctrlKey || event.metaKey)
+      return;
     const key = event.key;
     if (key !== "ArrowRight" && key !== "ArrowLeft" && key !== "ArrowDown" && key !== "ArrowUp" && key !== "Home" && key !== "End") {
       return;
@@ -240,24 +298,421 @@ class InputToolbarController {
     btn.disabled = disabled;
     btn.setAttribute("data-gg-action", actionId);
     btn.setAttribute("aria-label", isThisRunning ? `Stop ${meta.label}` : meta.label);
-    btn.title = isThisRunning ? `Stop ${meta.label}` : meta.tooltip;
+    if (actionId === "guided_swipe" && !isThisRunning) {
+      btn.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
+      btn.title = "Guided Swipe — click to swipe, hold (or Ctrl+Click) to swipe in background";
+    } else if (actionId === "guided_continue" && !isThisRunning) {
+      btn.setAttribute("aria-haspopup", "menu");
+      btn.setAttribute("aria-expanded", "false");
+      btn.setAttribute("aria-keyshortcuts", "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter");
+      btn.title = "Guided Continue — click to continue, hold for continue options";
+    } else {
+      btn.title = isThisRunning ? `Stop ${meta.label}` : meta.tooltip;
+    }
     btn.innerHTML = isThisRunning ? STOP_ICON_SVG : TOOLBAR_ICONS[actionId];
+    if (actionId === "guided_swipe") {
+      this.attachSwipeHoldHandlers(btn, state, isThisRunning, disabled);
+    } else if (actionId === "guided_continue") {
+      this.attachContinueHoldHandlers(btn, state, isThisRunning, disabled);
+    } else {
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (isThisRunning && state.activeRun) {
+          this.handlers.onAbortAction(state.activeRun.runId);
+        } else {
+          this.handlers.onTriggerAction(actionId);
+        }
+      });
+    }
+    return btn;
+  }
+  clearActiveHold() {
+    if (this.activeHoldCancel) {
+      const cancel = this.activeHoldCancel;
+      this.activeHoldCancel = null;
+      cancel();
+    }
+  }
+  clearPostHoldClickSuppression() {
+    this.suppressNextHoldClick = false;
+    if (this.clearSuppressHoldClickTimer !== null) {
+      clearTimeout(this.clearSuppressHoldClickTimer);
+      this.clearSuppressHoldClickTimer = null;
+    }
+    if (this.holdReleaseCleanup) {
+      const cleanup = this.holdReleaseCleanup;
+      this.holdReleaseCleanup = null;
+      cleanup();
+    }
+    if (this.postHoldCleanup) {
+      const onCleanup = this.postHoldCleanup;
+      this.postHoldCleanup = null;
+      onCleanup();
+    }
+  }
+  armPostHoldClickSuppression(onSuppressionCleared) {
+    this.clearPostHoldClickSuppression();
+    this.suppressNextHoldClick = true;
+    this.postHoldCleanup = onSuppressionCleared ?? null;
+    if (typeof document === "undefined")
+      return;
+    const cleanupListeners = () => {
+      document.removeEventListener("pointerup", onRelease, true);
+      document.removeEventListener("pointercancel", onRelease, true);
+      if (this.holdReleaseCleanup === cleanupListeners) {
+        this.holdReleaseCleanup = null;
+      }
+    };
+    const onRelease = () => {
+      cleanupListeners();
+      if (this.clearSuppressHoldClickTimer !== null) {
+        clearTimeout(this.clearSuppressHoldClickTimer);
+      }
+      this.clearSuppressHoldClickTimer = setTimeout(() => {
+        this.clearSuppressHoldClickTimer = null;
+        this.suppressNextHoldClick = false;
+        const onCleanup = this.postHoldCleanup;
+        this.postHoldCleanup = null;
+        onCleanup?.();
+      }, 0);
+    };
+    this.holdReleaseCleanup = cleanupListeners;
+    document.addEventListener("pointerup", onRelease, true);
+    document.addEventListener("pointercancel", onRelease, true);
+  }
+  attachLongPressHandlers(btn, state, isThisRunning, disabled, options) {
+    const hold = {
+      timer: undefined,
+      x: 0,
+      y: 0,
+      fired: false
+    };
+    const doc = typeof document !== "undefined" ? document : null;
+    const win = typeof window !== "undefined" ? window : doc?.defaultView ?? null;
+    let holdListenersAttached = false;
+    const detachHoldCancelListeners = () => {
+      if (!holdListenersAttached)
+        return;
+      holdListenersAttached = false;
+      win?.removeEventListener("blur", cancelHold);
+      doc?.removeEventListener("visibilitychange", cancelHold);
+    };
+    const attachHoldCancelListeners = () => {
+      if (holdListenersAttached)
+        return;
+      holdListenersAttached = true;
+      win?.addEventListener("blur", cancelHold);
+      doc?.addEventListener("visibilitychange", cancelHold);
+    };
+    const cancelHold = () => {
+      detachHoldCancelListeners();
+      if (hold.timer !== undefined) {
+        clearTimeout(hold.timer);
+        hold.timer = undefined;
+      }
+      btn.classList.remove("is-holding");
+      if (this.activeHoldCancel === cancelHold) {
+        this.activeHoldCancel = null;
+      }
+    };
+    btn.addEventListener("pointerdown", (event) => {
+      if (disabled || state.activeRun)
+        return;
+      if (!event.isPrimary)
+        return;
+      if (event.pointerType === "mouse" && event.button !== 0)
+        return;
+      this.clearActiveHold();
+      this.clearPostHoldClickSuppression();
+      cancelHold();
+      hold.fired = false;
+      hold.x = event.clientX;
+      hold.y = event.clientY;
+      btn.classList.add("is-holding");
+      this.activeHoldCancel = cancelHold;
+      attachHoldCancelListeners();
+      hold.timer = setTimeout(() => {
+        hold.timer = undefined;
+        detachHoldCancelListeners();
+        btn.classList.remove("is-holding");
+        if (this.activeHoldCancel === cancelHold) {
+          this.activeHoldCancel = null;
+        }
+        hold.fired = true;
+        this.armPostHoldClickSuppression(() => {
+          hold.fired = false;
+        });
+        options.onHold();
+      }, HOLD_DURATION_MS);
+    });
+    btn.addEventListener("pointermove", (event) => {
+      if (hold.timer === undefined)
+        return;
+      const dx = event.clientX - hold.x;
+      const dy = event.clientY - hold.y;
+      if (Math.hypot(dx, dy) > HOLD_MOVE_TOLERANCE_PX) {
+        cancelHold();
+      }
+    });
+    btn.addEventListener("pointerup", cancelHold);
+    btn.addEventListener("pointercancel", cancelHold);
+    btn.addEventListener("pointerleave", cancelHold);
+    btn.addEventListener("contextmenu", (event) => {
+      if (hold.timer !== undefined || hold.fired || this.suppressNextHoldClick) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
     btn.addEventListener("click", (event) => {
+      if (hold.fired || this.suppressNextHoldClick) {
+        hold.fired = false;
+        this.clearPostHoldClickSuppression();
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       if (isThisRunning && state.activeRun) {
         this.handlers.onAbortAction(state.activeRun.runId);
       } else {
-        this.handlers.onTriggerAction(actionId);
+        options.onClick(event);
       }
     });
-    return btn;
+    btn.addEventListener("keydown", (event) => {
+      if (disabled || isThisRunning || state.activeRun)
+        return;
+      if (options.onShortcutKeyDown(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+  }
+  attachSwipeHoldHandlers(btn, state, isThisRunning, disabled) {
+    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+      onClick: (event) => {
+        this.handlers.onTriggerAction("guided_swipe", {
+          backgroundSwipe: Boolean(event.ctrlKey || event.metaKey)
+        });
+      },
+      onHold: () => {
+        this.handlers.onTriggerAction("guided_swipe", { backgroundSwipe: true });
+      },
+      onShortcutKeyDown: (event) => {
+        if ((event.ctrlKey || event.metaKey) && (event.key === "Enter" || event.key === " ")) {
+          this.handlers.onTriggerAction("guided_swipe", { backgroundSwipe: true });
+          return true;
+        }
+        return false;
+      }
+    });
+  }
+  attachContinueHoldHandlers(btn, state, isThisRunning, disabled) {
+    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+      onClick: (event) => {
+        if (this.continueMenu !== null) {
+          this.closeContinueMenu({ restoreFocus: true });
+          return;
+        }
+        if (event.ctrlKey || event.metaKey) {
+          this.openContinueMenu(btn);
+          return;
+        }
+        this.handlers.onTriggerAction("guided_continue");
+      },
+      onHold: () => {
+        this.openContinueMenu(btn);
+      },
+      onShortcutKeyDown: (event) => {
+        if (event.shiftKey && event.key === "F10" || event.altKey && event.key === "ArrowUp" || (event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          this.openContinueMenu(btn);
+          return true;
+        }
+        return false;
+      }
+    });
+  }
+  openContinueMenu(anchorBtn) {
+    if (typeof document === "undefined" || !document.body)
+      return;
+    this.closeContinueMenu({ restoreFocus: false });
+    const menuEl = document.createElement("div");
+    menuEl.className = "gg-dropup-menu";
+    menuEl.setAttribute("role", "menu");
+    menuEl.setAttribute("aria-label", "Guided Continue options");
+    const menuDefs = [
+      {
+        id: "remove_last_continue",
+        label: "Remove the last continue",
+        icon: CONTINUE_MENU_ICONS.remove_last_continue,
+        onSelect: () => this.handlers.onRemoveLastContinue()
+      },
+      {
+        id: "regenerate_last_continue",
+        label: "Regenerate last continue",
+        icon: CONTINUE_MENU_ICONS.regenerate_last_continue,
+        onSelect: () => this.handlers.onRegenerateLastContinue()
+      }
+    ];
+    const items = [];
+    for (const def of menuDefs) {
+      const itemBtn = document.createElement("button");
+      itemBtn.type = "button";
+      itemBtn.className = "gg-dropup-item";
+      itemBtn.setAttribute("role", "menuitem");
+      itemBtn.setAttribute("data-gg-menu-action", def.id);
+      itemBtn.tabIndex = -1;
+      itemBtn.innerHTML = `${def.icon}<span>${def.label}</span>`;
+      itemBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: false });
+        def.onSelect();
+      });
+      items.push(itemBtn);
+      menuEl.append(itemBtn);
+    }
+    document.body.append(menuEl);
+    anchorBtn.setAttribute("aria-expanded", "true");
+    this.positionContinueMenu(menuEl, anchorBtn);
+    const openedAt = Date.now();
+    const onMenuKeyDown = (event) => {
+      const activeIdx = items.indexOf(document.activeElement);
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        event.stopPropagation();
+        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % items.length;
+        items[nextIdx]?.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopPropagation();
+        const nextIdx = activeIdx <= 0 ? items.length - 1 : activeIdx - 1;
+        items[nextIdx]?.focus();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        event.stopPropagation();
+        items[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        event.stopPropagation();
+        items[items.length - 1]?.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+    const onDocumentKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+    const onOutsidePointerDown = (event) => {
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS)
+        return;
+      const target = event.target;
+      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onOutsideClick = (event) => {
+      if (this.suppressNextHoldClick)
+        return;
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS)
+        return;
+      const target = event.target;
+      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onViewportResize = () => {
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onViewportScroll = (event) => {
+      const target = event.target;
+      if (target && menuEl.contains(target))
+        return;
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    menuEl.addEventListener("keydown", onMenuKeyDown);
+    document.addEventListener("keydown", onDocumentKeyDown, true);
+    document.addEventListener("pointerdown", onOutsidePointerDown, true);
+    document.addEventListener("click", onOutsideClick, true);
+    document.addEventListener("scroll", onViewportScroll, true);
+    if (win) {
+      win.addEventListener("resize", onViewportResize);
+      win.addEventListener("scroll", onViewportScroll, true);
+    }
+    const cleanup = () => {
+      menuEl.removeEventListener("keydown", onMenuKeyDown);
+      document.removeEventListener("keydown", onDocumentKeyDown, true);
+      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
+      document.removeEventListener("click", onOutsideClick, true);
+      document.removeEventListener("scroll", onViewportScroll, true);
+      if (win) {
+        win.removeEventListener("resize", onViewportResize);
+        win.removeEventListener("scroll", onViewportScroll, true);
+      }
+      menuEl.remove();
+    };
+    this.continueMenu = { menuEl, anchorBtn, items, cleanup };
+    items[0]?.focus();
+  }
+  positionContinueMenu(menuEl, anchorBtn) {
+    const rect = anchorBtn.getBoundingClientRect();
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    const getStyle = typeof getComputedStyle === "function" ? getComputedStyle : win?.getComputedStyle?.bind(win);
+    const bodyStyle = getStyle && document.body ? getStyle(document.body) : null;
+    const zoomVal = bodyStyle ? parseFloat(bodyStyle.zoom) : NaN;
+    const scaleProp = bodyStyle && typeof bodyStyle.getPropertyValue === "function" ? parseFloat(bodyStyle.getPropertyValue("scale")) : NaN;
+    const varScale = bodyStyle && typeof bodyStyle.getPropertyValue === "function" ? parseFloat(bodyStyle.getPropertyValue("--lumiverse-ui-scale")) : NaN;
+    const uiScale = Number.isFinite(zoomVal) && zoomVal > 0 && zoomVal !== 1 ? zoomVal : Number.isFinite(scaleProp) && scaleProp > 0 && scaleProp !== 1 ? scaleProp : Number.isFinite(varScale) && varScale > 0 && varScale !== 1 ? varScale : 1;
+    const vw = win && typeof win.innerWidth === "number" ? win.innerWidth : document.documentElement?.clientWidth || 1024;
+    const vh = win && typeof win.innerHeight === "number" ? win.innerHeight : document.documentElement?.clientHeight || 768;
+    const menuWidth = menuEl.offsetWidth * uiScale;
+    const menuHeight = menuEl.offsetHeight * uiScale;
+    const gapPx = 6;
+    const edgePadding = 8;
+    const maxLeft = Math.max(edgePadding, vw - menuWidth - edgePadding);
+    const clampedLeft = Math.max(edgePadding, Math.min(rect.left, maxLeft));
+    menuEl.style.left = `${clampedLeft / uiScale}px`;
+    const spaceAbove = rect.top;
+    const spaceBelow = vh - rect.bottom;
+    const neededHeight = menuHeight + gapPx * uiScale + edgePadding;
+    if (spaceAbove < neededHeight && spaceBelow > spaceAbove) {
+      menuEl.style.top = `${Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx)}px`;
+      menuEl.style.bottom = "";
+    } else {
+      menuEl.style.bottom = `${(vh - rect.top) / uiScale + gapPx}px`;
+      menuEl.style.top = "";
+    }
+  }
+  closeContinueMenu(options) {
+    const session = this.continueMenu;
+    if (!session)
+      return;
+    this.continueMenu = null;
+    session.anchorBtn.setAttribute("aria-expanded", "false");
+    session.cleanup();
+    if (options.restoreFocus && session.anchorBtn.isConnected && !session.anchorBtn.disabled) {
+      session.anchorBtn.focus();
+    }
   }
   buildRecoveryButton(state) {
     if (!state.settings.inputRecovery.enabled)
       return null;
     const hasRecovery = state.recovery.length > 0;
-    const disabled = !hasRecovery || Boolean(state.activeRun);
+    const disabled = Boolean(state.activeRun);
     const latestPreview = state.recovery[0]?.text ? ` ("${state.recovery[0].text.replace(/\s+/g, " ").trim().slice(0, 48)}")` : "";
     const recoverBtn = document.createElement("button");
     recoverBtn.type = "button";
@@ -266,8 +721,8 @@ class InputToolbarController {
       recoverBtn.classList.add("is-dimmed");
     recoverBtn.disabled = disabled;
     recoverBtn.setAttribute("data-gg-action", "input_recovery");
-    recoverBtn.setAttribute("aria-label", "Restore last input");
-    recoverBtn.title = hasRecovery ? `Restore last cleared input${latestPreview}` : "Input Recovery — no saved input yet";
+    recoverBtn.setAttribute("aria-label", hasRecovery ? "Restore last input" : "Clear current input");
+    recoverBtn.title = hasRecovery ? `Restore last cleared input${latestPreview}` : "Input Recovery — clear current input";
     recoverBtn.innerHTML = TOOLBAR_ICONS.input_recovery;
     recoverBtn.addEventListener("click", (event) => {
       event.preventDefault();
@@ -313,6 +768,9 @@ class InputToolbarController {
       el.replaceChildren();
   }
   destroy() {
+    this.closeContinueMenu({ restoreFocus: false });
+    this.clearActiveHold();
+    this.clearPostHoldClickSuppression();
     this.toolbarEl.removeEventListener("keydown", this.onKeyDown);
     this.toolbarEl.removeEventListener("focusin", this.onFocusIn);
     this.buttons = [];
@@ -325,12 +783,323 @@ class InputToolbarController {
   }
 }
 
+// src/frontend/pill-metrics.ts
+var MESSAGE_READ_LIMIT = 50;
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function extractMessageList(page) {
+  const rawList = Array.isArray(page) ? page : isRecord(page) && Array.isArray(page.data) ? page.data : isRecord(page) && Array.isArray(page.items) ? page.items : [];
+  const result = [];
+  for (const item of rawList) {
+    if (isRecord(item) && typeof item.id === "string") {
+      result.push(item);
+    }
+  }
+  return result;
+}
+function isPermanentError(error) {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  const upper = message.toUpperCase();
+  return upper.includes("PERMISSION_DENIED") || upper.includes("SPINDLE_FRONTEND_INACTIVE") || upper.includes("STALE_GENERATION") || upper.includes("NOT FOUND") || upper.includes("404") || upper.includes("403") || upper.includes("401");
+}
+
+class PillMetricsController {
+  ctx;
+  pending = new Map;
+  scheduledKeys = new Set;
+  inFlightByMessage = new Map;
+  retryTimers = new Map;
+  nextRevision = 0;
+  destroyed = false;
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+  makeKey(chatId, messageId, swipeId) {
+    return `${chatId}:${messageId}:${swipeId}`;
+  }
+  handleMetricsEvent(event) {
+    if (this.destroyed)
+      return;
+    if (typeof event.chatId !== "string" || !event.chatId || typeof event.messageId !== "string" || !event.messageId || typeof event.swipeId !== "number" || !Number.isInteger(event.swipeId) || event.swipeId < 0) {
+      return;
+    }
+    if (event.tokenCount === undefined && event.generationMetrics === undefined) {
+      return;
+    }
+    const key = this.makeKey(event.chatId, event.messageId, event.swipeId);
+    const existing = this.pending.get(key);
+    const entry = {
+      key,
+      chatId: event.chatId,
+      messageId: event.messageId,
+      swipeId: event.swipeId,
+      tokenCount: event.tokenCount !== undefined ? event.tokenCount : existing?.tokenCount,
+      generationMetrics: event.generationMetrics !== undefined ? event.generationMetrics : existing?.generationMetrics,
+      latestFallback: existing?.latestFallback ?? null,
+      revision: ++this.nextRevision,
+      attempts: 0
+    };
+    this.pending.set(key, entry);
+    this.clearRetryTimer(key);
+    this.enqueueFlush(key);
+  }
+  onMessageEvent(rawPayload) {
+    if (this.destroyed || this.pending.size === 0)
+      return;
+    const payload = isRecord(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord(payload.message) ? payload.message : null;
+    const messageId = typeof msg?.id === "string" ? msg.id : typeof payload?.messageId === "string" ? payload.messageId : null;
+    if (!messageId)
+      return;
+    const chatId = typeof payload?.chatId === "string" ? payload.chatId : typeof msg?.chat_id === "string" ? msg.chat_id : null;
+    const action = typeof payload?.action === "string" ? payload.action : null;
+    const deletedSwipeId = action === "deleted" && typeof payload?.swipeId === "number" ? payload.swipeId : null;
+    const activeSwipeId = typeof msg?.swipe_id === "number" ? msg.swipe_id : action !== "deleted" && typeof payload?.swipeId === "number" ? payload.swipeId : undefined;
+    const eventFallback = msg && typeof msg.id === "string" ? msg : null;
+    if (deletedSwipeId !== null) {
+      const shifted = [];
+      for (const [key, entry] of [...this.pending.entries()]) {
+        if (entry.messageId !== messageId)
+          continue;
+        if (chatId && entry.chatId !== chatId)
+          continue;
+        if (entry.swipeId === deletedSwipeId) {
+          this.pending.delete(key);
+          this.scheduledKeys.delete(key);
+          this.clearRetryTimer(key);
+        } else if (entry.swipeId > deletedSwipeId) {
+          this.pending.delete(key);
+          this.scheduledKeys.delete(key);
+          this.clearRetryTimer(key);
+          entry.swipeId -= 1;
+          entry.latestFallback = null;
+          entry.key = this.makeKey(entry.chatId, entry.messageId, entry.swipeId);
+          shifted.push(entry);
+        }
+      }
+      for (const entry of shifted) {
+        const existing = this.pending.get(entry.key);
+        if (!existing || entry.revision > existing.revision) {
+          this.scheduledKeys.delete(entry.key);
+          this.clearRetryTimer(entry.key);
+          this.pending.set(entry.key, entry);
+        }
+      }
+    }
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.messageId !== messageId)
+        continue;
+      if (chatId && entry.chatId !== chatId)
+        continue;
+      if (activeSwipeId !== undefined && activeSwipeId !== entry.swipeId) {
+        continue;
+      }
+      entry.attempts = 0;
+      this.enqueueFlush(key, eventFallback);
+    }
+  }
+  onChatChanged(chatId) {
+    if (this.destroyed || this.pending.size === 0)
+      return;
+    const targetChatId = typeof chatId === "string" && chatId.length > 0 ? chatId : this.safeGetActiveChatId();
+    if (!targetChatId)
+      return;
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.chatId !== targetChatId)
+        continue;
+      entry.attempts = 0;
+      this.enqueueFlush(key);
+    }
+  }
+  destroy() {
+    if (this.destroyed)
+      return;
+    this.destroyed = true;
+    this.pending.clear();
+    this.scheduledKeys.clear();
+    for (const timer of this.retryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.retryTimers.clear();
+  }
+  enqueueFlush(key, eventFallback = null) {
+    if (this.destroyed)
+      return;
+    const entry = this.pending.get(key);
+    if (!entry)
+      return;
+    if (eventFallback !== null) {
+      entry.latestFallback = eventFallback;
+    }
+    if (this.scheduledKeys.has(key))
+      return;
+    this.scheduledKeys.add(key);
+    const msgKey = `${entry.chatId}:${entry.messageId}`;
+    const prev = this.inFlightByMessage.get(msgKey) ?? Promise.resolve();
+    const run = prev.catch(() => {
+      return;
+    }).then(async () => {
+      this.scheduledKeys.delete(key);
+      if (this.destroyed)
+        return;
+      await this.flushKey(key, eventFallback);
+    }).catch(() => {
+      return;
+    }).finally(() => {
+      if (this.inFlightByMessage.get(msgKey) === run) {
+        this.inFlightByMessage.delete(msgKey);
+      }
+    });
+    this.inFlightByMessage.set(msgKey, run);
+  }
+  async flushKey(key, eventFallback) {
+    if (this.destroyed)
+      return;
+    const snapshot = this.pending.get(key);
+    if (!snapshot)
+      return;
+    const resolvedFallback = snapshot.latestFallback ?? eventFallback;
+    const updateMessage = this.resolveUpdateMessage();
+    if (!updateMessage) {
+      this.deleteIfSameRevision(key, snapshot.revision);
+      return;
+    }
+    let target = null;
+    const getMessages = this.resolveGetMessages();
+    if (getMessages) {
+      let page;
+      try {
+        page = await getMessages(snapshot.chatId, {
+          limit: MESSAGE_READ_LIMIT,
+          tail: true
+        });
+      } catch (error) {
+        if (this.destroyed)
+          return;
+        this.handleFlushFailure(key, snapshot, error);
+        return;
+      }
+      if (this.destroyed)
+        return;
+      const messages = extractMessageList(page);
+      target = messages.find((m) => m.id === snapshot.messageId) ?? null;
+      if (!target) {
+        if (resolvedFallback && resolvedFallback.id === snapshot.messageId && messages.length >= MESSAGE_READ_LIMIT) {
+          target = resolvedFallback;
+        } else {
+          this.deleteIfSameRevision(key, snapshot.revision);
+          return;
+        }
+      }
+    } else if (resolvedFallback && resolvedFallback.id === snapshot.messageId) {
+      target = resolvedFallback;
+    } else {
+      return;
+    }
+    if (typeof target.swipe_id !== "number") {
+      return;
+    }
+    if (target.swipe_id !== snapshot.swipeId) {
+      return;
+    }
+    const nextExtra = {
+      ...isRecord(target.extra) ? target.extra : {}
+    };
+    if (snapshot.tokenCount !== undefined) {
+      nextExtra.tokenCount = snapshot.tokenCount;
+    }
+    if (snapshot.generationMetrics !== undefined) {
+      nextExtra.generationMetrics = snapshot.generationMetrics;
+    }
+    try {
+      await updateMessage(snapshot.chatId, snapshot.messageId, {
+        extra: nextExtra
+      });
+    } catch (error) {
+      if (this.destroyed)
+        return;
+      this.handleFlushFailure(key, snapshot, error);
+      return;
+    }
+    if (this.destroyed)
+      return;
+    this.deleteIfSameRevision(key, snapshot.revision);
+  }
+  handleFlushFailure(key, snapshot, error) {
+    const current = this.pending.get(key);
+    if (!current || current.revision !== snapshot.revision) {
+      return;
+    }
+    if (isPermanentError(error) || snapshot.attempts >= 1) {
+      this.pending.delete(key);
+      return;
+    }
+    current.attempts = snapshot.attempts + 1;
+    this.scheduleRetry(key);
+  }
+  deleteIfSameRevision(key, revision) {
+    const current = this.pending.get(key);
+    if (current && current.revision === revision) {
+      this.pending.delete(key);
+    }
+  }
+  scheduleRetry(key) {
+    if (this.destroyed || this.retryTimers.has(key))
+      return;
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(key);
+      if (this.destroyed)
+        return;
+      this.enqueueFlush(key);
+    }, 0);
+    this.retryTimers.set(key, timer);
+  }
+  clearRetryTimer(key) {
+    const timer = this.retryTimers.get(key);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.retryTimers.delete(key);
+    }
+  }
+  resolveGetMessages() {
+    try {
+      const domainChats = this.ctx.domain?.chats;
+      if (typeof domainChats?.getMessages === "function") {
+        return domainChats.getMessages.bind(domainChats);
+      }
+      const chats = this.ctx.chats;
+      if (typeof chats?.getMessages === "function") {
+        return chats.getMessages.bind(chats);
+      }
+    } catch {}
+    return null;
+  }
+  resolveUpdateMessage() {
+    try {
+      const chats = this.ctx.chats;
+      if (typeof chats?.updateMessage === "function") {
+        return chats.updateMessage.bind(chats);
+      }
+    } catch {}
+    return null;
+  }
+  safeGetActiveChatId() {
+    try {
+      return this.ctx.getActiveChat?.().chatId ?? null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 // src/frontend/recovery-store.ts
 function formatRecoverySnippet(text, maxLength = 68) {
+  const safeMax = Number.isFinite(maxLength) ? Math.max(4, Math.floor(maxLength)) : 60;
   const singleLine = text.replace(/\s+/g, " ").trim();
-  if (singleLine.length <= maxLength)
+  if (singleLine.length <= safeMax)
     return singleLine;
-  return `${singleLine.slice(0, maxLength - 1)}…`;
+  return `${singleLine.slice(0, safeMax - 1)}…`;
 }
 function pickRecoveryEntry(entries, preferredId) {
   if (entries.length === 0)
@@ -394,7 +1163,7 @@ class SettingsDrawerController {
           if (this.destroyed)
             return;
           if (this.pendingView && !this.isEditingDrawerInput()) {
-            const next = this.pendingView;
+            const next = this.currentSettings ? { ...this.pendingView, settings: this.currentSettings } : this.pendingView;
             this.pendingView = null;
             this.render(next, { force: true });
           }
@@ -438,6 +1207,7 @@ class SettingsDrawerController {
       return;
     const maxEntries = settings?.inputRecovery.maxEntries ?? this.currentSettings?.inputRecovery.maxEntries ?? 10;
     this.recoveryUi.maxEntries = maxEntries;
+    this.recoveryUi.recoveryCount = recovery.length;
     this.recoveryUi.setBadge(recovery.length > 0 ? String(recovery.length) : "", recovery.length === 0);
     this.recoveryUi.countLabel.textContent = recovery.length > 0 ? `Saved inputs (${recovery.length}/${maxEntries}):` : "No saved inputs yet.";
     this.recoveryUi.clearBtn.disabled = recovery.length === 0;
@@ -532,6 +1302,24 @@ class SettingsDrawerController {
       warn.setAttribute("aria-live", "assertive");
       warn.textContent = `Missing extension permissions (${missingPerms.join(", ")}). Grant all permissions in Extension Manager so actions and dropdowns work properly.`;
       root.append(warn);
+    }
+    const missingFeaturePerms = [];
+    const degradedNotes = [];
+    if (view.permissions.interceptor === false) {
+      missingFeaturePerms.push("interceptor");
+      degradedNotes.push("preset-aware guidance placement (pre-history, in-history, before/after post-history) and swipe turn matching fall back to basic heuristic placement");
+    }
+    if (view.permissions.regex_scripts === false) {
+      missingFeaturePerms.push("regex_scripts");
+      degradedNotes.push("Lumiverse regex scripts are skipped on guidance prompts and generated/impersonated outputs");
+    }
+    if (missingFeaturePerms.length > 0) {
+      const featureWarn = document.createElement("div");
+      featureWarn.className = "gg-notice is-warn";
+      featureWarn.setAttribute("role", "alert");
+      featureWarn.setAttribute("aria-live", "assertive");
+      featureWarn.textContent = `Optional permissions not granted (${missingFeaturePerms.join(", ")}): ${degradedNotes.join("; ")}. Grant them in Extension Manager for full functionality.`;
+      root.append(featureWarn);
     }
     if (view.catalogWarnings && view.catalogWarnings.length > 0) {
       const catalogWarn = document.createElement("div");
@@ -793,6 +1581,20 @@ class SettingsDrawerController {
       ariaLabel: `Clear input bar when running ${meta.label}`,
       onChange: (checked) => savePatch({ clearInputOnRun: checked })
     }));
+    const regexRow = document.createElement("div");
+    regexRow.className = "gg-row";
+    const regexLabel = document.createElement("span");
+    regexLabel.className = "gg-field-label";
+    regexLabel.textContent = "Apply Lumiverse regex scripts";
+    const regexSlot = document.createElement("div");
+    regexRow.append(regexLabel, regexSlot);
+    body.append(regexRow);
+    this.handles.push(this.ctx.components.mountSwitch(regexSlot, {
+      checked: cfg.applyRegex ?? DEFAULT_APPLY_REGEX,
+      size: "sm",
+      ariaLabel: `Apply Lumiverse regex scripts for ${meta.label}`,
+      onChange: (checked) => savePatch({ applyRegex: checked })
+    }));
     const activeConnectionId = getActiveConnectionId(this.ctx);
     let modelHandle = null;
     const connField = createFieldContainer("API Connection Profile");
@@ -852,7 +1654,49 @@ class SettingsDrawerController {
       ariaLabel: `${meta.label} Guidance Injection Role`,
       onChange: (val) => savePatch({ injectionRole: val })
     }));
-    const templateField = createFieldContainer("Guidance Template (supports {{input}}; leave blank for raw input)");
+    const initialPosition = normalizeGuidancePosition(cfg.guidancePosition);
+    const initialDepth = normalizeGuidanceDepth(cfg.guidanceDepth);
+    let depthControl = null;
+    const depthFieldId = `gg-${actionId}-guidance-depth`;
+    const depthField = createFieldContainer("In-History Depth (0–999)", depthFieldId);
+    const syncDepthFieldState = (pos) => {
+      const isInHistory = pos === "in_history";
+      depthField.wrap.style.display = isInHistory ? "" : "none";
+      depthControl?.setDisabled(!isInHistory);
+    };
+    const positionField = createFieldContainer("Guidance Position");
+    body.append(positionField.wrap, depthField.wrap);
+    this.handles.push(this.ctx.components.mountSelect(positionField.slot, {
+      options: GUIDANCE_POSITION_OPTIONS.map((opt) => ({
+        value: opt.value,
+        label: opt.label,
+        sublabel: opt.sublabel
+      })),
+      value: initialPosition,
+      ariaLabel: `${meta.label} Guidance Position`,
+      onChange: (val) => {
+        const nextPosition = normalizeGuidancePosition(val);
+        savePatch({ guidancePosition: nextPosition });
+        syncDepthFieldState(nextPosition);
+      }
+    }));
+    depthControl = this.mountBoundedIntegerField({
+      slot: depthField.slot,
+      fieldId: depthFieldId,
+      ariaLabel: `${meta.label} In-history depth`,
+      debounceKey: `${actionId}:depth`,
+      min: 0,
+      max: 999,
+      defaultValue: DEFAULT_GUIDANCE_DEPTH,
+      placeholder: "0",
+      initialValue: initialDepth,
+      disabled: initialPosition !== "in_history",
+      onCommit: (guidanceDepth) => {
+        savePatch({ guidanceDepth });
+      }
+    });
+    syncDepthFieldState(initialPosition);
+    const templateField = createFieldContainer("Guidance Template (supports {{input}} and Lumiverse macros like {{char}}, {{user}}; leave blank for raw input)");
     body.append(templateField.wrap);
     this.handles.push(this.ctx.components.mountTextArea(templateField.slot, {
       value: cfg.instructionTemplate,
@@ -866,6 +1710,99 @@ class SettingsDrawerController {
       }
     }));
   }
+  mountBoundedIntegerField(options) {
+    const clamp = (raw) => {
+      if (typeof raw === "number" && Number.isFinite(raw)) {
+        return Math.max(options.min, Math.min(options.max, Math.floor(raw)));
+      }
+      return Math.max(options.min, Math.min(options.max, Math.floor(options.defaultValue)));
+    };
+    let currentValue = clamp(options.initialValue);
+    let syncingUi = false;
+    let handle = null;
+    let fallbackInput = null;
+    const commitInput = (rawNumber) => {
+      if (syncingUi)
+        return;
+      const normalized = clamp(rawNumber === null ? options.defaultValue : rawNumber);
+      currentValue = normalized;
+      this.scheduleDebouncedSave(options.debounceKey, () => {
+        options.onCommit(normalized);
+      });
+    };
+    if (typeof this.ctx.components.mountNumericInput === "function") {
+      handle = this.ctx.components.mountNumericInput(options.slot, {
+        value: currentValue,
+        min: options.min,
+        max: options.max,
+        step: 1,
+        integer: true,
+        allowEmpty: true,
+        placeholder: options.placeholder,
+        disabled: Boolean(options.disabled),
+        ariaLabel: options.ariaLabel,
+        onChange: commitInput
+      });
+      const mountedInput = options.slot.querySelector("input");
+      if (mountedInput) {
+        if (!mountedInput.id)
+          mountedInput.id = options.fieldId;
+        if (!mountedInput.getAttribute("aria-label")) {
+          mountedInput.setAttribute("aria-label", options.ariaLabel);
+        }
+      }
+      options.slot.addEventListener("focusout", () => {
+        this.flushPendingSaveKey(options.debounceKey);
+        if (handle && handle.getValue() !== currentValue) {
+          syncingUi = true;
+          try {
+            handle.update({ value: currentValue });
+          } finally {
+            syncingUi = false;
+          }
+        }
+      });
+      this.handles.push(handle);
+    } else {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.id = options.fieldId;
+      input.className = "gg-input-sm";
+      input.min = String(options.min);
+      input.max = String(options.max);
+      input.step = "1";
+      input.placeholder = options.placeholder;
+      input.value = String(currentValue);
+      input.disabled = Boolean(options.disabled);
+      input.setAttribute("aria-label", options.ariaLabel);
+      input.addEventListener("input", () => {
+        const raw = input.value.trim();
+        const parsed = raw === "" ? null : Number(raw);
+        commitInput(parsed !== null && Number.isFinite(parsed) ? parsed : null);
+      });
+      input.addEventListener("blur", () => {
+        this.flushPendingSaveKey(options.debounceKey);
+        input.value = String(currentValue);
+      });
+      fallbackInput = input;
+      options.slot.append(input);
+    }
+    return {
+      setDisabled: (disabled) => {
+        if (handle) {
+          syncingUi = true;
+          try {
+            handle.update({ disabled });
+          } finally {
+            syncingUi = false;
+          }
+        }
+        if (fallbackInput) {
+          fallbackInput.disabled = disabled;
+        }
+      }
+    };
+  }
   updateOrderStateTag(optionId, visible) {
     const tag = this.orderStateTags.get(optionId);
     if (tag) {
@@ -877,13 +1814,13 @@ class SettingsDrawerController {
     const body = card.body;
     const desc = document.createElement("p");
     desc.className = "gg-muted";
-    desc.textContent = "Automatically saves composer input cleared or replaced by guided actions so you can restore it in one click.";
+    desc.textContent = "Automatically saves composer input cleared or replaced by guided actions so you can restore it in one click. When no saved inputs exist, clicking Input Recovery clears the current input.";
     body.append(desc);
     const enableRow = document.createElement("div");
     enableRow.className = "gg-row";
     const enableLabel = document.createElement("span");
     enableLabel.className = "gg-field-label";
-    enableLabel.textContent = "Show Restore button on input bar";
+    enableLabel.textContent = "Enable Input Recovery & toolbar button";
     const enableSlot = document.createElement("div");
     enableRow.append(enableLabel, enableSlot);
     body.append(enableRow);
@@ -902,6 +1839,33 @@ class SettingsDrawerController {
         this.handlers.onSaveSettings(next, { rebuildDrawer: false });
       }
     }));
+    const maxEntriesFieldId = "gg-recovery-max-entries";
+    const maxEntriesField = createFieldContainer("Max saved drafts (1–50)", maxEntriesFieldId);
+    body.append(maxEntriesField.wrap);
+    this.mountBoundedIntegerField({
+      slot: maxEntriesField.slot,
+      fieldId: maxEntriesFieldId,
+      ariaLabel: "Max saved drafts",
+      debounceKey: "recovery:maxEntries",
+      min: 1,
+      max: 50,
+      defaultValue: 10,
+      placeholder: "10",
+      initialValue: settings.inputRecovery.maxEntries,
+      onCommit: (maxEntries) => {
+        const base = this.currentSettings ?? settings;
+        const next = {
+          ...base,
+          inputRecovery: { ...base.inputRecovery, maxEntries }
+        };
+        this.currentSettings = next;
+        if (this.recoveryUi) {
+          this.recoveryUi.maxEntries = maxEntries;
+          this.recoveryUi.countLabel.textContent = this.recoveryUi.recoveryCount > 0 ? `Saved inputs (${this.recoveryUi.recoveryCount}/${maxEntries}):` : "No saved inputs yet.";
+        }
+        this.handlers.onSaveSettings(next, { rebuildDrawer: false });
+      }
+    });
     const controlsRow = document.createElement("div");
     controlsRow.className = "gg-row";
     const countLabel = document.createElement("span");
@@ -923,7 +1887,8 @@ class SettingsDrawerController {
       clearBtn,
       body,
       listEl: null,
-      maxEntries: settings.inputRecovery.maxEntries
+      maxEntries: settings.inputRecovery.maxEntries,
+      recoveryCount: recovery.length
     };
     this.syncRecoveryList(recovery);
   }
@@ -977,7 +1942,7 @@ class SettingsDrawerController {
       this.debounceTimers.delete(key);
       flush();
       if (this.pendingView && !this.isEditingDrawerInput()) {
-        const next = this.pendingView;
+        const next = this.currentSettings ? { ...this.pendingView, settings: this.currentSettings } : this.pendingView;
         this.pendingView = null;
         this.render(next, { force: true });
       }
@@ -993,6 +1958,16 @@ class SettingsDrawerController {
       clearTimeout(entry.timer);
       entry.flush();
     }
+  }
+  flushPendingSaveKey(key) {
+    if (this.destroyed)
+      return;
+    const entry = this.debounceTimers.get(key);
+    if (!entry)
+      return;
+    this.debounceTimers.delete(key);
+    clearTimeout(entry.timer);
+    entry.flush();
   }
   cancelPendingSaves() {
     for (const entry of this.debounceTimers.values()) {
@@ -1084,6 +2059,369 @@ function buildPresetOptions(presets) {
   ];
 }
 
+// src/frontend/streaming-indicator.ts
+var INDICATOR_ACTIONS = new Set([
+  "guided_response",
+  "guided_regenerate",
+  "guided_swipe",
+  "guided_continue"
+]);
+var INDICATOR_HTML_BEFORE = '<div class="gg-streaming-indicator" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
+var INDICATOR_HTML_AFTER = '<div class="gg-streaming-indicator gg-streaming-indicator--after" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
+var MAX_RAF_RETRIES = 30;
+function isRecord2(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+class StreamingIndicatorController {
+  ctx;
+  disposers = [];
+  currentRun = null;
+  viewedSwipeId = undefined;
+  swipeInitialized = false;
+  contentSeen = false;
+  mountedEl = null;
+  mountedTarget = null;
+  mountedPosition = null;
+  rafId = null;
+  rafTimerId = null;
+  rafRetries = 0;
+  retryMode = null;
+  destroyed = false;
+  constructor(ctx) {
+    this.ctx = ctx;
+    if (typeof this.ctx.events?.on === "function") {
+      const handleMessageEvent = (rawPayload) => {
+        this.onMessageEvent(rawPayload);
+      };
+      const handleChatEvent = () => {
+        if (!this.destroyed) {
+          this.syncCurrent();
+        }
+      };
+      this.disposers.push(this.ctx.events.on("MESSAGE_SWIPED", handleMessageEvent), this.ctx.events.on("MESSAGE_EDITED", handleMessageEvent), this.ctx.events.on("MESSAGE_SENT", handleMessageEvent), this.ctx.events.on("CHAT_CHANGED", handleChatEvent), this.ctx.events.on("CHAT_SWITCHED", handleChatEvent));
+    }
+  }
+  sync(run) {
+    if (this.destroyed)
+      return;
+    const prevRun = this.currentRun;
+    const runIdentityChanged = prevRun?.runId !== run?.runId || prevRun?.messageId !== run?.messageId || prevRun?.actionId !== run?.actionId;
+    if (prevRun?.runId !== run?.runId) {
+      this.contentSeen = false;
+      this.viewedSwipeId = undefined;
+      this.swipeInitialized = false;
+      this.resetRetry();
+    } else if (prevRun?.messageId !== run?.messageId) {
+      this.resetRetry();
+    }
+    this.currentRun = run;
+    if (run && !this.swipeInitialized && run.swipeId !== undefined) {
+      this.viewedSwipeId = run.backgroundSwipe ? undefined : run.swipeId;
+      this.swipeInitialized = true;
+    }
+    if (runIdentityChanged) {
+      this.unmount();
+    }
+    this.syncCurrent();
+  }
+  destroy() {
+    if (this.destroyed)
+      return;
+    this.destroyed = true;
+    this.resetRetry();
+    this.unmount();
+    this.currentRun = null;
+    for (const dispose of this.disposers) {
+      try {
+        dispose();
+      } catch {}
+    }
+    this.disposers.length = 0;
+  }
+  onMessageEvent(rawPayload) {
+    if (this.destroyed || !this.currentRun?.messageId)
+      return;
+    const payload = isRecord2(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord2(payload.message) ? payload.message : null;
+    const eventMessageId = typeof msg?.id === "string" ? msg.id : typeof payload?.messageId === "string" ? payload.messageId : undefined;
+    if (eventMessageId === this.currentRun.messageId) {
+      const nextSwipeId = typeof msg?.swipe_id === "number" ? msg.swipe_id : typeof payload?.swipeId === "number" ? payload.swipeId : undefined;
+      if (nextSwipeId !== undefined) {
+        this.viewedSwipeId = nextSwipeId;
+        this.swipeInitialized = true;
+      }
+      const hasText = typeof msg?.content === "string" && msg.content.length > 0;
+      if (hasText && (this.currentRun.swipeId == null || this.viewedSwipeId === this.currentRun.swipeId || this.viewedSwipeId === undefined)) {
+        this.contentSeen = true;
+      }
+      if (this.mountedEl === null) {
+        this.rafRetries = 0;
+      }
+    }
+    this.syncCurrent();
+  }
+  syncCurrent() {
+    if (this.destroyed)
+      return;
+    const run = this.currentRun;
+    if (!this.shouldDisplay(run)) {
+      this.resetRetry();
+      this.unmount();
+      return;
+    }
+    if (typeof this.ctx.dom?.findMessageElement !== "function" || typeof this.ctx.dom?.inject !== "function") {
+      return;
+    }
+    const target = this.resolveTarget(run.messageId, run.actionId);
+    if (!target) {
+      this.unmount();
+      this.ensureRetryMode("row");
+      this.scheduleRetry();
+      return;
+    }
+    const expectMessageContent = Boolean(run.hasContentOutput || this.contentSeen);
+    if (this.mountedEl && this.mountedTarget === target.element && this.mountedPosition === target.position && this.isMountedAt(this.mountedEl, target.element, target.position)) {
+      if (!target.isMessageContent && expectMessageContent) {
+        this.ensureRetryMode("content");
+        this.scheduleRetry();
+      } else {
+        this.resetRetry();
+      }
+      return;
+    }
+    this.unmount();
+    const html = target.isMessageContent ? INDICATOR_HTML_AFTER : INDICATOR_HTML_BEFORE;
+    this.mountedEl = this.ctx.dom.inject(target.element, html, target.position);
+    this.mountedTarget = target.element;
+    this.mountedPosition = target.position;
+    if (!target.isMessageContent && expectMessageContent) {
+      this.ensureRetryMode("content");
+      this.scheduleRetry();
+    } else {
+      this.resetRetry();
+    }
+  }
+  shouldDisplay(run) {
+    if (!run || this.destroyed)
+      return false;
+    if (!INDICATOR_ACTIONS.has(run.actionId))
+      return false;
+    if (typeof run.messageId !== "string" || run.messageId.length === 0) {
+      return false;
+    }
+    const activeChatId = this.safeGetActiveChatId();
+    if (!activeChatId || run.chatId !== activeChatId)
+      return false;
+    if (run.actionId === "guided_swipe") {
+      if (typeof run.swipeId !== "number" || this.viewedSwipeId !== run.swipeId) {
+        return false;
+      }
+    } else if (run.swipeId != null && this.viewedSwipeId !== run.swipeId) {
+      return false;
+    }
+    return true;
+  }
+  safeGetActiveChatId() {
+    try {
+      return this.ctx.getActiveChat?.().chatId ?? null;
+    } catch {
+      return null;
+    }
+  }
+  isMountedAt(el, target, position) {
+    if (position === "afterend") {
+      return target.parentNode !== null && target.nextElementSibling === el;
+    }
+    if (position === "beforebegin") {
+      return target.parentNode !== null && target.previousElementSibling === el;
+    }
+    return target.contains(el);
+  }
+  resolveTarget(messageId, actionId) {
+    if (typeof this.ctx.dom?.findMessageElement !== "function")
+      return null;
+    const row = this.ctx.dom.findMessageElement(messageId);
+    if (!row)
+      return null;
+    const messageContent = row.querySelector('[data-component="MessageContent"]');
+    if (messageContent) {
+      return {
+        element: messageContent,
+        position: "afterend",
+        isMessageContent: true
+      };
+    }
+    if (actionId === "guided_continue") {
+      return this.resolveContinueFallbackTarget(row);
+    }
+    const mountBefore = row.querySelector('[data-spindle-mount="message_body_before"]');
+    if (mountBefore) {
+      return {
+        element: mountBefore,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    const mountAfter = row.querySelector('[data-spindle-mount="message_body_after"]');
+    if (mountAfter) {
+      return {
+        element: mountAfter,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    const bubbleFallback = row.querySelector('[data-component="BubbleMessage"] > div > div:last-child');
+    if (bubbleFallback) {
+      return {
+        element: bubbleFallback,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    if (typeof row.matches === "function" && row.matches('[data-component="BubbleMessage"]')) {
+      const el = row.firstElementChild?.lastElementChild;
+      return el ? { element: el, position: "beforeend", isMessageContent: false } : null;
+    }
+    const minimalFallback = row.querySelector('[data-component="MinimalMessage"] > div');
+    if (minimalFallback) {
+      return {
+        element: minimalFallback,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    if (typeof row.matches === "function" && row.matches('[data-component="MinimalMessage"]')) {
+      const el = row.firstElementChild;
+      return el ? { element: el, position: "beforeend", isMessageContent: false } : null;
+    }
+    return null;
+  }
+  resolveContinueFallbackTarget(row) {
+    const mountAfter = row.querySelector('[data-spindle-mount="message_body_after"]');
+    if (mountAfter) {
+      return {
+        element: mountAfter,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    const mountBefore = row.querySelector('[data-spindle-mount="message_body_before"]');
+    if (mountBefore) {
+      return {
+        element: mountBefore,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    const bubbleContent = row.querySelector('[data-component="BubbleMessage"] [class*="content"]');
+    if (bubbleContent) {
+      return {
+        element: bubbleContent,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    if (typeof row.matches === "function" && row.matches('[data-component="BubbleMessage"]')) {
+      const ownContent = row.querySelector('[class*="content"]') ?? row.firstElementChild?.lastElementChild;
+      if (ownContent) {
+        return {
+          element: ownContent,
+          position: "beforeend",
+          isMessageContent: false
+        };
+      }
+    }
+    const bubbleFallback = row.querySelector('[data-component="BubbleMessage"] > div > div:last-child');
+    if (bubbleFallback) {
+      return {
+        element: bubbleFallback,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    const minimalFallback = row.querySelector('[data-component="MinimalMessage"] > div');
+    if (minimalFallback) {
+      return {
+        element: minimalFallback,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    if (typeof row.matches === "function" && row.matches('[data-component="MinimalMessage"]') && row.firstElementChild) {
+      return {
+        element: row.firstElementChild,
+        position: "beforeend",
+        isMessageContent: false
+      };
+    }
+    return { element: row, position: "beforeend", isMessageContent: false };
+  }
+  ensureRetryMode(mode) {
+    if (this.retryMode !== mode) {
+      this.cancelRetry();
+      this.rafRetries = 0;
+      this.retryMode = mode;
+    }
+  }
+  resetRetry() {
+    this.cancelRetry();
+    this.rafRetries = 0;
+    this.retryMode = null;
+  }
+  unmount() {
+    const el = this.mountedEl;
+    this.mountedEl = null;
+    this.mountedTarget = null;
+    this.mountedPosition = null;
+    if (!el)
+      return;
+    try {
+      if (typeof this.ctx.dom?.uninject === "function") {
+        this.ctx.dom.uninject(el);
+      } else {
+        el.remove();
+      }
+    } catch {}
+  }
+  scheduleRetry() {
+    if (this.destroyed || this.rafId !== null || this.rafTimerId !== null) {
+      return;
+    }
+    if (this.rafRetries >= MAX_RAF_RETRIES)
+      return;
+    this.rafRetries += 1;
+    const raf = typeof globalThis.requestAnimationFrame === "function" ? globalThis.requestAnimationFrame.bind(globalThis) : undefined;
+    if (raf) {
+      this.rafId = raf(() => {
+        this.rafId = null;
+        if (!this.destroyed) {
+          this.syncCurrent();
+        }
+      });
+    } else {
+      this.rafTimerId = setTimeout(() => {
+        this.rafTimerId = null;
+        if (!this.destroyed) {
+          this.syncCurrent();
+        }
+      }, 16);
+    }
+  }
+  cancelRetry() {
+    if (this.rafId !== null) {
+      if (typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(this.rafId);
+      }
+      this.rafId = null;
+    }
+    if (this.rafTimerId !== null) {
+      clearTimeout(this.rafTimerId);
+      this.rafTimerId = null;
+    }
+  }
+}
+
 // src/frontend/styles.ts
 var GUIDED_GENERATIONS_CSS = `
 .gg-actions-host {
@@ -1149,6 +2487,13 @@ var GUIDED_GENERATIONS_CSS = `
   transform: scale(0.95);
 }
 
+.gg-btn.is-holding {
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--lumiverse-primary, #c4b5fd);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.35);
+  transform: scale(0.92);
+}
+
 .gg-btn.is-running {
   background: rgba(239, 68, 68, 0.2);
   color: #fecaca;
@@ -1185,7 +2530,7 @@ var GUIDED_GENERATIONS_CSS = `
   flex-direction: column;
   gap: 12px;
   padding: 12px;
-  color: var(--text-primary, #e5e7eb);
+  color: var(--lumiverse-text, var(--text-primary, #e5e7eb));
   font-size: 13px;
 }
 
@@ -1204,7 +2549,7 @@ var GUIDED_GENERATIONS_CSS = `
 
 .gg-muted {
   margin: 4px 0 0;
-  color: var(--text-secondary, rgba(229, 231, 235, 0.68));
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.68)));
   font-size: 12px;
   line-height: 1.4;
 }
@@ -1297,8 +2642,8 @@ var GUIDED_GENERATIONS_CSS = `
 }
 
 .gg-card-badge.is-muted {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-secondary, rgba(229, 231, 235, 0.65));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.65)));
 }
 
 .gg-card-body-wrap {
@@ -1326,24 +2671,41 @@ var GUIDED_GENERATIONS_CSS = `
 .gg-field-label {
   font-size: 12px;
   font-weight: 500;
-  color: var(--text-secondary, rgba(229, 231, 235, 0.85));
+  color: var(--lumiverse-text, var(--text-secondary, rgba(229, 231, 235, 0.85)));
 }
 
 .gg-btn-sm {
   padding: 5px 10px;
   border-radius: 7px;
-  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.16));
-  background: var(--surface-elevated, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.16)));
+  background: var(--lumiverse-fill, var(--surface-elevated, rgba(255, 255, 255, 0.08)));
   color: inherit;
   font-size: 12px;
   cursor: pointer;
 }
 
 .gg-btn-sm:hover:not(:disabled) {
-  background: var(--surface-hover, rgba(255, 255, 255, 0.15));
+  background: var(--lumiverse-fill-hover, var(--surface-hover, rgba(255, 255, 255, 0.15)));
 }
 
 .gg-btn-sm:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.gg-input-sm {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.16)));
+  background: var(--lumiverse-fill, var(--surface-elevated, rgba(255, 255, 255, 0.06)));
+  color: inherit;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.gg-input-sm:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
@@ -1363,8 +2725,8 @@ var GUIDED_GENERATIONS_CSS = `
   gap: 8px;
   padding: 6px 8px;
   border-radius: 7px;
-  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
-  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.1)));
+  background: var(--lumiverse-fill-subtle, rgba(0, 0, 0, 0.16));
 }
 
 .gg-recovery-meta {
@@ -1378,7 +2740,7 @@ var GUIDED_GENERATIONS_CSS = `
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--text-secondary, rgba(229, 231, 235, 0.6));
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.6)));
 }
 
 .gg-recovery-snippet {
@@ -1401,8 +2763,8 @@ var GUIDED_GENERATIONS_CSS = `
   gap: 8px;
   padding: 6px 8px;
   border-radius: 7px;
-  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
-  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.1)));
+  background: var(--lumiverse-fill-subtle, rgba(0, 0, 0, 0.16));
 }
 
 .gg-order-item-left {
@@ -1420,7 +2782,7 @@ var GUIDED_GENERATIONS_CSS = `
   width: 18px;
   height: 18px;
   flex-shrink: 0;
-  color: var(--text-secondary, rgba(229, 231, 235, 0.78));
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.78)));
 }
 
 .gg-order-item-icon svg {
@@ -1439,7 +2801,7 @@ var GUIDED_GENERATIONS_CSS = `
 
 .gg-order-item-state {
   font-size: 10.5px;
-  color: var(--text-secondary, rgba(229, 231, 235, 0.55));
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.55)));
 }
 
 .gg-order-item-controls {
@@ -1457,8 +2819,8 @@ var GUIDED_GENERATIONS_CSS = `
   height: 24px;
   padding: 0;
   border-radius: 6px;
-  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.14));
-  background: var(--surface-elevated, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.14)));
+  background: var(--lumiverse-fill, var(--surface-elevated, rgba(255, 255, 255, 0.06)));
   color: inherit;
   font-size: 12px;
   line-height: 1;
@@ -1466,18 +2828,130 @@ var GUIDED_GENERATIONS_CSS = `
 }
 
 .gg-icon-btn-sm:hover:not(:disabled) {
-  background: var(--surface-hover, rgba(255, 255, 255, 0.14));
+  background: var(--lumiverse-fill-hover, var(--surface-hover, rgba(255, 255, 255, 0.14)));
 }
 
 .gg-icon-btn-sm:disabled {
   opacity: 0.35;
   cursor: not-allowed;
 }
+
+/* Guided Continue Drop-Up Menu (portaled to document.body) */
+.gg-dropup-menu {
+  position: fixed;
+  z-index: 11000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 210px;
+  max-width: calc((100vw - 16px) / var(--lumiverse-ui-scale, 1));
+  padding: 4px;
+  border-radius: var(--lcs-radius-md, 10px);
+  border: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.14)));
+  background: var(--lumiverse-bg-deep, var(--bg-secondary, #18181f));
+  color: var(--lumiverse-text, var(--text-primary, #e5e7eb));
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.25);
+  box-sizing: border-box;
+}
+
+.gg-dropup-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--lcs-radius-xs, 6px);
+  background: transparent;
+  color: var(--lumiverse-text, var(--text-primary, #e5e7eb));
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.gg-dropup-item:hover {
+  background: var(--lumiverse-fill, var(--bg-hover, rgba(255, 255, 255, 0.08)));
+}
+
+.gg-dropup-item:focus-visible {
+  background: var(--lumiverse-fill, var(--bg-hover, rgba(255, 255, 255, 0.08)));
+  outline: 2px solid var(--lumiverse-primary, var(--accent-primary, #8b5cf6));
+  outline-offset: -2px;
+}
+
+.gg-dropup-item svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  pointer-events: none;
+  display: block;
+  color: var(--lumiverse-primary, var(--accent-primary, currentColor));
+}
+
+/* Streaming Indicator */
+.gg-streaming-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.gg-streaming-indicator--after {
+  margin-top: 4px;
+}
+
+.gg-streaming-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--lumiverse-primary, rgba(147, 112, 219, 0.9));
+  animation: gg-streaming-bounce 1.2s ease-in-out infinite;
+}
+
+.gg-streaming-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.gg-streaming-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes gg-streaming-bounce {
+  0%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-5px);
+    opacity: 1;
+  }
+}
 `;
 
 // src/frontend.ts
-function isRecord(value) {
+function isRecord3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function extractChatIdFromPayload(rawPayload) {
+  if (!isRecord3(rawPayload))
+    return null;
+  if (typeof rawPayload.chatId === "string" && rawPayload.chatId) {
+    return rawPayload.chatId;
+  }
+  if (isRecord3(rawPayload.chat) && typeof rawPayload.chat.id === "string") {
+    return rawPayload.chat.id;
+  }
+  return null;
 }
 function withFrontendConnectionFallback(next, ctx) {
   if (next.connections.length > 0 || !ctx.connections?.list)
@@ -1671,6 +3145,7 @@ function setup(rawCtx) {
       const recoveryUnchanged = Boolean(options.onlyIfChanged) && view !== null && JSON.stringify(view.recovery) === JSON.stringify(mergedNext.recovery);
       view = mergedNext;
       activeRun = resolvedActiveRun;
+      indicator.sync(activeRun);
       if (!coreUnchanged) {
         drawer.render(view);
       } else if (!recoveryUnchanged) {
@@ -1684,7 +3159,7 @@ function setup(rawCtx) {
       showBanner(msg, "error");
     }
   }
-  async function triggerAction(actionId) {
+  async function triggerAction(actionId, options) {
     if (destroyed || activeRun || isLaunching)
       return;
     isLaunching = true;
@@ -1725,7 +3200,8 @@ function setup(rawCtx) {
         actionId,
         chatId,
         activeConnectionId,
-        inputText
+        inputText,
+        ...actionId === "guided_swipe" && options?.backgroundSwipe ? { backgroundSwipe: true } : {}
       };
       try {
         await rpc("run_action", payload, 300000);
@@ -1763,9 +3239,80 @@ function setup(rawCtx) {
     safeFocusComposer();
     clearBanner();
   }
+  function clearCurrentInput() {
+    if (destroyed || !view || activeRun)
+      return;
+    if (!view.settings.inputRecovery.enabled)
+      return;
+    const state = safeGetComposerState();
+    if (!isComposerAvailable(state)) {
+      showBanner("Composer is unavailable right now — cannot clear input.", "warn");
+      return;
+    }
+    if (!state.text) {
+      safeFocusComposer();
+      clearBanner();
+      return;
+    }
+    if (!safeSetComposerText("")) {
+      showBanner("Composer is unavailable right now — cannot clear input.", "warn");
+      return;
+    }
+    safeFocusComposer();
+    clearBanner();
+  }
+  async function removeLastContinue() {
+    if (destroyed || activeRun || isLaunching)
+      return;
+    isLaunching = true;
+    try {
+      const { chatId } = ctx.getActiveChat();
+      if (!chatId) {
+        showBanner("Open a chat before removing the last continue.", "warn");
+        return;
+      }
+      clearBanner();
+      await rpc("remove_last_continue", { chatId });
+    } catch (error) {
+      if (destroyed)
+        return;
+      const msg = error instanceof Error ? error.message : String(error);
+      showBanner(msg, "warn", 7000);
+    } finally {
+      isLaunching = false;
+    }
+  }
+  async function regenerateLastContinue() {
+    if (destroyed || activeRun || isLaunching)
+      return;
+    isLaunching = true;
+    try {
+      const { chatId } = ctx.getActiveChat();
+      if (!chatId) {
+        showBanner("Open a chat before regenerating the last continue.", "warn");
+        return;
+      }
+      clearBanner();
+      const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
+      const payload = {
+        chatId,
+        activeConnectionId
+      };
+      await rpc("regenerate_last_continue", payload, 300000);
+    } catch (error) {
+      if (destroyed)
+        return;
+      const msg = error instanceof Error ? error.message : String(error);
+      showBanner(msg, "error", 7000);
+    } finally {
+      isLaunching = false;
+    }
+  }
+  const indicator = new StreamingIndicatorController(ctx);
+  const pillMetrics = new PillMetricsController(ctx);
   const toolbar = new InputToolbarController(ctx, {
-    onTriggerAction: (actionId) => {
-      triggerAction(actionId);
+    onTriggerAction: (actionId, options) => {
+      triggerAction(actionId, options);
     },
     onAbortAction: (runId) => {
       if (destroyed)
@@ -1775,11 +3322,20 @@ function setup(rawCtx) {
       });
     },
     onRestoreLatest: () => {
-      if (destroyed || !view)
+      if (destroyed || !view || activeRun)
         return;
       const latest = pickRecoveryEntry(view.recovery);
-      if (latest)
+      if (latest) {
         restoreRecoveryEntry(latest);
+      } else {
+        clearCurrentInput();
+      }
+    },
+    onRemoveLastContinue: () => {
+      removeLastContinue();
+    },
+    onRegenerateLastContinue: () => {
+      regenerateLastContinue();
     }
   });
   const drawer = new SettingsDrawerController(ctx, {
@@ -1841,7 +3397,7 @@ function setup(rawCtx) {
   disposers.push(ctx.onBackendMessage((rawPayload) => {
     if (destroyed)
       return;
-    const msg = isRecord(rawPayload) ? rawPayload : {};
+    const msg = isRecord3(rawPayload) ? rawPayload : {};
     if (msg.type === "gg:reply" && typeof msg.requestId === "string") {
       const waiter = pending.get(msg.requestId);
       if (!waiter)
@@ -1862,6 +3418,7 @@ function setup(rawCtx) {
         activeRun = event.run ?? null;
         if (view)
           view = { ...view, activeRun };
+        indicator.sync(activeRun);
         renderToolbar();
         if (event.error) {
           showBanner(event.error, "error", 7000);
@@ -1896,15 +3453,33 @@ function setup(rawCtx) {
         refresh({ onlyIfChanged: true });
         return;
       }
+      case "gg:generation_metrics": {
+        if (typeof event.chatId === "string" && typeof event.messageId === "string" && typeof event.swipeId === "number") {
+          pillMetrics.handleMetricsEvent(event);
+        }
+        return;
+      }
     }
   }));
-  disposers.push(ctx.events.on("CHAT_SWITCHED", () => {
-    if (!destroyed)
-      renderToolbar();
+  disposers.push(ctx.events.on("CHAT_SWITCHED", (payload) => {
+    if (destroyed)
+      return;
+    renderToolbar();
+    pillMetrics.onChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
   }));
-  disposers.push(ctx.events.on("CHAT_CHANGED", () => {
+  disposers.push(ctx.events.on("CHAT_CHANGED", (payload) => {
+    if (destroyed)
+      return;
+    renderToolbar();
+    pillMetrics.onChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
+  }));
+  disposers.push(ctx.events.on("MESSAGE_SWIPED", (payload) => {
     if (!destroyed)
-      renderToolbar();
+      pillMetrics.onMessageEvent(payload);
+  }));
+  disposers.push(ctx.events.on("MESSAGE_EDITED", (payload) => {
+    if (!destroyed)
+      pillMetrics.onMessageEvent(payload);
   }));
   if (ctx.connections?.subscribe) {
     disposers.push(ctx.connections.subscribe(() => {
@@ -1916,8 +3491,10 @@ function setup(rawCtx) {
   try {
     if (ctx.state) {
       disposers.push(ctx.state.subscribe("chat.active", () => {
-        if (!destroyed)
+        if (!destroyed) {
+          indicator.sync(activeRun);
           renderToolbar();
+        }
       }));
       stateSubscribed = true;
     }
@@ -1930,6 +3507,7 @@ function setup(rawCtx) {
       const nextChatId = ctx.getActiveChat().chatId;
       if (nextChatId !== lastChatId) {
         lastChatId = nextChatId;
+        indicator.sync(activeRun);
         renderToolbar();
       }
     }, 600);
@@ -1938,6 +3516,7 @@ function setup(rawCtx) {
   ctx.ready();
   refresh();
   return () => {
+    drawer.flushPendingSaves();
     destroyed = true;
     if (noticeTimer) {
       clearTimeout(noticeTimer);
@@ -1950,6 +3529,8 @@ function setup(rawCtx) {
       waiter.reject(new Error("Guided Generations unloaded."));
     }
     pending.clear();
+    pillMetrics.destroy();
+    indicator.destroy();
     toolbar.destroy();
     drawer.destroy();
     composerAlertMount?.replaceChildren();

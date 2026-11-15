@@ -12,12 +12,17 @@ import type {
   ToolbarOptionId,
   ToolbarPlacement,
 } from "../shared/types";
-import { STOP_ICON_SVG, TOOLBAR_ICONS } from "./icons";
+import { CONTINUE_MENU_ICONS, STOP_ICON_SVG, TOOLBAR_ICONS } from "./icons";
 
 export interface InputToolbarHandlers {
-  onTriggerAction(actionId: GuidedActionId): void;
+  onTriggerAction(
+    actionId: GuidedActionId,
+    options?: { backgroundSwipe?: boolean },
+  ): void;
   onAbortAction(runId: string): void;
   onRestoreLatest(): void;
+  onRemoveLastContinue(): void;
+  onRegenerateLastContinue(): void;
 }
 
 export interface ToolbarRenderState {
@@ -34,12 +39,29 @@ const HOST_CLASSES = [
   "is-right",
 ] as const;
 
+const HOLD_DURATION_MS = 450;
+const HOLD_MOVE_TOLERANCE_PX = 10;
+const MENU_DISMISS_GRACE_MS = 150;
+
+interface ContinueMenuSession {
+  menuEl: HTMLDivElement;
+  anchorBtn: HTMLButtonElement;
+  items: HTMLButtonElement[];
+  cleanup: () => void;
+}
+
 export class InputToolbarController {
   private readonly actionsMountRoot: Element;
   private toolbarMountRoot: Element | null = null;
   private readonly toolbarEl: HTMLDivElement;
   private buttons: HTMLButtonElement[] = [];
   private activeActionId: ToolbarOptionId | null = null;
+  private activeHoldCancel: (() => void) | null = null;
+  private suppressNextHoldClick = false;
+  private clearSuppressHoldClickTimer: ReturnType<typeof setTimeout> | null = null;
+  private holdReleaseCleanup: (() => void) | null = null;
+  private postHoldCleanup: (() => void) | null = null;
+  private continueMenu: ContinueMenuSession | null = null;
   private readonly onKeyDown: (event: KeyboardEvent) => void;
   private readonly onFocusIn: (event: FocusEvent) => void;
 
@@ -75,6 +97,8 @@ export class InputToolbarController {
   }
 
   render(state: ToolbarRenderState): void {
+    this.closeContinueMenu({ restoreFocus: false });
+    this.clearActiveHold();
     const buttons: HTMLButtonElement[] = [];
     const order = normalizeButtonOrder(state.settings.buttonOrder);
 
@@ -116,6 +140,7 @@ export class InputToolbarController {
   }
 
   private handleToolbarKeyDown(event: KeyboardEvent): void {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
     const key = event.key;
     if (
       key !== "ArrowRight" &&
@@ -177,27 +202,513 @@ export class InputToolbarController {
     btn.disabled = disabled;
     btn.setAttribute("data-gg-action", actionId);
     btn.setAttribute("aria-label", isThisRunning ? `Stop ${meta.label}` : meta.label);
-    btn.title = isThisRunning ? `Stop ${meta.label}` : meta.tooltip;
+    if (actionId === "guided_swipe" && !isThisRunning) {
+      btn.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
+      btn.title =
+        "Guided Swipe — click to swipe, hold (or Ctrl+Click) to swipe in background";
+    } else if (actionId === "guided_continue" && !isThisRunning) {
+      btn.setAttribute("aria-haspopup", "menu");
+      btn.setAttribute("aria-expanded", "false");
+      btn.setAttribute("aria-keyshortcuts", "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter");
+      btn.title = "Guided Continue — click to continue, hold for continue options";
+    } else {
+      btn.title = isThisRunning ? `Stop ${meta.label}` : meta.tooltip;
+    }
     btn.innerHTML = isThisRunning ? STOP_ICON_SVG : TOOLBAR_ICONS[actionId];
 
+    if (actionId === "guided_swipe") {
+      this.attachSwipeHoldHandlers(btn, state, isThisRunning, disabled);
+    } else if (actionId === "guided_continue") {
+      this.attachContinueHoldHandlers(btn, state, isThisRunning, disabled);
+    } else {
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (isThisRunning && state.activeRun) {
+          this.handlers.onAbortAction(state.activeRun.runId);
+        } else {
+          this.handlers.onTriggerAction(actionId);
+        }
+      });
+    }
+
+    return btn;
+  }
+
+  private clearActiveHold(): void {
+    if (this.activeHoldCancel) {
+      const cancel = this.activeHoldCancel;
+      this.activeHoldCancel = null;
+      cancel();
+    }
+  }
+
+  private clearPostHoldClickSuppression(): void {
+    this.suppressNextHoldClick = false;
+    if (this.clearSuppressHoldClickTimer !== null) {
+      clearTimeout(this.clearSuppressHoldClickTimer);
+      this.clearSuppressHoldClickTimer = null;
+    }
+    if (this.holdReleaseCleanup) {
+      const cleanup = this.holdReleaseCleanup;
+      this.holdReleaseCleanup = null;
+      cleanup();
+    }
+    if (this.postHoldCleanup) {
+      const onCleanup = this.postHoldCleanup;
+      this.postHoldCleanup = null;
+      onCleanup();
+    }
+  }
+
+  private armPostHoldClickSuppression(onSuppressionCleared?: () => void): void {
+    this.clearPostHoldClickSuppression();
+    this.suppressNextHoldClick = true;
+    this.postHoldCleanup = onSuppressionCleared ?? null;
+
+    if (typeof document === "undefined") return;
+
+    const cleanupListeners = () => {
+      document.removeEventListener("pointerup", onRelease, true);
+      document.removeEventListener("pointercancel", onRelease, true);
+      if (this.holdReleaseCleanup === cleanupListeners) {
+        this.holdReleaseCleanup = null;
+      }
+    };
+
+    const onRelease = () => {
+      cleanupListeners();
+      if (this.clearSuppressHoldClickTimer !== null) {
+        clearTimeout(this.clearSuppressHoldClickTimer);
+      }
+      this.clearSuppressHoldClickTimer = setTimeout(() => {
+        this.clearSuppressHoldClickTimer = null;
+        this.suppressNextHoldClick = false;
+        const onCleanup = this.postHoldCleanup;
+        this.postHoldCleanup = null;
+        onCleanup?.();
+      }, 0);
+    };
+
+    this.holdReleaseCleanup = cleanupListeners;
+    document.addEventListener("pointerup", onRelease, true);
+    document.addEventListener("pointercancel", onRelease, true);
+  }
+
+  private attachLongPressHandlers(
+    btn: HTMLButtonElement,
+    state: ToolbarRenderState,
+    isThisRunning: boolean,
+    disabled: boolean,
+    options: {
+      onClick: (event: MouseEvent) => void;
+      onHold: () => void;
+      onShortcutKeyDown: (event: KeyboardEvent) => boolean;
+    },
+  ): void {
+    const hold: {
+      timer: ReturnType<typeof setTimeout> | undefined;
+      x: number;
+      y: number;
+      fired: boolean;
+    } = {
+      timer: undefined,
+      x: 0,
+      y: 0,
+      fired: false,
+    };
+
+    const doc = typeof document !== "undefined" ? document : null;
+    const win =
+      typeof window !== "undefined" ? window : (doc?.defaultView ?? null);
+    let holdListenersAttached = false;
+
+    const detachHoldCancelListeners = () => {
+      if (!holdListenersAttached) return;
+      holdListenersAttached = false;
+      win?.removeEventListener("blur", cancelHold);
+      doc?.removeEventListener("visibilitychange", cancelHold);
+    };
+
+    const attachHoldCancelListeners = () => {
+      if (holdListenersAttached) return;
+      holdListenersAttached = true;
+      win?.addEventListener("blur", cancelHold);
+      doc?.addEventListener("visibilitychange", cancelHold);
+    };
+
+    const cancelHold = () => {
+      detachHoldCancelListeners();
+      if (hold.timer !== undefined) {
+        clearTimeout(hold.timer);
+        hold.timer = undefined;
+      }
+      btn.classList.remove("is-holding");
+      if (this.activeHoldCancel === cancelHold) {
+        this.activeHoldCancel = null;
+      }
+    };
+
+    btn.addEventListener("pointerdown", (event) => {
+      if (disabled || state.activeRun) return;
+      if (!event.isPrimary) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+
+      this.clearActiveHold();
+      this.clearPostHoldClickSuppression();
+      cancelHold();
+      hold.fired = false;
+      hold.x = event.clientX;
+      hold.y = event.clientY;
+      btn.classList.add("is-holding");
+      this.activeHoldCancel = cancelHold;
+      attachHoldCancelListeners();
+
+      hold.timer = setTimeout(() => {
+        hold.timer = undefined;
+        detachHoldCancelListeners();
+        btn.classList.remove("is-holding");
+        if (this.activeHoldCancel === cancelHold) {
+          this.activeHoldCancel = null;
+        }
+        hold.fired = true;
+        this.armPostHoldClickSuppression(() => {
+          hold.fired = false;
+        });
+        options.onHold();
+      }, HOLD_DURATION_MS);
+    });
+
+    btn.addEventListener("pointermove", (event) => {
+      if (hold.timer === undefined) return;
+      const dx = event.clientX - hold.x;
+      const dy = event.clientY - hold.y;
+      if (Math.hypot(dx, dy) > HOLD_MOVE_TOLERANCE_PX) {
+        cancelHold();
+      }
+    });
+
+    btn.addEventListener("pointerup", cancelHold);
+    btn.addEventListener("pointercancel", cancelHold);
+    btn.addEventListener("pointerleave", cancelHold);
+
+    btn.addEventListener("contextmenu", (event) => {
+      if (hold.timer !== undefined || hold.fired || this.suppressNextHoldClick) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+
     btn.addEventListener("click", (event) => {
+      if (hold.fired || this.suppressNextHoldClick) {
+        hold.fired = false;
+        this.clearPostHoldClickSuppression();
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       if (isThisRunning && state.activeRun) {
         this.handlers.onAbortAction(state.activeRun.runId);
       } else {
-        this.handlers.onTriggerAction(actionId);
+        options.onClick(event);
       }
     });
 
-    return btn;
+    btn.addEventListener("keydown", (event) => {
+      if (disabled || isThisRunning || state.activeRun) return;
+      if (options.onShortcutKeyDown(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+  }
+
+  private attachSwipeHoldHandlers(
+    btn: HTMLButtonElement,
+    state: ToolbarRenderState,
+    isThisRunning: boolean,
+    disabled: boolean,
+  ): void {
+    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+      onClick: (event) => {
+        this.handlers.onTriggerAction("guided_swipe", {
+          backgroundSwipe: Boolean(event.ctrlKey || event.metaKey),
+        });
+      },
+      onHold: () => {
+        this.handlers.onTriggerAction("guided_swipe", { backgroundSwipe: true });
+      },
+      onShortcutKeyDown: (event) => {
+        if ((event.ctrlKey || event.metaKey) && (event.key === "Enter" || event.key === " ")) {
+          this.handlers.onTriggerAction("guided_swipe", { backgroundSwipe: true });
+          return true;
+        }
+        return false;
+      },
+    });
+  }
+
+  private attachContinueHoldHandlers(
+    btn: HTMLButtonElement,
+    state: ToolbarRenderState,
+    isThisRunning: boolean,
+    disabled: boolean,
+  ): void {
+    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+      onClick: (event) => {
+        if (this.continueMenu !== null) {
+          this.closeContinueMenu({ restoreFocus: true });
+          return;
+        }
+        if (event.ctrlKey || event.metaKey) {
+          this.openContinueMenu(btn);
+          return;
+        }
+        this.handlers.onTriggerAction("guided_continue");
+      },
+      onHold: () => {
+        this.openContinueMenu(btn);
+      },
+      onShortcutKeyDown: (event) => {
+        if (
+          (event.shiftKey && event.key === "F10") ||
+          (event.altKey && event.key === "ArrowUp") ||
+          ((event.ctrlKey || event.metaKey) && event.key === "Enter")
+        ) {
+          this.openContinueMenu(btn);
+          return true;
+        }
+        return false;
+      },
+    });
+  }
+
+  private openContinueMenu(anchorBtn: HTMLButtonElement): void {
+    if (typeof document === "undefined" || !document.body) return;
+    this.closeContinueMenu({ restoreFocus: false });
+
+    const menuEl = document.createElement("div");
+    menuEl.className = "gg-dropup-menu";
+    menuEl.setAttribute("role", "menu");
+    menuEl.setAttribute("aria-label", "Guided Continue options");
+
+    const menuDefs = [
+      {
+        id: "remove_last_continue",
+        label: "Remove the last continue",
+        icon: CONTINUE_MENU_ICONS.remove_last_continue,
+        onSelect: () => this.handlers.onRemoveLastContinue(),
+      },
+      {
+        id: "regenerate_last_continue",
+        label: "Regenerate last continue",
+        icon: CONTINUE_MENU_ICONS.regenerate_last_continue,
+        onSelect: () => this.handlers.onRegenerateLastContinue(),
+      },
+    ] as const;
+
+    const items: HTMLButtonElement[] = [];
+    for (const def of menuDefs) {
+      const itemBtn = document.createElement("button");
+      itemBtn.type = "button";
+      itemBtn.className = "gg-dropup-item";
+      itemBtn.setAttribute("role", "menuitem");
+      itemBtn.setAttribute("data-gg-menu-action", def.id);
+      itemBtn.tabIndex = -1;
+      itemBtn.innerHTML = `${def.icon}<span>${def.label}</span>`;
+      itemBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: false });
+        def.onSelect();
+      });
+      items.push(itemBtn);
+      menuEl.append(itemBtn);
+    }
+
+    document.body.append(menuEl);
+    anchorBtn.setAttribute("aria-expanded", "true");
+    this.positionContinueMenu(menuEl, anchorBtn);
+
+    const openedAt = Date.now();
+
+    const onMenuKeyDown = (event: KeyboardEvent) => {
+      const activeIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        event.stopPropagation();
+        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % items.length;
+        items[nextIdx]?.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopPropagation();
+        const nextIdx = activeIdx <= 0 ? items.length - 1 : activeIdx - 1;
+        items[nextIdx]?.focus();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        event.stopPropagation();
+        items[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        event.stopPropagation();
+        items[items.length - 1]?.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+
+    const onOutsidePointerDown = (event: Event) => {
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS) return;
+      const target = event.target as Node | null;
+      if (
+        target &&
+        (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))
+      ) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+
+    const onOutsideClick = (event: Event) => {
+      if (this.suppressNextHoldClick) return;
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS) return;
+      const target = event.target as Node | null;
+      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+
+    const onViewportResize = () => {
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+
+    const onViewportScroll = (event: Event) => {
+      const target = event.target as Node | null;
+      if (target && menuEl.contains(target)) return;
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    menuEl.addEventListener("keydown", onMenuKeyDown);
+    document.addEventListener("keydown", onDocumentKeyDown, true);
+    document.addEventListener("pointerdown", onOutsidePointerDown, true);
+    document.addEventListener("click", onOutsideClick, true);
+    document.addEventListener("scroll", onViewportScroll, true);
+    if (win) {
+      win.addEventListener("resize", onViewportResize);
+      win.addEventListener("scroll", onViewportScroll, true);
+    }
+
+    const cleanup = () => {
+      menuEl.removeEventListener("keydown", onMenuKeyDown);
+      document.removeEventListener("keydown", onDocumentKeyDown, true);
+      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
+      document.removeEventListener("click", onOutsideClick, true);
+      document.removeEventListener("scroll", onViewportScroll, true);
+      if (win) {
+        win.removeEventListener("resize", onViewportResize);
+        win.removeEventListener("scroll", onViewportScroll, true);
+      }
+      menuEl.remove();
+    };
+
+    this.continueMenu = { menuEl, anchorBtn, items, cleanup };
+    items[0]?.focus();
+  }
+
+  private positionContinueMenu(menuEl: HTMLDivElement, anchorBtn: HTMLButtonElement): void {
+    const rect = anchorBtn.getBoundingClientRect();
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    const getStyle =
+      typeof getComputedStyle === "function"
+        ? getComputedStyle
+        : win?.getComputedStyle?.bind(win);
+    const bodyStyle = getStyle && document.body ? getStyle(document.body) : null;
+    const zoomVal = bodyStyle ? parseFloat(bodyStyle.zoom) : NaN;
+    const scaleProp =
+      bodyStyle && typeof bodyStyle.getPropertyValue === "function"
+        ? parseFloat(bodyStyle.getPropertyValue("scale"))
+        : NaN;
+    const varScale =
+      bodyStyle && typeof bodyStyle.getPropertyValue === "function"
+        ? parseFloat(bodyStyle.getPropertyValue("--lumiverse-ui-scale"))
+        : NaN;
+    const uiScale =
+      Number.isFinite(zoomVal) && zoomVal > 0 && zoomVal !== 1
+        ? zoomVal
+        : Number.isFinite(scaleProp) && scaleProp > 0 && scaleProp !== 1
+          ? scaleProp
+          : Number.isFinite(varScale) && varScale > 0 && varScale !== 1
+            ? varScale
+            : 1;
+    const vw =
+      win && typeof win.innerWidth === "number"
+        ? win.innerWidth
+        : document.documentElement?.clientWidth || 1024;
+    const vh =
+      win && typeof win.innerHeight === "number"
+        ? win.innerHeight
+        : document.documentElement?.clientHeight || 768;
+
+    const menuWidth = menuEl.offsetWidth * uiScale;
+    const menuHeight = menuEl.offsetHeight * uiScale;
+    const gapPx = 6;
+    const edgePadding = 8;
+
+    const maxLeft = Math.max(edgePadding, vw - menuWidth - edgePadding);
+    const clampedLeft = Math.max(edgePadding, Math.min(rect.left, maxLeft));
+    menuEl.style.left = `${clampedLeft / uiScale}px`;
+
+    const spaceAbove = rect.top;
+    const spaceBelow = vh - rect.bottom;
+    const neededHeight = menuHeight + gapPx * uiScale + edgePadding;
+
+    if (spaceAbove < neededHeight && spaceBelow > spaceAbove) {
+      menuEl.style.top = `${Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx)}px`;
+      menuEl.style.bottom = "";
+    } else {
+      menuEl.style.bottom = `${(vh - rect.top) / uiScale + gapPx}px`;
+      menuEl.style.top = "";
+    }
+  }
+
+  private closeContinueMenu(options: { restoreFocus: boolean }): void {
+    const session = this.continueMenu;
+    if (!session) return;
+    this.continueMenu = null;
+    session.anchorBtn.setAttribute("aria-expanded", "false");
+    session.cleanup();
+    if (
+      options.restoreFocus &&
+      session.anchorBtn.isConnected &&
+      !session.anchorBtn.disabled
+    ) {
+      session.anchorBtn.focus();
+    }
   }
 
   private buildRecoveryButton(state: ToolbarRenderState): HTMLButtonElement | null {
     if (!state.settings.inputRecovery.enabled) return null;
 
     const hasRecovery = state.recovery.length > 0;
-    const disabled = !hasRecovery || Boolean(state.activeRun);
+    const disabled = Boolean(state.activeRun);
     const latestPreview = state.recovery[0]?.text
       ? ` ("${state.recovery[0].text.replace(/\s+/g, " ").trim().slice(0, 48)}")`
       : "";
@@ -208,10 +719,13 @@ export class InputToolbarController {
     if (disabled) recoverBtn.classList.add("is-dimmed");
     recoverBtn.disabled = disabled;
     recoverBtn.setAttribute("data-gg-action", "input_recovery");
-    recoverBtn.setAttribute("aria-label", "Restore last input");
+    recoverBtn.setAttribute(
+      "aria-label",
+      hasRecovery ? "Restore last input" : "Clear current input",
+    );
     recoverBtn.title = hasRecovery
       ? `Restore last cleared input${latestPreview}`
-      : "Input Recovery — no saved input yet";
+      : "Input Recovery — clear current input";
     recoverBtn.innerHTML = TOOLBAR_ICONS.input_recovery;
 
     recoverBtn.addEventListener("click", (event) => {
@@ -264,6 +778,9 @@ export class InputToolbarController {
   }
 
   destroy(): void {
+    this.closeContinueMenu({ restoreFocus: false });
+    this.clearActiveHold();
+    this.clearPostHoldClickSuppression();
     this.toolbarEl.removeEventListener("keydown", this.onKeyDown);
     this.toolbarEl.removeEventListener("focusin", this.onFocusIn);
     this.buttons = [];

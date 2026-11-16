@@ -14,7 +14,7 @@ import {
 } from "../src/frontend/recovery-store";
 import { SettingsDrawerController } from "../src/frontend/settings-drawer";
 import { GUIDED_GENERATIONS_CSS } from "../src/frontend/styles";
-import { CONTINUE_MENU_ICONS, TOOLBAR_ICONS } from "../src/frontend/icons";
+import { CONTINUE_MENU_ICONS, RECOVERY_MENU_ICONS, TOOLBAR_ICONS } from "../src/frontend/icons";
 import { GuidedGenerationRunner } from "../src/backend/generation-runner";
 import { createDefaultSettings } from "../src/shared/defaults";
 import type {
@@ -524,7 +524,7 @@ describe("InputToolbarController DOM behavior", () => {
     expect(res.messageId).toBe("m3");
     expect(res.text).toBe("Fresh reply");
     expect(deletedIds).toEqual(["m2"]);
-    expect(events).toEqual(["delete:m2", "append", "dryRun"]);
+    expect(events).toEqual(["delete:m2", "dryRun", "append"]);
   });
 
   test("reset toolbar alignment supports CSS ordering, custom buttonOrder, and below_bar placement", () => {
@@ -1469,6 +1469,661 @@ describe("InputToolbarController DOM behavior", () => {
       expect(getMenu()).toBeNull();
     } finally {
       Win.getComputedStyle = origGetComputedStyle;
+      Date.now = origDateNow;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("InputToolbarController handles input_recovery press-and-hold drop-up menu with History and Clear History options", () => {
+    expect(RECOVERY_MENU_ICONS.history).toContain("<svg");
+    expect(RECOVERY_MENU_ICONS.clear_history).toContain("<svg");
+
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origDateNow = Date.now;
+    let fakeNow = 20_000;
+    const pendingHoldTimers = new Map<number, () => void>();
+    let nextTimerId = 94_000;
+
+    Date.now = () => fakeNow;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextTimerId;
+        pendingHoldTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (pendingHoldTimers.has(num)) {
+        pendingHoldTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const fireHoldTimers = () => {
+      for (const [id, fn] of [...pendingHoldTimers.entries()]) {
+        if (!pendingHoldTimers.has(id)) continue;
+        pendingHoldTimers.delete(id);
+        fn();
+      }
+    };
+
+    const Win = document.defaultView!;
+    try {
+      let restoreLatestCalls = 0;
+      let clearRecoveryCalls = 0;
+      const restoredEntries: RecoveryEntry[] = [];
+
+      const actionsMount = document.createElement("span");
+      document.body.append(actionsMount);
+      const fakeCtx = {
+        ui: { mount: () => actionsMount },
+      } as unknown as SpindleFrontendContext;
+
+      const toolbar = new InputToolbarController(fakeCtx, {
+        onTriggerAction: () => {},
+        onAbortAction: () => {},
+        onRestoreLatest: () => {
+          restoreLatestCalls += 1;
+        },
+        onRestoreEntry: (entry) => {
+          restoredEntries.push(entry);
+        },
+        onClearRecovery: () => {
+          clearRecoveryCalls += 1;
+        },
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      });
+
+      const entries: RecoveryEntry[] = [
+        {
+          id: "rec-2",
+          text: "Second saved draft",
+          actionId: "guided_swipe",
+          chatId: "c1",
+          createdAt: 200,
+        },
+        {
+          id: "rec-1",
+          text: "First saved draft",
+          actionId: "guided_response",
+          chatId: "c1",
+          createdAt: 100,
+        },
+      ];
+
+      const settings = createDefaultSettings();
+      toolbar.render({ settings, activeRun: null, recovery: entries, hasActiveChat: true });
+
+      const getRecoveryBtn = () =>
+        actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+      const getMenu = () =>
+        document.body.querySelector<HTMLDivElement>(".gg-dropup-menu");
+      const getMenuItems = () =>
+        Array.from(document.body.querySelectorAll<HTMLButtonElement>('.gg-dropup-menu [role="menuitem"]'));
+
+      const PointerEvt = Win.PointerEvent;
+      const MouseEvt = Win.MouseEvent;
+      const KeyEvt = Win.KeyboardEvent;
+
+      expect(getRecoveryBtn().getAttribute("aria-haspopup")).toBe("menu");
+      expect(getRecoveryBtn().getAttribute("aria-expanded")).toBe("false");
+
+      // Single click restores latest without opening menu
+      getRecoveryBtn().click();
+      expect(restoreLatestCalls).toBe(1);
+      expect(getMenu()).toBeNull();
+
+      // Press and hold for 450ms opens drop-up with 2 options: History and Clear History
+      const recBtn = getRecoveryBtn();
+      recBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 100,
+          clientY: 100,
+        }),
+      );
+      expect(recBtn.classList.contains("is-holding")).toBe(true);
+      fakeNow += 450;
+      fireHoldTimers();
+      expect(recBtn.classList.contains("is-holding")).toBe(false);
+      expect(recBtn.getAttribute("aria-expanded")).toBe("true");
+
+      // Release pointer after hold -> trailing click is suppressed and menu stays open
+      fakeNow += 30;
+      recBtn.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 100,
+          clientY: 100,
+        }),
+      );
+      const trailingClick = new MouseEvt("click", { bubbles: true, cancelable: true });
+      recBtn.dispatchEvent(trailingClick);
+      expect(trailingClick.defaultPrevented).toBe(true);
+      expect(restoreLatestCalls).toBe(1);
+
+      const menu = getMenu()!;
+      expect(menu).not.toBeNull();
+      expect(menu.getAttribute("aria-label")).toBe("Input Recovery options");
+
+      const rootItems = getMenuItems();
+      expect(rootItems.map((el) => el.textContent?.trim())).toEqual([
+        "History",
+        "Clear History",
+      ]);
+
+      // Clicking "History" switches drop-up to saved drafts list
+      rootItems[0]!.click();
+      expect(getMenu()).not.toBeNull();
+      expect(getMenu()!.getAttribute("aria-label")).toBe("Input Recovery History");
+      const historyItems = getMenuItems();
+      expect(historyItems).toHaveLength(2);
+      expect(historyItems[0]!.getAttribute("data-gg-recovery-id")).toBe("rec-2");
+      expect(historyItems[1]!.getAttribute("data-gg-recovery-id")).toBe("rec-1");
+
+      // Pressing ArrowLeft returns to root options ("History" and "Clear History")
+      getMenu()!.dispatchEvent(
+        new KeyEvt("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }),
+      );
+      expect(getMenuItems().map((el) => el.textContent?.trim())).toEqual([
+        "History",
+        "Clear History",
+      ]);
+
+      // Clicking "History" then selecting the second draft restores that entry and closes menu
+      getMenuItems()[0]!.click();
+      getMenuItems()[1]!.click();
+      expect(restoredEntries).toEqual([entries[1]!]);
+      expect(getMenu()).toBeNull();
+      expect(recBtn.getAttribute("aria-expanded")).toBe("false");
+
+      // Re-open with Ctrl+Click and click "Clear History"
+      recBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      const clearItem = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="clear_history"]',
+      )!;
+      clearItem.click();
+      expect(clearRecoveryCalls).toBe(1);
+      expect(getMenu()).toBeNull();
+
+      // Empty history state in drop-up History view
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      getRecoveryBtn().dispatchEvent(
+        new KeyEvt("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true }),
+      );
+      expect(getMenu()).not.toBeNull();
+      getMenuItems()[0]!.click();
+      expect(document.body.querySelector(".gg-dropup-empty")?.textContent).toBe(
+        "No saved inputs yet.",
+      );
+      const backBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="back"]',
+      )!;
+      backBtn.click();
+      expect(getMenuItems().map((el) => el.textContent?.trim())).toEqual([
+        "History",
+        "Clear History",
+      ]);
+
+      toolbar.destroy();
+      expect(getMenu()).toBeNull();
+    } finally {
+      Date.now = origDateNow;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("audit regressions: History maxHeight viewport clamping, disabled Clear History when empty, onFocusOut with pendingView not swallowing drawer clicks, and updateRecovery preserved across pendingView flush", async () => {
+    const Win = document.defaultView!;
+    const origInnerHeight = Win.innerHeight;
+    Object.defineProperty(Win, "innerHeight", { value: 240, configurable: true });
+
+    const actionsMount = document.createElement("span");
+    document.body.append(actionsMount);
+    const fakeCtx = {
+      ui: { mount: () => actionsMount },
+    } as unknown as SpindleFrontendContext;
+
+    const toolbar = new InputToolbarController(fakeCtx, {
+      onTriggerAction: () => {},
+      onAbortAction: () => {},
+      onRestoreLatest: () => {},
+      onRestoreEntry: () => {},
+      onClearRecovery: () => {},
+      onRemoveLastContinue: () => {},
+      onRegenerateLastContinue: () => {},
+    });
+
+    try {
+      const settings = createDefaultSettings();
+      // 1. Empty recovery -> Clear History disabled in root drop-up menu
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      const recBtn = actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+      recBtn.dispatchEvent(new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+      const clearMenuBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="clear_history"]',
+      )!;
+      expect(clearMenuBtn.disabled).toBe(true);
+      expect(clearMenuBtn.getAttribute("aria-disabled")).toBe("true");
+      toolbar.render({
+        settings,
+        activeRun: null,
+        recovery: Array.from({ length: 15 }, (_, idx) => ({
+          id: `rec-${idx}`,
+          text: `Saved draft #${idx}`,
+          actionId: "guided_response" as const,
+          chatId: "chat-1",
+          createdAt: 1000 + idx,
+        })),
+        hasActiveChat: true,
+      });
+
+      // 2. Tight viewport clamps menuEl.style.maxHeight and .gg-dropup-history-list maxHeight
+      const recBtn2 = actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+      recBtn2.getBoundingClientRect = () =>
+        ({
+          left: 100,
+          right: 130,
+          top: 190,
+          bottom: 220,
+          width: 30,
+          height: 30,
+          x: 100,
+          y: 190,
+          toJSON: () => ({}),
+        }) as DOMRect;
+      recBtn2.dispatchEvent(new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+      const historyMenuBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="history"]',
+      )!;
+      historyMenuBtn.click();
+      const menuEl = document.body.querySelector<HTMLDivElement>(".gg-dropup-menu")!;
+      const listEl = document.body.querySelector<HTMLDivElement>(".gg-dropup-history-list")!;
+      expect(parseFloat(menuEl.style.maxHeight)).toBeLessThanOrEqual(190);
+      expect(parseFloat(listEl.style.maxHeight)).toBeLessThanOrEqual(190);
+    } finally {
+      toolbar.destroy();
+      actionsMount.remove();
+      Object.defineProperty(Win, "innerHeight", { value: origInnerHeight, configurable: true });
+    }
+
+    // 3. SettingsDrawerController: onFocusOut while clicking a drawer button with pendingView
+    //    must NOT detach the clicked button before click fires; and updateRecovery during pendingView
+    //    is preserved when pendingView flushes.
+    const tabRoot = document.createElement("div");
+    document.body.append(tabRoot);
+    let refreshClicked = 0;
+    const drawerCtx = {
+      ui: {
+        registerDrawerTab: () => ({
+          root: tabRoot,
+          tabId: "gg-test-tab",
+          setTitle: () => {},
+          setShortName: () => {},
+          setBadge: () => {},
+          activate: () => {},
+          destroy: () => {},
+          onActivate: () => () => {},
+        }),
+      },
+      components: {
+        mountSwitch: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const btn = document.createElement("button");
+          btn.setAttribute("role", "switch");
+          btn.setAttribute("aria-checked", "true");
+          el.append(btn);
+          return { componentId: "sw", element: el as HTMLElement, update: () => {}, destroy: () => { el.replaceChildren(); }, getValue: () => true };
+        },
+        mountSelect: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "sel", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "" };
+        },
+        mountModelCombobox: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "mc", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "", refresh: () => {} };
+        },
+        mountTextArea: (target: string | Element, opts: { value?: string; ariaLabel?: string }) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const ta = document.createElement("textarea");
+          if (opts.ariaLabel) ta.setAttribute("aria-label", opts.ariaLabel);
+          ta.value = opts.value ?? "";
+          el.append(ta);
+          return { componentId: "ta", element: el as HTMLElement, update: () => {}, destroy: () => { el.replaceChildren(); }, getValue: () => ta.value };
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const drawer = new SettingsDrawerController(drawerCtx, {
+      onRefresh: () => {
+        refreshClicked += 1;
+      },
+      onSaveSettings: async () => {},
+      onRestoreEntry: () => {},
+      onClearRecovery: async () => {},
+    });
+
+    const initialSettings = createDefaultSettings();
+    const initialView: ExtensionBootstrapView = {
+      settings: initialSettings,
+      connections: [],
+      presets: [],
+      recovery: [],
+      activeRun: null,
+      permissions: {
+        generation: true,
+        chats: true,
+        chat_mutation: true,
+        characters: true,
+        presets: true,
+        regex_scripts: true,
+        interceptor: true,
+      },
+    };
+
+    try {
+      drawer.render(initialView);
+      const templateBox = tabRoot.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Guided Response Guidance Template"]',
+      )!;
+      const refreshBtn = tabRoot.querySelector<HTMLButtonElement>(
+        'button[data-gg-focus-key="refresh"]',
+      )!;
+
+      // Focus textarea so drawer.render(nextView) queues pendingView instead of rebuilding
+      templateBox.focus();
+      drawer.render({
+        ...initialView,
+        recovery: [
+          {
+            id: "old-rec",
+            text: "Stale recovery",
+            actionId: "guided_response",
+            chatId: "chat-1",
+            createdAt: 1,
+          },
+        ],
+      });
+
+      // Update recovery while pendingView is queued
+      drawer.updateRecovery(
+        [
+          {
+            id: "fresh-rec",
+            text: "Fresh recovery entry",
+            actionId: "guided_response",
+            chatId: "chat-1",
+            createdAt: 2,
+          },
+        ],
+        initialSettings,
+      );
+
+      // Simulate clicking Refresh button while textarea had focus:
+      // pointerdown -> focusout (relatedTarget: refreshBtn) -> microtask tick -> mouseup -> click
+      tabRoot.dispatchEvent(new Win.MouseEvent("mousedown", { bubbles: true }));
+      templateBox.dispatchEvent(
+        new Win.FocusEvent("focusout", { bubbles: true, relatedTarget: refreshBtn }),
+      );
+      await Promise.resolve();
+      // refreshBtn must STILL be connected so the browser click fires on it!
+      expect(refreshBtn.isConnected).toBe(true);
+
+      refreshBtn.dispatchEvent(new Win.MouseEvent("mouseup", { bubbles: true }));
+      refreshBtn.click();
+      expect(refreshClicked).toBe(1);
+
+      // Wait for macrotask pendingView flush -> updated recovery ("Fresh recovery entry") is preserved!
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(tabRoot.textContent).toContain("Fresh recovery entry");
+      expect(tabRoot.textContent).not.toContain("Stale recovery");
+    } finally {
+      drawer.destroy();
+      tabRoot.remove();
+    }
+  });
+
+  test("post-audit polish: mountBoundedIntegerField focusout inside slot, setRecoveryBusy, and touch post-hold click suppression", () => {
+    const Win = document.defaultView!;
+    // 1. mountBoundedIntegerField focusout with relatedTarget inside options.slot does NOT commit default/flush
+    const tabRoot = document.createElement("div");
+    document.body.append(tabRoot);
+    const savedPatches: GuidedGenerationsSettings[] = [];
+    let currentNumericVal: number | null = 5;
+    let slotBtn!: HTMLButtonElement;
+    const drawerCtx = {
+      ui: {
+        registerDrawerTab: () => ({
+          root: tabRoot,
+          tabId: "gg-test-polish",
+          setTitle: () => {},
+          setShortName: () => {},
+          setBadge: () => {},
+          activate: () => {},
+          destroy: () => {},
+          onActivate: () => () => {},
+        }),
+      },
+      components: {
+        mountSwitch: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "sw", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => true };
+        },
+        mountSelect: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "sel", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "" };
+        },
+        mountNumericInput: (
+          target: string | Element,
+          opts: { value?: number | null; onChange?: (v: number | null) => void },
+        ) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          const input = document.createElement("input");
+          input.type = "number";
+          input.value = opts.value != null ? String(opts.value) : "";
+          slotBtn = document.createElement("button");
+          slotBtn.type = "button";
+          el.append(input, slotBtn);
+          return {
+            componentId: "num",
+            element: el as HTMLElement,
+            update: (patch: { value?: number | null }) => {
+              if (patch.value !== undefined) {
+                currentNumericVal = patch.value;
+                input.value = patch.value === null ? "" : String(patch.value);
+              }
+            },
+            destroy: () => el.replaceChildren(),
+            getValue: () => currentNumericVal,
+            onChange: opts.onChange,
+          };
+        },
+        mountModelCombobox: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "mc", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "", refresh: () => {} };
+        },
+        mountTextArea: (target: string | Element) => {
+          const el = typeof target === "string" ? document.querySelector(target)! : target;
+          return { componentId: "ta", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "" };
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const drawer = new SettingsDrawerController(drawerCtx, {
+      onRefresh: () => {},
+      onSaveSettings: async (next) => {
+        savedPatches.push(next);
+      },
+      onRestoreEntry: () => {},
+      onClearRecovery: async () => {},
+    });
+
+    try {
+      const settings = createDefaultSettings();
+      settings.inputRecovery.maxEntries = 12;
+      currentNumericVal = 12;
+      drawer.render({
+        settings,
+        connections: [],
+        presets: [],
+        recovery: [
+          {
+            id: "r1",
+            text: "Saved 1",
+            actionId: "guided_response",
+            chatId: "c1",
+            createdAt: 1,
+          },
+        ],
+        activeRun: null,
+        permissions: {
+          generation: true,
+          chats: true,
+          chat_mutation: true,
+          characters: true,
+          presets: true,
+          regex_scripts: true,
+          interceptor: true,
+        },
+      });
+
+      const maxEntriesSlot = tabRoot.querySelector("#gg-recovery-max-entries")?.parentElement as HTMLElement;
+      expect(maxEntriesSlot).not.toBeNull();
+      const inputEl = maxEntriesSlot.querySelector("input")!;
+      // Focus moves to sibling inside slot (relatedTarget inside options.slot) -> must NOT flush/reset
+      currentNumericVal = null;
+      inputEl.value = "";
+      maxEntriesSlot.dispatchEvent(
+        new Win.FocusEvent("focusout", { bubbles: true, relatedTarget: slotBtn }),
+      );
+      expect(inputEl.value).toBe("");
+      expect(savedPatches).toHaveLength(0);
+
+      // setRecoveryBusy(true) disables Clear History and restore buttons; setRecoveryBusy(false) re-enables
+      drawer.setRecoveryBusy(true);
+      const recoveryButtons = Array.from(
+        tabRoot.querySelectorAll<HTMLButtonElement>(".gg-recovery-list button"),
+      );
+      expect(recoveryButtons.length).toBeGreaterThan(0);
+      expect(recoveryButtons.every((b) => b.disabled)).toBe(true);
+      drawer.setRecoveryBusy(false);
+      expect(recoveryButtons.every((b) => !b.disabled)).toBe(true);
+    } finally {
+      drawer.destroy();
+      tabRoot.remove();
+    }
+
+    // 2. Touch pointerup keeps post-hold click suppression active for delayed clicks (e.g. 120ms) within 250ms
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origDateNow = Date.now;
+    let fakeNow = 50_000;
+    const holdTimers = new Map<number, () => void>();
+    let nextId = 81_000;
+
+    Date.now = () => fakeNow;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextId;
+        holdTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (holdTimers.has(num)) {
+        holdTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const actionsMount = document.createElement("span");
+    document.body.append(actionsMount);
+    const triggered: string[] = [];
+    const toolbar = new InputToolbarController(
+      { ui: { mount: () => actionsMount } } as unknown as SpindleFrontendContext,
+      {
+        onTriggerAction: (id) => triggered.push(id),
+        onAbortAction: () => {},
+        onRestoreLatest: () => {},
+        onRestoreEntry: () => {},
+        onClearRecovery: () => {},
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      },
+    );
+
+    try {
+      toolbar.render({
+        settings: createDefaultSettings(),
+        activeRun: null,
+        recovery: [],
+        hasActiveChat: true,
+      });
+      const swipeBtn = actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_swipe"]')!;
+      swipeBtn.dispatchEvent(
+        new Win.PointerEvent("pointerdown", {
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 50,
+          clientY: 50,
+        }),
+      );
+      fakeNow += 450;
+      for (const [id, fn] of [...holdTimers.entries()]) {
+        holdTimers.delete(id);
+        fn();
+      }
+      expect(triggered).toEqual(["guided_swipe"]);
+      triggered.length = 0;
+      swipeBtn.dispatchEvent(
+        new Win.PointerEvent("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 50,
+          clientY: 50,
+        }),
+      );
+      // Advance 120ms (< 250ms POST_RELEASE_MAX_WINDOW_MS): delayed touch click must still be suppressed
+      fakeNow += 120;
+      const delayedClick = new Win.MouseEvent("click", { bubbles: true, cancelable: true });
+      swipeBtn.dispatchEvent(delayedClick);
+      expect(delayedClick.defaultPrevented).toBe(true);
+      expect(triggered).toEqual([]);
+    } finally {
+      toolbar.destroy();
+      actionsMount.remove();
       Date.now = origDateNow;
       (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
       (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =

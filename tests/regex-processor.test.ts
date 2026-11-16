@@ -367,4 +367,95 @@ describe("regex-processor", () => {
     });
     expect(await applyRegexScripts("a𝄞", [stickyZeroLen], "ai_output", 0)).toBe("|a|𝄞|");
   });
+
+  test("healFormattingArtifacts preserves dimension quotes, HTML attrs, even-star math bullets, exponentiation, boundary underscores, 4-backtick fences, multiline backticks, and nested </json> strings", async () => {
+    const input = [
+      'Board dimensions: 2" x 4" and 6" x 8" are standard.',
+      '<div data-expr="1>0" title=" * keep * "> " spaced prose " </div>',
+      "* Multiply 2 * 3",
+      "Math: 2 * (3 + 4) * 5 and 2 ** 3 ** 4",
+      "Boundary underscores: foo(1)_ and bar(2)_ stay intact",
+      "`* multiline\ninline code *`",
+      '````md\n```ts\nconst s = "* keep *";\n```\n````',
+      '<json>{"html":"</json> * keep *"}</json>',
+    ].join("\n");
+
+    const healed = healFormattingArtifacts(input);
+    const expected = [
+      'Board dimensions: 2" x 4" and 6" x 8" are standard.',
+      '<div data-expr="1>0" title=" * keep * "> "spaced prose" </div>',
+      "* Multiply 2 * 3",
+      "Math: 2 * (3 + 4) * 5 and 2 ** 3 ** 4",
+      "Boundary underscores: foo(1)_ and bar(2)_ stay intact",
+      "`* multiline\ninline code *`",
+      '````md\n```ts\nconst s = "* keep *";\n```\n````',
+      '<json>{"html":"</json> * keep *"}</json>',
+    ].join("\n");
+    expect(healed).toBe(expected);
+
+    // processResponseOutput runs healFormattingArtifacts on content ONLY, not reasoning
+    const out = await processResponseOutput({
+      content: '" spaced content "',
+      reasoning: '" spaced reasoning " and 2 * 3',
+      scripts: [],
+    });
+    expect(out.content).toBe('"spaced content"');
+    expect(out.reasoning).toBe('" spaced reasoning " and 2 * 3');
+  });
+
+  test("applyRegexScripts preserves $1/$& inside {{match}} and tokenizes block macros as single top-level tokens", async () => {
+    const matchWithDollars = makeScript({
+      find_regex: "(Price:\\s*\\S+)",
+      replace_string: "[{{match}} | $1]",
+    });
+    expect(
+      await applyRegexScripts("Price: $1/$&", [matchWithDollars], "ai_output", 0),
+    ).toBe("[Price: $1/$& | Price: $1/$&]");
+
+    const resolvedTokens: string[] = [];
+    const blockMacroScript = makeScript({
+      find_regex: "{{#if flag}}yes*{{/if}} (\\w+)",
+      replace_string: "MATCH:$1",
+      substitute_macros: "escaped",
+    });
+    const blockOut = await applyRegexScripts(
+      "yes* world",
+      [blockMacroScript],
+      "ai_output",
+      0,
+      {
+        resolveMacros: async (token) => {
+          resolvedTokens.push(token);
+          if (token === "{{#if flag}}yes*{{/if}}") return "yes*";
+          return token;
+        },
+      },
+    );
+    expect(resolvedTokens).toEqual(["{{#if flag}}yes*{{/if}}"]);
+    expect(blockOut).toBe("MATCH:world");
+  });
+
+  test("applyRegexScripts runs substitute_macros 'after' on 0 matches and healFormattingArtifacts closes unclosed <font> at CRLF paragraph breaks", async () => {
+    const afterZeroMatches = makeScript({
+      find_regex: "NEVER_MATCHES_XYZ",
+      replace_string: "unused",
+      substitute_macros: "after",
+    });
+    const resolved = await applyRegexScripts(
+      "Hello {{char}} and {{user}}.",
+      [afterZeroMatches],
+      "ai_output",
+      0,
+      {
+        resolveMacros: async (text) =>
+          text.replace(/\{\{char\}\}/g, "Aria").replace(/\{\{user\}\}/g, "Kai"),
+      },
+    );
+    expect(resolved).toBe("Hello Aria and Kai.");
+
+    const crlfUnclosedFont = '<font color="#ff0000">First paragraph\r\n\r\nSecond paragraph';
+    expect(healFormattingArtifacts(crlfUnclosedFont)).toBe(
+      '<font color="#ff0000">First paragraph</font>\r\n\r\nSecond paragraph',
+    );
+  });
 });

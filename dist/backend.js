@@ -219,6 +219,8 @@ function resolveChatHistoryFlags(messages, options = {}) {
         const expectedRole = mapPromptBlockRole(block.role);
         if (messages[preEnd]?.role === expectedRole) {
           preEnd += 1;
+        } else {
+          break;
         }
       }
       let postStart = messages.length;
@@ -231,6 +233,8 @@ function resolveChatHistoryFlags(messages, options = {}) {
         const expectedRole = mapPromptBlockRole(postBlocks[i].role);
         if (messages[postStart - 1]?.role === expectedRole) {
           postStart -= 1;
+        } else {
+          break;
         }
       }
       if (preEnd > 0 || postStart < messages.length) {
@@ -252,6 +256,15 @@ function stripInternalMessageMarkers(messages) {
       __worldInfoSource: _worldInfoSource,
       __sourceMessageId: _sourceMessageId,
       __sourceIndexInChat: _sourceIndexInChat,
+      __sourceMessageMetadata: _sourceMetaUnderscore,
+      __continueNudge: _continueNudge,
+      __contextAnchorProtected: _contextAnchorProtected,
+      __preserveDisplayReasoningDelimiters: _preserveReasoningDelims,
+      __cortexHistorySummary: _cortexHistorySummary,
+      __runtimeWorldInfoPlacementId: _runtimeWiPlacementId,
+      sourceMessageId: _sourceId,
+      sourceIndexInChat: _sourceIdx,
+      sourceMessageMetadata: _sourceMeta,
       ...rest
     } = msg;
     return rest;
@@ -307,11 +320,30 @@ function injectGuidanceMessage(messages, guidanceText, role, options = {}) {
     }
     return -1;
   };
+  const findMovedContinueAssistantIndex = (afterIdx) => {
+    if (options.actionId !== "guided_continue")
+      return -1;
+    let idx = copy.length - 1;
+    while (idx > afterIdx && copy[idx]?.role === "system") {
+      idx -= 1;
+    }
+    if (idx > afterIdx && copy[idx]?.role === "assistant") {
+      return idx;
+    }
+    return -1;
+  };
   let insertIndex = copy.length;
   switch (position) {
     case "pre_history": {
       if (hasHistoryFlags) {
-        insertIndex = historyIndices.length > 0 ? historyIndices[0] : 0;
+        if (historyIndices.length > 0) {
+          insertIndex = historyIndices[0];
+        } else if (options.actionId === "guided_continue") {
+          const firstTurnIdx = copy.findIndex((m) => m.role === "user" || m.role === "assistant");
+          insertIndex = firstTurnIdx >= 0 ? firstTurnIdx : 0;
+        } else {
+          insertIndex = 0;
+        }
       } else {
         const firstTurnIdx = copy.findIndex((m) => m.role === "user" || m.role === "assistant");
         insertIndex = firstTurnIdx >= 0 ? firstTurnIdx : 0;
@@ -323,14 +355,19 @@ function injectGuidanceMessage(messages, guidanceText, role, options = {}) {
         if (historyIndices.length > 0) {
           const lastHistoryIdx = historyIndices[historyIndices.length - 1];
           if (options.actionId === "guided_continue") {
-            const continueIdx = findHistoryContinueAssistantIndex();
-            const fallbackIdx = continueIdx >= 0 ? continueIdx : findFallbackContinueAssistantIndex();
-            insertIndex = fallbackIdx >= 0 ? fallbackIdx : lastHistoryIdx + 1;
+            const movedContinueIdx = findMovedContinueAssistantIndex(lastHistoryIdx);
+            if (movedContinueIdx >= 0) {
+              insertIndex = lastHistoryIdx + 1;
+            } else {
+              const continueIdx = findHistoryContinueAssistantIndex();
+              insertIndex = continueIdx >= 0 ? continueIdx : lastHistoryIdx + 1;
+            }
           } else {
             insertIndex = lastHistoryIdx + 1;
           }
         } else {
-          insertIndex = copy.length > 0 && copy[copy.length - 1]?.role === "assistant" ? copy.length - 1 : copy.length;
+          const continueIdx = findFallbackContinueAssistantIndex();
+          insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
         }
       } else {
         const continueIdx = findFallbackContinueAssistantIndex();
@@ -342,17 +379,36 @@ function injectGuidanceMessage(messages, guidanceText, role, options = {}) {
       if (hasHistoryFlags) {
         if (historyIndices.length > 0) {
           const lastHistoryIdx = historyIndices[historyIndices.length - 1];
+          const movedContinueIdx = options.actionId === "guided_continue" ? findMovedContinueAssistantIndex(lastHistoryIdx) : -1;
           if (depth === 0) {
             if (options.actionId === "guided_continue") {
-              const continueIdx = findHistoryContinueAssistantIndex();
-              const fallbackIdx = continueIdx >= 0 ? continueIdx : findFallbackContinueAssistantIndex();
-              insertIndex = fallbackIdx >= 0 ? fallbackIdx : lastHistoryIdx + 1;
+              if (movedContinueIdx >= 0) {
+                insertIndex = lastHistoryIdx + 1;
+              } else {
+                const continueIdx = findHistoryContinueAssistantIndex();
+                insertIndex = continueIdx >= 0 ? continueIdx : lastHistoryIdx + 1;
+              }
             } else {
               insertIndex = lastHistoryIdx + 1;
+            }
+          } else if (movedContinueIdx >= 0) {
+            if (depth === 1) {
+              insertIndex = lastHistoryIdx + 1;
+            } else {
+              const clampedOffset = Math.max(0, historyIndices.length - (depth - 1));
+              insertIndex = historyIndices[clampedOffset];
             }
           } else {
             const clampedOffset = Math.max(0, historyIndices.length - depth);
             insertIndex = historyIndices[clampedOffset];
+          }
+        } else if (options.actionId === "guided_continue") {
+          const continueIdx = findFallbackContinueAssistantIndex();
+          if (depth === 0) {
+            insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
+          } else {
+            const endBound = continueIdx >= 0 ? continueIdx : copy.length;
+            insertIndex = Math.max(0, endBound - depth);
           }
         } else {
           insertIndex = copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1]) ? copy.length - 1 : copy.length;
@@ -361,13 +417,31 @@ function injectGuidanceMessage(messages, guidanceText, role, options = {}) {
         const continueIdx = findFallbackContinueAssistantIndex();
         insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
       } else {
-        const endBound = copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1]) ? copy.length - 1 : copy.length;
+        const endBound = options.actionId === "guided_continue" ? (() => {
+          const continueIdx = findFallbackContinueAssistantIndex();
+          return continueIdx >= 0 ? continueIdx : copy.length;
+        })() : copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1]) ? copy.length - 1 : copy.length;
         insertIndex = Math.max(0, endBound - depth);
       }
       break;
     }
     case "post_history": {
-      if (copy.length > 0 && (isPartialAssistantPrefill(copy[copy.length - 1]) || options.actionId === "guided_continue" && copy[copy.length - 1]?.role === "assistant")) {
+      if (options.actionId === "guided_continue") {
+        if (hasHistoryFlags && historyIndices.length > 0) {
+          const lastHistoryIdx = historyIndices[historyIndices.length - 1];
+          const movedContinueIdx = findMovedContinueAssistantIndex(lastHistoryIdx);
+          if (movedContinueIdx >= 0) {
+            insertIndex = movedContinueIdx;
+          } else if (copy.length > 0 && copy[copy.length - 1]?.role === "assistant") {
+            insertIndex = copy.length - 1;
+          } else {
+            insertIndex = copy.length;
+          }
+        } else {
+          const continueIdx = findFallbackContinueAssistantIndex();
+          insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
+        }
+      } else if (copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1])) {
         insertIndex = copy.length - 1;
       } else {
         insertIndex = copy.length;
@@ -378,44 +452,235 @@ function injectGuidanceMessage(messages, guidanceText, role, options = {}) {
   copy.splice(insertIndex, 0, injected);
   return copy;
 }
-function stripRejectedSwipeAssistantTurnWithHistory(messages, targetMessageId, isChatHistory) {
-  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
-  if (targetMessageId && messages.some((msg) => getMessageSourceId(msg) === targetMessageId)) {
+function isWorldInfoMessage(msg) {
+  return Boolean(msg.__isWorldInfoEntry || msg.__worldInfoSource);
+}
+function getLlmMessageTextContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => part.type === "text" ? part.text : "").join("");
+  }
+  return "";
+}
+function mergeMessageContents(prev, curr) {
+  if (typeof prev === "string" && typeof curr === "string") {
+    return `${prev}
+
+${curr}`;
+  }
+  const hasNonText = (content) => Array.isArray(content) && content.some((part) => part.type !== "text");
+  if (!hasNonText(prev) && !hasNonText(curr)) {
+    return `${getLlmMessageTextContent(prev)}
+
+${getLlmMessageTextContent(curr)}`;
+  }
+  const toParts = (content) => typeof content === "string" ? content.length > 0 ? [{ type: "text", text: content }] : [] : content;
+  const prevParts = toParts(prev);
+  const currParts = toParts(curr);
+  return [
+    ...prevParts,
+    ...prevParts.length > 0 && currParts.length > 0 ? [{ type: "text", text: `
+
+` }] : [],
+    ...currParts
+  ];
+}
+function hasNonEmptyLlmContent(msg) {
+  if (typeof msg.content === "string") {
+    return msg.content.trim().length > 0 || msg.role === "assistant" && msg.partial === true;
+  }
+  if (Array.isArray(msg.content)) {
+    return msg.content.length > 0;
+  }
+  return true;
+}
+function mergeConsecutiveSameRoleMessages(messages) {
+  const merged = [];
+  for (const rawMsg of messages) {
+    const msg = { ...rawMsg };
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role) {
+      merged[merged.length - 1] = {
+        ...prev,
+        content: mergeMessageContents(prev.content, msg.content),
+        ...msg.partial === true ? { partial: true } : {}
+      };
+    } else {
+      merged.push(msg);
+    }
+  }
+  return merged;
+}
+function collapseMessagesToSingleRole(messages, role) {
+  if (messages.length <= 1) {
+    return messages.map((msg) => ({ ...msg }));
+  }
+  const textChunks = [];
+  const mediaParts = [];
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      if (msg.content) {
+        textChunks.push(msg.content);
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          if (part.text) {
+            textChunks.push(part.text);
+          }
+        } else {
+          mediaParts.push(part);
+        }
+      }
+    }
+  }
+  const collapsed = textChunks.join(`
+
+`);
+  if (mediaParts.length > 0) {
+    const parts = [
+      ...collapsed ? [{ type: "text", text: collapsed }] : [],
+      ...mediaParts
+    ];
+    return [{ role, content: parts }];
+  }
+  return [{ role, content: collapsed }];
+}
+function removeTrailingHistoryTurnAndUnshiftDepth(messages, isChatHistory, targetIdx) {
+  const historyIndices = [];
+  for (let i = 0;i < isChatHistory.length; i += 1) {
+    if (isChatHistory[i]) {
+      historyIndices.push(i);
+    }
+  }
+  const lastHistoryPos = historyIndices.length - 1;
+  if (lastHistoryPos < 1 || historyIndices[lastHistoryPos] !== targetIdx) {
     const nextMessages = [];
     const nextFlags = [];
     for (let i = 0;i < messages.length; i += 1) {
-      const msg = messages[i];
-      if (getMessageSourceId(msg) === targetMessageId)
+      if (i === targetIdx)
         continue;
-      nextMessages.push({ ...msg });
-      if (hasFlags)
-        nextFlags.push(Boolean(isChatHistory[i]));
+      nextMessages.push({ ...messages[i] });
+      nextFlags.push(Boolean(isChatHistory[i]));
     }
-    return {
-      messages: nextMessages,
-      ...hasFlags ? { isChatHistory: nextFlags } : {}
-    };
+    return { messages: nextMessages, isChatHistory: nextFlags };
   }
-  const copy = messages.map((msg) => ({ ...msg }));
-  const nextFlags = hasFlags ? [...isChatHistory] : undefined;
-  for (let i = copy.length - 1;i >= 0; i -= 1) {
-    const msg = copy[i];
+  const h0 = historyIndices[0];
+  const h1 = historyIndices[1];
+  const hk = targetIdx;
+  const nextMessages = [];
+  const nextFlags = [];
+  const pushItem = (idx, flag) => {
+    nextMessages.push({ ...messages[idx] });
+    nextFlags.push(flag);
+  };
+  for (let i = 0;i < h0; i += 1) {
+    pushItem(i, false);
+  }
+  const gap1KeepAfterH0 = [];
+  for (let i = h0 + 1;i < h1; i += 1) {
+    if (isWorldInfoMessage(messages[i])) {
+      gap1KeepAfterH0.push(i);
+    } else {
+      pushItem(i, false);
+    }
+  }
+  pushItem(h0, true);
+  for (const idx of gap1KeepAfterH0) {
+    pushItem(idx, false);
+  }
+  for (let j = 2;j <= lastHistoryPos; j += 1) {
+    const prevH = historyIndices[j - 1];
+    const currH = historyIndices[j];
+    for (let i = prevH + 1;i < currH; i += 1) {
+      pushItem(i, false);
+    }
+    pushItem(prevH, true);
+  }
+  for (let i = hk + 1;i < messages.length; i += 1) {
+    pushItem(i, false);
+  }
+  return { messages: nextMessages, isChatHistory: nextFlags };
+}
+function stripTrailingAssistantTurnWithHistory(messages, matchId, isChatHistory, options) {
+  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
+  if (matchId) {
+    const matchingIndices = [];
+    for (let i = 0;i < messages.length; i += 1) {
+      if (getMessageSourceId(messages[i]) === matchId) {
+        matchingIndices.push(i);
+      }
+    }
+    if (matchingIndices.length === 1) {
+      const targetIdx = matchingIndices[0];
+      if (hasFlags) {
+        return removeTrailingHistoryTurnAndUnshiftDepth(messages, isChatHistory, targetIdx);
+      }
+      return {
+        messages: messages.filter((_, idx) => idx !== targetIdx).map((msg) => ({ ...msg }))
+      };
+    }
+    if (matchingIndices.length > 1) {
+      const matchSet = new Set(matchingIndices);
+      const nextMessages = [];
+      const nextFlags = [];
+      for (let i = 0;i < messages.length; i += 1) {
+        if (matchSet.has(i))
+          continue;
+        nextMessages.push({ ...messages[i] });
+        if (hasFlags)
+          nextFlags.push(Boolean(isChatHistory[i]));
+      }
+      return {
+        messages: nextMessages,
+        ...hasFlags ? { isChatHistory: nextFlags } : {}
+      };
+    }
+  }
+  let targetIdx = -1;
+  for (let i = messages.length - 1;i >= 0; i -= 1) {
+    const msg = messages[i];
     if (!msg)
       continue;
+    if (hasFlags && !isChatHistory[i]) {
+      continue;
+    }
     if (msg.role === "user") {
       break;
     }
     if (msg.role === "assistant") {
-      copy.splice(i, 1);
-      if (nextFlags)
-        nextFlags.splice(i, 1);
+      if (msg.partial) {
+        continue;
+      }
+      const candidateSourceId = getMessageSourceId(msg);
+      if (matchId && candidateSourceId && candidateSourceId !== matchId) {
+        break;
+      }
+      if (!options.requireBlankFallback || isBlankLlmContent(msg.content)) {
+        targetIdx = i;
+      }
       break;
     }
   }
+  if (targetIdx === -1) {
+    return {
+      messages: messages.map((msg) => ({ ...msg })),
+      ...hasFlags ? { isChatHistory: [...isChatHistory] } : {}
+    };
+  }
+  if (hasFlags) {
+    return removeTrailingHistoryTurnAndUnshiftDepth(messages, isChatHistory, targetIdx);
+  }
   return {
-    messages: copy,
-    ...nextFlags ? { isChatHistory: nextFlags } : {}
+    messages: messages.filter((_, idx) => idx !== targetIdx).map((msg) => ({ ...msg }))
   };
+}
+function stripRejectedSwipeAssistantTurnWithHistory(messages, targetMessageId, isChatHistory, options) {
+  return stripTrailingAssistantTurnWithHistory(messages, targetMessageId, isChatHistory, {
+    requireBlankFallback: options?.requireBlankFallback ?? false
+  });
 }
 function isBlankLlmContent(content) {
   if (typeof content === "string") {
@@ -427,51 +692,9 @@ function isBlankLlmContent(content) {
   return false;
 }
 function stripCreatedBlankAssistantTurnWithHistory(messages, createdMessageId, isChatHistory) {
-  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
-  if (createdMessageId && messages.some((msg) => getMessageSourceId(msg) === createdMessageId)) {
-    const nextMessages = [];
-    const nextFlags = [];
-    for (let i = 0;i < messages.length; i += 1) {
-      const msg = messages[i];
-      if (getMessageSourceId(msg) === createdMessageId)
-        continue;
-      nextMessages.push({ ...msg });
-      if (hasFlags)
-        nextFlags.push(Boolean(isChatHistory[i]));
-    }
-    return {
-      messages: nextMessages,
-      ...hasFlags ? { isChatHistory: nextFlags } : {}
-    };
-  }
-  const copy = messages.map((msg) => ({ ...msg }));
-  const nextFlags = hasFlags ? [...isChatHistory] : undefined;
-  for (let i = copy.length - 1;i >= 0; i -= 1) {
-    const msg = copy[i];
-    if (!msg)
-      continue;
-    if (hasFlags && !nextFlags[i]) {
-      continue;
-    }
-    if (msg.role === "user") {
-      break;
-    }
-    if (msg.role === "assistant") {
-      if (msg.partial) {
-        continue;
-      }
-      if (isBlankLlmContent(msg.content)) {
-        copy.splice(i, 1);
-        if (nextFlags)
-          nextFlags.splice(i, 1);
-      }
-      break;
-    }
-  }
-  return {
-    messages: copy,
-    ...nextFlags ? { isChatHistory: nextFlags } : {}
-  };
+  return stripTrailingAssistantTurnWithHistory(messages, createdMessageId, isChatHistory, {
+    requireBlankFallback: true
+  });
 }
 function buildDryRunInput(args) {
   const generationTypeMap = {
@@ -530,9 +753,10 @@ function stitchContinueContent(baseContent, delta) {
   if (!baseContent)
     return delta;
   const endsWithWhitespace = /\s$/.test(baseContent);
+  const endsWithOpeningDelimiter = /[(\[{\u201C\u2018\u2014\u2013-]$/.test(baseContent) || /(?:^|[\s(\[>])["'*_]$/.test(baseContent);
   const startsWithWhitespace = /^\s/.test(delta);
   const startsWithPunctuation = /^[,.;:!?'"\u2019\u201D\)\]\-\u2014\u2026]/.test(delta);
-  if (endsWithWhitespace || startsWithWhitespace || startsWithPunctuation) {
+  if (endsWithWhitespace || endsWithOpeningDelimiter || startsWithWhitespace || startsWithPunctuation) {
     return baseContent + delta;
   }
   return `${baseContent} ${delta}`;
@@ -615,7 +839,11 @@ function buildPresetContextMetadata(existingMetadata, swipeIndex, presetId) {
   while (nextContexts.length <= idx) {
     nextContexts.push(null);
   }
-  nextContexts[idx] = { preset_id: presetId };
+  const existingEntry = nextContexts[idx];
+  nextContexts[idx] = {
+    ...existingEntry ?? {},
+    preset_id: presetId
+  };
   return {
     ...existingMetadata ?? {},
     preset_contexts: nextContexts
@@ -642,12 +870,16 @@ function buildActiveSwipePatch(args) {
 function buildBackgroundSwipePatch(args) {
   const updatedSwipes = buildUpdatedSwipesArray(args.swipes, args.swipeIndex, args.content);
   const hasNewReasoning = typeof args.reasoningText === "string" && args.reasoningText.length > 0;
+  const validDuration = typeof args.reasoningDuration === "number" && Number.isFinite(args.reasoningDuration) && args.reasoningDuration >= 0 ? args.reasoningDuration : undefined;
   const shouldWriteSwipeReasoning = hasNewReasoning || Boolean(args.clearReasoningSlot);
   let swipeReasoning;
   if (shouldWriteSwipeReasoning) {
     swipeReasoning = updatedSwipes.map((_, idx) => {
       if (idx === args.swipeIndex) {
-        return hasNewReasoning ? { text: args.reasoningText } : null;
+        return hasNewReasoning ? {
+          text: args.reasoningText,
+          ...validDuration !== undefined ? { duration: validDuration } : {}
+        } : null;
       }
       return resolveExistingSwipeReasoningSlot(idx, args.existingExtra, args.existingActiveSwipeId);
     });
@@ -663,12 +895,68 @@ function buildBackgroundSwipePatch(args) {
 
 // src/backend/regex-processor.ts
 var MAX_REGEX_MATCHES = 5000;
+var MAX_REGEX_PATTERN_LENGTH = 50000;
+var REGEX_SCRIPT_TIME_BUDGET_MS = 500;
+var VALID_REGEX_FLAGS = new Set(["d", "g", "i", "m", "s", "u", "v", "y"]);
+function countPrecedingBackslashes(input, index) {
+  let count = 0;
+  for (let i = index - 1;i >= 0 && input[i] === "\\"; i -= 1) {
+    count += 1;
+  }
+  return count;
+}
+function parseMacroTagHeader(tagText) {
+  let pos = 2;
+  const len = tagText.length - 2;
+  while (pos < len && (tagText[pos] === " " || tagText[pos] === "\t"))
+    pos += 1;
+  let isClose = false;
+  while (pos < len) {
+    const ch = tagText[pos];
+    if (ch === "!" || ch === "?" || ch === "~" || ch === ">" || ch === "#") {
+      pos += 1;
+    } else if (ch === "/") {
+      isClose = true;
+      pos += 1;
+    } else {
+      break;
+    }
+  }
+  while (pos < len && (tagText[pos] === " " || tagText[pos] === "\t"))
+    pos += 1;
+  const idStart = pos;
+  while (pos < len && /[a-zA-Z0-9_-]/.test(tagText[pos]))
+    pos += 1;
+  const name = pos > idStart ? tagText.slice(idStart, pos).toLowerCase() : "";
+  return { name, isClose };
+}
+function findClosingMacroTagIndex(tags, startIdx, name) {
+  let depth = 0;
+  for (let i = startIdx;i < tags.length; i += 1) {
+    const tag = tags[i];
+    if (tag.name !== name)
+      continue;
+    if (tag.isClose) {
+      if (depth === 0)
+        return i;
+      depth -= 1;
+    } else {
+      depth += 1;
+    }
+  }
+  return -1;
+}
 function findTopLevelMacroTokens(input) {
-  const tokens = [];
+  const rawTags = [];
   let depth = 0;
   let tokenStart = -1;
   for (let i = 0;i < input.length; ) {
-    if (input[i] === "{" && input[i + 1] === "{") {
+    const ch = input[i];
+    if ((ch === "{" || ch === "}") && countPrecedingBackslashes(input, i) % 2 === 1) {
+      i += 1;
+      continue;
+    }
+    if (ch === "{" && input[i + 1] === "{") {
       if (depth === 0) {
         tokenStart = i;
       }
@@ -676,19 +964,48 @@ function findTopLevelMacroTokens(input) {
       i += 2;
       continue;
     }
-    if (input[i] === "}" && input[i + 1] === "}" && depth > 0) {
+    if (ch === "}" && input[i + 1] === "}" && depth > 0) {
       depth -= 1;
       i += 2;
       if (depth === 0 && tokenStart >= 0) {
-        tokens.push({
+        const tagText = input.slice(tokenStart, i);
+        const { name, isClose } = parseMacroTagHeader(tagText);
+        rawTags.push({
           start: tokenStart,
           end: i,
-          value: input.slice(tokenStart, i)
+          name,
+          isClose
         });
         tokenStart = -1;
       }
       continue;
     }
+    i += 1;
+  }
+  if (rawTags.length === 0) {
+    return [];
+  }
+  const tokens = [];
+  for (let i = 0;i < rawTags.length; ) {
+    const tag = rawTags[i];
+    if (!tag.isClose && tag.name) {
+      const closingIdx = findClosingMacroTagIndex(rawTags, i + 1, tag.name);
+      if (closingIdx >= 0) {
+        const end = rawTags[closingIdx].end;
+        tokens.push({
+          start: tag.start,
+          end,
+          value: input.slice(tag.start, end)
+        });
+        i = closingIdx + 1;
+        continue;
+      }
+    }
+    tokens.push({
+      start: tag.start,
+      end: tag.end,
+      value: input.slice(tag.start, tag.end)
+    });
     i += 1;
   }
   return tokens;
@@ -739,6 +1056,369 @@ function extractMatchActions(script) {
   }
   return actions;
 }
+function validateFlags(flags) {
+  const seen = new Set;
+  for (const ch of flags) {
+    if (!VALID_REGEX_FLAGS.has(ch) || seen.has(ch)) {
+      return false;
+    }
+    seen.add(ch);
+  }
+  return true;
+}
+function hasOverlappingAlternationBranches(branches, hasEmptyBranch, hasCharClassOrShorthandOverlap) {
+  if (hasEmptyBranch || hasCharClassOrShorthandOverlap)
+    return true;
+  for (let i = 0;i < branches.length; i += 1) {
+    const a = branches[i];
+    if (!a)
+      return true;
+    for (let j = i + 1;j < branches.length; j += 1) {
+      const b = branches[j];
+      if (!b)
+        return true;
+      if (a.startsWith(b) || b.startsWith(a)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function isLikelyCatastrophicRegex(pattern) {
+  const createFrame = () => ({
+    hasInnerQuantifier: false,
+    hasWildcard: false,
+    hasAlternation: false,
+    hasOptionalElement: false,
+    mandatoryCount: 0,
+    branches: [],
+    currentBranchPrefix: "",
+    currentBranchOpen: true,
+    hasEmptyBranch: false,
+    classLikeBranches: 0
+  });
+  const stack = [createFrame()];
+  let inCharClass = false;
+  let lastWasQuantifiableAtom = false;
+  let lastWasWildcard = false;
+  let lastAtomIsUnboundedQuantifiedWildcard = false;
+  const readQuantifier = (idx) => {
+    if (idx >= pattern.length)
+      return null;
+    const ch = pattern[idx];
+    if (ch === "*") {
+      const end = pattern[idx + 1] === "?" || pattern[idx + 1] === "+" ? idx + 2 : idx + 1;
+      return { end, min: 0, maxMoreThanOne: true, unbounded: true };
+    }
+    if (ch === "+") {
+      const end = pattern[idx + 1] === "?" || pattern[idx + 1] === "+" ? idx + 2 : idx + 1;
+      return { end, min: 1, maxMoreThanOne: true, unbounded: true };
+    }
+    if (ch === "?") {
+      const end = pattern[idx + 1] === "?" || pattern[idx + 1] === "+" ? idx + 2 : idx + 1;
+      return { end, min: 0, maxMoreThanOne: false, unbounded: false };
+    }
+    if (ch === "{") {
+      const m = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(idx));
+      if (!m)
+        return null;
+      const min = Number.parseInt(m[1], 10);
+      const maxStr = m[2];
+      const max = maxStr === undefined ? min : maxStr === "" ? Number.POSITIVE_INFINITY : Number.parseInt(maxStr, 10);
+      let end = idx + m[0].length;
+      if (pattern[end] === "?" || pattern[end] === "+")
+        end += 1;
+      return {
+        end,
+        min,
+        maxMoreThanOne: max > 1,
+        unbounded: maxStr === ""
+      };
+    }
+    return null;
+  };
+  for (let i = 0;i < pattern.length; ) {
+    const ch = pattern[i];
+    const top = stack[stack.length - 1];
+    if (ch === "\\") {
+      if (i + 1 >= pattern.length)
+        break;
+      const esc = pattern[i + 1];
+      let advance = 2;
+      if ((esc === "k" || esc === "p" || esc === "P") && pattern[i + 2] === "<") {
+        const close = pattern.indexOf(">", i + 3);
+        if (close >= 0)
+          advance = close - i + 1;
+      } else if ((esc === "p" || esc === "P" || esc === "u") && pattern[i + 2] === "{") {
+        const close = pattern.indexOf("}", i + 3);
+        if (close >= 0)
+          advance = close - i + 1;
+      }
+      i += advance;
+      if (!inCharClass) {
+        const isAnchor = esc === "b" || esc === "B";
+        lastWasQuantifiableAtom = !isAnchor;
+        lastWasWildcard = false;
+        if (!isAnchor) {
+          top.mandatoryCount += 1;
+          lastAtomIsUnboundedQuantifiedWildcard = false;
+          if (esc === "w" || esc === "W" || esc === "d" || esc === "D" || esc === "s" || esc === "S" || esc === "p" || esc === "P") {
+            if (top.currentBranchOpen && top.currentBranchPrefix.length === 0) {
+              top.classLikeBranches += 1;
+            }
+            top.currentBranchOpen = false;
+          } else if (top.currentBranchOpen && top.currentBranchPrefix.length < 16) {
+            top.currentBranchPrefix += esc;
+          }
+        }
+      }
+      continue;
+    }
+    if (inCharClass) {
+      if (ch === "]") {
+        inCharClass = false;
+        lastWasQuantifiableAtom = true;
+        lastWasWildcard = false;
+        top.mandatoryCount += 1;
+        if (top.currentBranchOpen && top.currentBranchPrefix.length === 0) {
+          top.classLikeBranches += 1;
+        }
+        top.currentBranchOpen = false;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "[") {
+      inCharClass = true;
+      const rest = pattern.slice(i);
+      const isWildClass = /^\[(?:\\s\\S|\\S\\s|\\d\\D|\\D\\d|\\w\\W|\\W\\w)\]/.test(rest);
+      lastWasWildcard = isWildClass;
+      if (isWildClass)
+        top.hasWildcard = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "(") {
+      let skip = 1;
+      if (pattern[i + 1] === "?") {
+        if (pattern[i + 2] === "#") {
+          const close = pattern.indexOf(")", i + 3);
+          i = close >= 0 ? close + 1 : pattern.length;
+          continue;
+        }
+        if (pattern[i + 2] === "<" && (pattern[i + 3] === "=" || pattern[i + 3] === "!")) {
+          skip = 4;
+        } else if (pattern[i + 2] === "<") {
+          const gt = pattern.indexOf(">", i + 3);
+          skip = gt >= 0 ? gt - i + 1 : 2;
+        } else if (pattern[i + 2] === ":" || pattern[i + 2] === "=" || pattern[i + 2] === "!") {
+          skip = 3;
+        }
+      }
+      top.currentBranchOpen = false;
+      stack.push(createFrame());
+      lastWasQuantifiableAtom = false;
+      lastWasWildcard = false;
+      lastAtomIsUnboundedQuantifiedWildcard = false;
+      i += skip;
+      continue;
+    }
+    if (ch === ")") {
+      const closed = stack.length > 1 ? stack.pop() : null;
+      const parent = stack[stack.length - 1];
+      if (closed) {
+        if (closed.currentBranchPrefix.length === 0 && closed.mandatoryCount === 0) {
+          closed.hasEmptyBranch = true;
+        } else if (closed.currentBranchPrefix.length > 0) {
+          closed.branches.push(closed.currentBranchPrefix);
+        }
+        if (closed.hasInnerQuantifier)
+          parent.hasInnerQuantifier = true;
+        if (closed.hasWildcard)
+          parent.hasWildcard = true;
+        if (closed.mandatoryCount > 0)
+          parent.mandatoryCount += 1;
+      }
+      lastWasQuantifiableAtom = true;
+      lastWasWildcard = false;
+      i += 1;
+      const q = readQuantifier(i);
+      if (q) {
+        if (closed && q.maxMoreThanOne) {
+          if (closed.hasInnerQuantifier && (q.unbounded || closed.hasWildcard || closed.hasOptionalElement || closed.mandatoryCount <= 1)) {
+            return true;
+          }
+          if (closed.hasAlternation && (closed.hasOptionalElement || closed.hasWildcard || hasOverlappingAlternationBranches(closed.branches, closed.hasEmptyBranch, closed.classLikeBranches > 1))) {
+            return true;
+          }
+        }
+        if (q.min === 0) {
+          parent.hasOptionalElement = true;
+          if (closed && closed.mandatoryCount > 0) {
+            parent.mandatoryCount = Math.max(0, parent.mandatoryCount - 1);
+          }
+        }
+        if (q.maxMoreThanOne) {
+          parent.hasInnerQuantifier = true;
+        }
+        lastWasQuantifiableAtom = false;
+        i = q.end;
+      }
+      continue;
+    }
+    if (ch === "|") {
+      top.hasAlternation = true;
+      if (top.currentBranchPrefix.length === 0 && top.currentBranchOpen) {
+        top.hasEmptyBranch = true;
+      } else if (top.currentBranchPrefix.length > 0) {
+        top.branches.push(top.currentBranchPrefix);
+      }
+      top.currentBranchPrefix = "";
+      top.currentBranchOpen = true;
+      lastWasQuantifiableAtom = false;
+      lastWasWildcard = false;
+      lastAtomIsUnboundedQuantifiedWildcard = false;
+      i += 1;
+      continue;
+    }
+    const q = readQuantifier(i);
+    if (q && lastWasQuantifiableAtom) {
+      if (q.min === 0) {
+        top.hasOptionalElement = true;
+        top.mandatoryCount = Math.max(0, top.mandatoryCount - 1);
+      }
+      if (q.maxMoreThanOne) {
+        top.hasInnerQuantifier = true;
+      }
+      if (lastWasWildcard && q.unbounded) {
+        if (lastAtomIsUnboundedQuantifiedWildcard) {
+          return true;
+        }
+        lastAtomIsUnboundedQuantifiedWildcard = true;
+      } else {
+        lastAtomIsUnboundedQuantifiedWildcard = false;
+      }
+      lastWasQuantifiableAtom = false;
+      lastWasWildcard = false;
+      i = q.end;
+      continue;
+    }
+    if (ch === "^" || ch === "$") {
+      lastWasQuantifiableAtom = false;
+      lastWasWildcard = false;
+      lastAtomIsUnboundedQuantifiedWildcard = false;
+      i += 1;
+      continue;
+    }
+    if (ch === ".") {
+      top.hasWildcard = true;
+      lastWasWildcard = true;
+      top.currentBranchOpen = false;
+    } else {
+      lastWasWildcard = false;
+      lastAtomIsUnboundedQuantifiedWildcard = false;
+      if (top.currentBranchOpen && top.currentBranchPrefix.length < 16) {
+        top.currentBranchPrefix += ch;
+      }
+    }
+    top.mandatoryCount += 1;
+    lastWasQuantifiableAtom = true;
+    i += 1;
+  }
+  return false;
+}
+var ESCAPABLE_LITERAL_CHARS = new Set("\\^$.*+?()[]{}|/");
+function getRequiredTerminalLiteral(pattern) {
+  let suffix = "";
+  let depth = 0;
+  let inCharacterClass = false;
+  for (let i = 0;i < pattern.length; i += 1) {
+    const char = pattern[i];
+    if (char === "\\") {
+      const escaped = pattern[i + 1];
+      if (escaped === undefined)
+        return null;
+      i += 1;
+      if (inCharacterClass)
+        continue;
+      if (ESCAPABLE_LITERAL_CHARS.has(escaped)) {
+        suffix += escaped;
+      } else {
+        suffix = "";
+        if ((escaped === "k" || escaped === "p" || escaped === "P") && pattern[i + 1] === "<") {
+          const close = pattern.indexOf(">", i + 2);
+          if (close >= 0)
+            i = close;
+        } else if ((escaped === "p" || escaped === "P" || escaped === "u") && pattern[i + 1] === "{") {
+          const close = pattern.indexOf("}", i + 2);
+          if (close >= 0)
+            i = close;
+        } else if (escaped === "u") {
+          i = Math.min(pattern.length - 1, i + 4);
+        } else if (escaped === "x") {
+          i = Math.min(pattern.length - 1, i + 2);
+        } else if (escaped === "c") {
+          i = Math.min(pattern.length - 1, i + 1);
+        } else if (/\d/.test(escaped)) {
+          while (/\d/.test(pattern[i + 1] ?? ""))
+            i += 1;
+        }
+      }
+      continue;
+    }
+    if (inCharacterClass) {
+      if (char === "]")
+        inCharacterClass = false;
+      continue;
+    }
+    if (char === "[") {
+      inCharacterClass = true;
+      suffix = "";
+      continue;
+    }
+    if (char === "(") {
+      depth += 1;
+      suffix = "";
+      continue;
+    }
+    if (char === ")") {
+      depth = Math.max(0, depth - 1);
+      suffix = "";
+      continue;
+    }
+    if (char === "|") {
+      if (depth === 0)
+        return null;
+      suffix = "";
+      continue;
+    }
+    if (".*+?^${}".includes(char)) {
+      suffix = "";
+      continue;
+    }
+    suffix += char;
+  }
+  return suffix.length >= 4 ? suffix : null;
+}
+function getRegexSearchEnd(input, pattern, flags, replacementTemplate) {
+  if (flags.includes("y") || replacementTemplate.includes("$'"))
+    return input.length;
+  const terminal = getRequiredTerminalLiteral(pattern);
+  if (!terminal)
+    return input.length;
+  let index = -1;
+  if (!flags.includes("i")) {
+    index = input.lastIndexOf(terminal);
+  } else {
+    const unicodeFlag = flags.includes("v") ? "v" : flags.includes("u") ? "u" : "";
+    const guard = new RegExp(escapeRegExp(terminal), `gi${unicodeFlag}`);
+    let match;
+    while ((match = guard.exec(input)) !== null) {
+      index = match.index;
+    }
+  }
+  return index < 0 ? 0 : index + terminal.length;
+}
 async function resolveFindRegex(findRegex, mode, resolveMacros) {
   if (!resolveMacros || mode === "none") {
     return findRegex;
@@ -785,8 +1465,9 @@ async function resolveEscapedReplaceTemplate(replaceString, resolveMacros) {
   return out;
 }
 function expandReplacementTemplate(template, match, trimmedMatch, fullText) {
-  const withMatch = template.includes("{{match}}") ? template.replaceAll("{{match}}", () => trimmedMatch) : template;
-  return withMatch.replace(/\$(?:\$|&|`|'|<([^>]+)>|(\d{1,2}))/g, (token, groupName, groupNum) => {
+  return template.replace(/\{\{match\}\}|\$(?:\$|&|`|'|<([^>]+)>|(\d{1,2}))/g, (token, groupName, groupNum) => {
+    if (token === "{{match}}")
+      return trimmedMatch;
     if (token === "$$")
       return "$";
     if (token === "$&")
@@ -796,7 +1477,10 @@ function expandReplacementTemplate(template, match, trimmedMatch, fullText) {
     if (token === "$'")
       return fullText.slice(match.index + match[0].length);
     if (groupName !== undefined) {
-      return match.groups?.[groupName] ?? "";
+      if (match.groups && Object.prototype.hasOwnProperty.call(match.groups, groupName)) {
+        return match.groups[groupName] ?? "";
+      }
+      return token;
     }
     if (groupNum !== undefined) {
       const idx = Number.parseInt(groupNum, 10);
@@ -807,6 +1491,25 @@ function expandReplacementTemplate(template, match, trimmedMatch, fullText) {
     }
     return token;
   });
+}
+function applyTrimStrings(result, trimStrings) {
+  for (const trim of trimStrings) {
+    if (typeof trim === "string" && trim.length > 0) {
+      while (result.includes(trim)) {
+        result = result.replaceAll(trim, "");
+      }
+    }
+  }
+  return result;
+}
+function trimMatchStrings(rawMatch, trimStrings) {
+  let trimmed = rawMatch;
+  for (const trim of trimStrings) {
+    if (typeof trim === "string" && trim.length > 0) {
+      trimmed = trimmed.split(trim).join("");
+    }
+  }
+  return trimmed;
 }
 async function fetchActiveRegexScripts(spindle2, options) {
   if (!spindle2.permissions?.has?.("regex_scripts")) {
@@ -837,6 +1540,9 @@ async function applyRegexScripts(text, scripts, placement, depth, options = {}) 
   for (const script of scripts) {
     if (!script || script.disabled)
       continue;
+    if (script.metadata && typeof script.metadata === "object" && script.metadata.regex_evidence?.quarantined === true) {
+      continue;
+    }
     if (!Array.isArray(script.placement) || !script.placement.includes(placement)) {
       continue;
     }
@@ -849,93 +1555,146 @@ async function applyRegexScripts(text, scripts, placement, depth, options = {}) 
     if (!script.find_regex) {
       continue;
     }
-    const resolvedFindRegex = await resolveFindRegex(script.find_regex, script.substitute_macros, options.resolveMacros);
-    let regex;
-    try {
-      regex = new RegExp(resolvedFindRegex, script.flags ?? "");
-    } catch {
+    const flags = typeof script.flags === "string" ? script.flags : "";
+    if (!validateFlags(flags)) {
       continue;
     }
-    const baseReplaceTemplate = script.substitute_macros === "escaped" ? await resolveEscapedReplaceTemplate(script.replace_string ?? "", options.resolveMacros) : script.replace_string ?? "";
+    const resolvedFindRegex = await resolveFindRegex(script.find_regex, script.substitute_macros, options.resolveMacros);
+    if (resolvedFindRegex.length > MAX_REGEX_PATTERN_LENGTH || isLikelyCatastrophicRegex(resolvedFindRegex)) {
+      continue;
+    }
     const actions = extractMatchActions(script);
     const moveTop = actions.has("move_top");
     const moveBottom = actions.has("move_bottom");
     const repeatBack = actions.has("repeat_back");
+    const effectiveFlags = moveTop || moveBottom ? flags.replaceAll("g", "") : flags;
+    let regex;
+    try {
+      regex = new RegExp(resolvedFindRegex, effectiveFlags);
+    } catch {
+      continue;
+    }
+    const baseReplaceTemplate = script.substitute_macros === "escaped" ? await resolveEscapedReplaceTemplate(script.replace_string ?? "", options.resolveMacros) : script.replace_string ?? "";
     const trimStrings = Array.isArray(script.trim_strings) ? script.trim_strings : [];
+    const searchEnd = getRegexSearchEnd(current, resolvedFindRegex, effectiveFlags, baseReplaceTemplate);
+    const searchInput = searchEnd === current.length ? current : current.slice(0, searchEnd);
+    const searchTail = searchEnd === current.length ? "" : current.slice(searchEnd);
     const matches = [];
-    let execResult;
-    while ((execResult = regex.exec(current)) !== null) {
-      let trimmedMatch = execResult[0];
-      for (const trim of trimStrings) {
-        if (typeof trim === "string" && trim.length > 0) {
-          trimmedMatch = trimmedMatch.split(trim).join("");
+    let timedOut = false;
+    const startedAt = Date.now();
+    if (searchEnd > 0 || current.length === 0) {
+      let execResult;
+      while ((execResult = regex.exec(searchInput)) !== null) {
+        const trimmedMatch = trimMatchStrings(execResult[0], trimStrings);
+        let replacement = expandReplacementTemplate(baseReplaceTemplate, execResult, trimmedMatch, current);
+        if (script.substitute_macros === "raw" && options.resolveMacros) {
+          replacement = await options.resolveMacros(replacement);
         }
-      }
-      let replacement = expandReplacementTemplate(baseReplaceTemplate, execResult, trimmedMatch, current);
-      if ((script.substitute_macros === "raw" || script.substitute_macros === "after") && options.resolveMacros) {
-        replacement = await options.resolveMacros(replacement);
-      }
-      const movedValue = replacement.length > 0 ? replacement : trimmedMatch;
-      matches.push({
-        index: execResult.index,
-        length: execResult[0].length,
-        replacement,
-        movedValue
-      });
-      if (matches.length >= MAX_REGEX_MATCHES) {
-        break;
-      }
-      if (!regex.global && !regex.sticky) {
-        break;
-      }
-      if (execResult[0].length === 0) {
-        if (regex.lastIndex >= current.length) {
+        const movedValue = replacement.length > 0 ? replacement : trimmedMatch;
+        matches.push({
+          index: execResult.index,
+          length: execResult[0].length,
+          replacement,
+          movedValue
+        });
+        if (Date.now() - startedAt > REGEX_SCRIPT_TIME_BUDGET_MS) {
+          timedOut = true;
           break;
         }
-        const cp = current.codePointAt(regex.lastIndex);
-        regex.lastIndex += cp !== undefined && cp > 65535 ? 2 : 1;
+        if (matches.length >= MAX_REGEX_MATCHES) {
+          break;
+        }
+        if (!regex.global && !regex.sticky) {
+          break;
+        }
+        if (execResult[0].length === 0) {
+          if (regex.lastIndex >= searchInput.length) {
+            break;
+          }
+          const cp = searchInput.codePointAt(regex.lastIndex);
+          regex.lastIndex += cp !== undefined && cp > 65535 ? 2 : 1;
+        }
       }
     }
+    if (timedOut) {
+      continue;
+    }
     if (matches.length === 0) {
+      if (repeatBack && options.previousContent !== undefined) {
+        let priorRegex = null;
+        try {
+          priorRegex = new RegExp(resolvedFindRegex, effectiveFlags);
+        } catch {
+          priorRegex = null;
+        }
+        const priorExec = priorRegex ? priorRegex.exec(options.previousContent) : null;
+        if (priorExec) {
+          const repeatRawMatch = script.metadata?.repeat_raw_match === true;
+          const repeatPosition = typeof script.metadata?.repeat_position === "string" ? script.metadata.repeat_position : (script.replace_string ?? "").split(" ", 2)[1];
+          let piece;
+          if (repeatRawMatch) {
+            piece = priorExec[0];
+          } else {
+            const trimmedPrior = trimMatchStrings(priorExec[0], trimStrings);
+            piece = expandReplacementTemplate(baseReplaceTemplate, priorExec, trimmedPrior, options.previousContent);
+            if ((script.substitute_macros === "raw" || script.substitute_macros === "after") && options.resolveMacros) {
+              piece = await options.resolveMacros(piece);
+            }
+          }
+          let repeated = current;
+          if (!repeatPosition || repeatPosition === "end") {
+            repeated = current + piece;
+          } else if (repeatPosition === "start") {
+            repeated = piece + current;
+          } else if (repeatPosition === "end_nl") {
+            repeated = `${current}
+${piece}`;
+          } else if (repeatPosition === "start_nl") {
+            repeated = `${piece}
+${current}`;
+          }
+          current = applyTrimStrings(repeated, trimStrings);
+        }
+      }
+      if (script.substitute_macros === "after" && options.resolveMacros) {
+        current = await options.resolveMacros(current);
+      }
+      continue;
+    }
+    if (moveTop || moveBottom) {
+      const m = matches[0];
+      const remainder = searchInput.slice(0, m.index) + searchInput.slice(m.index + m.length) + searchTail;
+      let moved = m.movedValue;
+      if (script.substitute_macros === "after" && options.resolveMacros) {
+        moved = await options.resolveMacros(moved);
+      }
+      let next = moveTop ? joinSections(moved, remainder) : joinSections(remainder, moved);
+      if (repeatBack && options.previousContent === undefined && moved) {
+        next = joinSections(next, moved);
+      }
+      current = applyTrimStrings(next, trimStrings);
       continue;
     }
     let rebuilt = "";
     let cursor = 0;
     const movedChunks = [];
     for (const m of matches) {
-      rebuilt += current.slice(cursor, m.index);
-      if (moveTop || moveBottom) {
-        if (repeatBack) {
-          rebuilt += m.replacement;
-        }
-        if (m.movedValue) {
-          movedChunks.push(m.movedValue);
-        }
-      } else {
-        rebuilt += m.replacement;
-        if (repeatBack && m.movedValue) {
-          movedChunks.push(m.movedValue);
-        }
+      rebuilt += searchInput.slice(cursor, m.index);
+      rebuilt += m.replacement;
+      if (repeatBack && options.previousContent === undefined && m.movedValue) {
+        movedChunks.push(m.movedValue);
       }
       cursor = m.index + m.length;
     }
-    rebuilt += current.slice(cursor);
-    if (moveTop && movedChunks.length > 0) {
-      rebuilt = joinSections(movedChunks.join(`
-`), rebuilt);
+    rebuilt += searchInput.slice(cursor) + searchTail;
+    if (script.substitute_macros === "after" && options.resolveMacros) {
+      rebuilt = await options.resolveMacros(rebuilt);
     }
-    if ((moveBottom || repeatBack) && movedChunks.length > 0) {
+    if (repeatBack && options.previousContent === undefined && movedChunks.length > 0) {
       rebuilt = joinSections(rebuilt, movedChunks.join(`
 `));
     }
-    for (const trim of trimStrings) {
-      if (typeof trim === "string" && trim.length > 0) {
-        while (rebuilt.includes(trim)) {
-          rebuilt = rebuilt.replaceAll(trim, "");
-        }
-      }
-    }
-    current = rebuilt;
+    current = applyTrimStrings(rebuilt, trimStrings);
   }
   return current;
 }
@@ -954,20 +1713,24 @@ function healFontTagsAndAttributes(prose) {
     return pairs ? `${openTag}${openQ}${inner}${closeQ}${closeTag}` : _m;
   });
   out = out.replace(/(<font\b[^>]*>)[ \t]*((?:["\u201C])[^<\n]*?(?:["\u201D]))[ \t]*(<\/font>)/gi, "$1$2$3");
-  const fontTokenRe = /(<\/?font\b[^>]*>|\n\n)/gi;
+  const fontTokenRe = /(<\/?font\b[^>]*>|\r?\n\r?\n)/gi;
   const closeInsertOffsets = [];
-  let openStack = [];
+  const openStack = [];
   let tokenMatch;
   const findLineEnd = (fromIndex) => {
     const nl = out.indexOf(`
 `, fromIndex);
-    return nl === -1 ? out.length : nl;
+    if (nl === -1)
+      return out.length;
+    return nl > fromIndex && out[nl - 1] === "\r" ? nl - 1 : nl;
   };
   while ((tokenMatch = fontTokenRe.exec(out)) !== null) {
     const token = tokenMatch[0];
     if (token === `
 
-`) {
+` || token === `\r
+\r
+` || /^\r?\n\r?\n$/.test(token)) {
       while (openStack.length > 0) {
         const entry = openStack.pop();
         closeInsertOffsets.push(Math.min(entry.lineEndOffset, tokenMatch.index));
@@ -1006,117 +1769,410 @@ function healFontTagsAndAttributes(prose) {
   }
   return out;
 }
-function trimInnerWhitespaceInPairs(line, openChar, closeChar) {
-  const positions = [];
-  let inTag = false;
+var OPEN_BOUNDARY_RE = /[\s([{"'\u201C\u2018\u00AB>\u2014\u2013-]/;
+var CLOSE_BOUNDARY_RE = /[\s)\]},.!?:;"'\u201D\u2019\u00BB<\u2014\u2013-]/;
+var HAS_ALNUM_RE = /[\p{L}\p{N}]/u;
+function findHtmlTagSpansOnLine(line) {
+  const spans = [];
+  for (let i = 0;i < line.length; i += 1) {
+    if (line[i] !== "<")
+      continue;
+    const next = line[i + 1];
+    if (!next || !/[a-zA-Z!?/]/.test(next))
+      continue;
+    let attrQuote = null;
+    let closedAt = -1;
+    for (let j = i + 1;j < line.length; j += 1) {
+      const ch = line[j];
+      if (attrQuote) {
+        if (ch === attrQuote && countPrecedingBackslashes(line, j) % 2 === 0) {
+          attrQuote = null;
+        }
+      } else if (ch === '"' || ch === "'") {
+        attrQuote = ch;
+      } else if (ch === ">") {
+        closedAt = j + 1;
+        break;
+      }
+    }
+    if (closedAt > i) {
+      spans.push({ start: i, end: closedAt });
+      i = closedAt - 1;
+    }
+  }
+  return spans;
+}
+function isInsideSpans(index, spans) {
+  for (const span of spans) {
+    if (index < span.start)
+      return false;
+    if (index < span.end)
+      return true;
+  }
+  return false;
+}
+function applyTextEdits(line, edits) {
+  if (edits.length === 0)
+    return line;
+  let out = "";
+  let cursor = 0;
+  for (const edit of edits) {
+    if (edit.start < cursor)
+      continue;
+    out += line.slice(cursor, edit.start) + edit.replacement;
+    cursor = edit.end;
+  }
+  return out + line.slice(cursor);
+}
+function trimInnerWhitespaceInPairs(line, openChar, closeChar, tagSpans = findHtmlTagSpansOnLine(line)) {
+  const edits = [];
+  let openEnd = -1;
   for (let i = 0;i < line.length; i += 1) {
     const ch = line[i];
-    if (ch === "<") {
-      inTag = true;
+    if (ch !== openChar && ch !== closeChar)
       continue;
-    }
-    if (ch === ">" && inTag) {
-      inTag = false;
+    if (isInsideSpans(i, tagSpans))
       continue;
-    }
-    if (!inTag && ch === openChar && (i === 0 || line[i - 1] !== "\\")) {
-      positions.push(i);
-    }
-  }
-  if (openChar === closeChar) {
-    if (positions.length < 2 || positions.length % 2 !== 0) {
-      return line;
-    }
-    let out = "";
-    let cursor = 0;
-    for (let i = 0;i < positions.length; i += 2) {
-      const start = positions[i];
-      const end = positions[i + 1];
-      const inner = line.slice(start + 1, end);
-      const trimmed = inner.replace(/^[ \t]+|[ \t]+$/g, "");
-      out += line.slice(cursor, start + 1);
-      out += trimmed.length > 0 ? trimmed : inner;
-      out += closeChar;
-      cursor = end + 1;
-    }
-    out += line.slice(cursor);
-    return out;
-  }
-  return line;
-}
-function trimEmphasisOnLine(line) {
-  let out = line;
-  out = out.replace(/(^|[^\S\r\n]|[\(\["'\u201C\u2018>])(\*{2,3})[ \t]+([^\n]*?\S)[ \t]*\2(?=$|[\s.,!?;:'"\u201D\u2019\)\]<])/g, (full, prefix, marker, inner) => inner.includes(marker) ? full : `${prefix}${marker}${inner}${marker}`);
-  out = out.replace(/(^|[^\S\r\n]|[\(\["'\u201C\u2018>])(\*{2,3})(\S[^\n]*?)[ \t]+\2(?=$|[\s.,!?;:'"\u201D\u2019\)\]<])/g, (full, prefix, marker, inner) => inner.includes(marker) ? full : `${prefix}${marker}${inner}${marker}`);
-  out = out.replace(/(^|[^\w_\\])__[ \t]+([^_\n]*?\S)[ \t]*__(?!\w|_)/g, "$1__$2__");
-  out = out.replace(/(^|[^\w_\\])__(\S[^_\n]*?)[ \t]+__(?!\w|_)/g, "$1__$2__");
-  const singleStarIndices = [];
-  for (let i = 0;i < out.length; i += 1) {
-    if (out[i] === "*" && out[i - 1] !== "*" && out[i + 1] !== "*" && out[i - 1] !== "\\") {
-      singleStarIndices.push(i);
-    }
-  }
-  const isBulletWithOddStars = /^[ \t]*\*[ \t]+/.test(out) && singleStarIndices.length % 2 === 1;
-  if (!isBulletWithOddStars && singleStarIndices.length >= 2) {
-    out = out.replace(/(^|[^\w*\\])\*[ \t]+([^*\n]*?\S)[ \t]*\*(?!\*)/g, (full, prefix, inner, offset) => {
-      const before = out.slice(0, offset + prefix.length);
-      const afterStart = offset + full.length;
-      const after = out.slice(afterStart);
-      if (/\d\s+$/.test(before) && /^\s+\d/.test(after) && /^\d+$/.test(inner.trim())) {
-        return full;
+    if (countPrecedingBackslashes(line, i) % 2 === 1)
+      continue;
+    const canOpen = i === 0 || OPEN_BOUNDARY_RE.test(line[i - 1]);
+    const canClose = i + 1 === line.length || CLOSE_BOUNDARY_RE.test(line[i + 1]);
+    if (openChar === closeChar) {
+      if (openEnd === -1) {
+        if (canOpen) {
+          openEnd = i + 1;
+        }
+      } else if (canClose) {
+        const inner = line.slice(openEnd, i);
+        const trimmed = inner.replace(/^[ \t]+|[ \t]+$/g, "");
+        if (trimmed !== inner && trimmed.length > 0 && HAS_ALNUM_RE.test(trimmed)) {
+          edits.push({ start: openEnd, end: i, replacement: trimmed });
+        }
+        openEnd = -1;
       }
-      return `${prefix}*${inner}*`;
-    });
-    out = out.replace(/(^|[^\w*\\])\*([^\s*\n][^*\n]*?)[ \t]+\*(?!\*)/g, "$1*$2*");
+    } else {
+      if (ch === openChar) {
+        if (canOpen) {
+          openEnd = i + 1;
+        }
+      } else if (ch === closeChar && openEnd !== -1 && canClose) {
+        const inner = line.slice(openEnd, i);
+        const trimmed = inner.replace(/^[ \t]+|[ \t]+$/g, "");
+        if (trimmed !== inner && trimmed.length > 0 && HAS_ALNUM_RE.test(trimmed)) {
+          edits.push({ start: openEnd, end: i, replacement: trimmed });
+        }
+        openEnd = -1;
+      }
+    }
   }
-  out = out.replace(/(^|[^\w_\\])_[ \t]+([^_\n]*?\S)[ \t]*_(?!\w|_)/g, "$1_$2_");
-  out = out.replace(/(^|[^\w_\\])_([^\s_\n][^_\n]*?)[ \t]+_(?!\w|_)/g, "$1_$2_");
+  return applyTextEdits(line, edits);
+}
+function trimDelimiterOnLine(line, delimiter, tagSpans) {
+  let out = line;
+  let currentTagSpans = tagSpans;
+  for (const size of [3, 2, 1]) {
+    if (out !== line) {
+      currentTagSpans = findHtmlTagSpansOnLine(out);
+    }
+    const runs = [];
+    for (let i = 0;i < out.length; ) {
+      if (out[i] !== delimiter) {
+        i += 1;
+        continue;
+      }
+      if (isInsideSpans(i, currentTagSpans) || countPrecedingBackslashes(out, i) % 2 === 1) {
+        while (i < out.length && out[i] === delimiter)
+          i += 1;
+        continue;
+      }
+      const runStart = i;
+      while (i < out.length && out[i] === delimiter)
+        i += 1;
+      const runEnd = i;
+      if (runEnd - runStart !== size)
+        continue;
+      const canOpen = runStart === 0 || OPEN_BOUNDARY_RE.test(out[runStart - 1]);
+      const canClose = runEnd === out.length || CLOSE_BOUNDARY_RE.test(out[runEnd]);
+      let isMath = false;
+      if (delimiter === "*" && (size === 1 || size === 2)) {
+        const hasLeftMath = /[\d)][ \t]+$/.test(out.slice(0, runStart));
+        const hasRightMath = /^[ \t]+[\d(]/.test(out.slice(runEnd));
+        isMath = hasLeftMath && hasRightMath;
+      }
+      runs.push({ start: runStart, end: runEnd, canOpen, canClose, isMath });
+    }
+    const nonMathRuns = runs.filter((r) => !r.isMath);
+    if (nonMathRuns.length < 2)
+      continue;
+    if (delimiter === "*" && size === 1 && /^[ \t]*\*(?!\*)[ \t]+/.test(out) && nonMathRuns.length % 2 === 1) {
+      continue;
+    }
+    const marker = delimiter.repeat(size);
+    const edits = [];
+    let openRun = null;
+    for (const run of nonMathRuns) {
+      if (!openRun) {
+        if (run.canOpen) {
+          openRun = run;
+        }
+        continue;
+      }
+      if (run.canClose) {
+        const inner = out.slice(openRun.end, run.start);
+        const trimmed = inner.replace(/^[ \t]+|[ \t]+$/g, "");
+        const safeInner = trimmed !== inner && trimmed.length > 0 && HAS_ALNUM_RE.test(trimmed) && !trimmed.startsWith(delimiter) && !trimmed.endsWith(delimiter) && !trimmed.includes(marker) && (size > 1 || !inner.includes(delimiter));
+        if (safeInner) {
+          edits.push({ start: openRun.end, end: run.start, replacement: trimmed });
+        }
+        openRun = null;
+      } else if (run.canOpen) {
+        openRun = run;
+      }
+    }
+    out = applyTextEdits(out, edits);
+  }
+  return out;
+}
+function trimEmphasisOnLine(line, tagSpans = findHtmlTagSpansOnLine(line)) {
+  let out = trimDelimiterOnLine(line, "*", tagSpans);
+  const nextSpans = out === line ? tagSpans : findHtmlTagSpansOnLine(out);
+  out = trimDelimiterOnLine(out, "_", nextSpans);
   return out;
 }
 function healProseSegment(prose) {
-  let out = healFontTagsAndAttributes(prose);
-  out = out.replace(/\u201C[ \t]*([^\u201D\n]*?\S)[ \t]*\u201D/g, "\u201C$1\u201D");
-  out = out.replace(/\u2018[ \t]*([^\u2019\n]*?\S)[ \t]*\u2019/g, "\u2018$1\u2019");
+  const out = healFontTagsAndAttributes(prose);
   const lines = out.split(`
 `);
   for (let i = 0;i < lines.length; i += 1) {
     let line = lines[i];
-    line = trimInnerWhitespaceInPairs(line, '"', '"');
-    line = trimEmphasisOnLine(line);
+    for (let pass = 0;pass < 2; pass += 1) {
+      let next = trimEmphasisOnLine(line);
+      const tagSpans = findHtmlTagSpansOnLine(next);
+      next = trimInnerWhitespaceInPairs(next, '"', '"', tagSpans);
+      next = trimInnerWhitespaceInPairs(next, "\u201C", "\u201D", tagSpans);
+      next = trimInnerWhitespaceInPairs(next, "\u2018", "\u2019", tagSpans);
+      if (next === line)
+        break;
+      line = next;
+    }
     lines[i] = line;
   }
   return lines.join(`
 `);
 }
+function findFencedCodeSpans(text) {
+  const fenceLines = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const nl = text.indexOf(`
+`, pos);
+    const lineEnd = nl === -1 ? text.length : nl;
+    const line = text.slice(pos, lineEnd);
+    const m = /^[ \t]*(`{3,}|~{3,})([^\n]*)$/.exec(line);
+    if (m) {
+      const fence = m[1];
+      const info = m[2];
+      fenceLines.push({
+        lineStart: pos,
+        lineEnd,
+        fenceChar: fence[0],
+        fenceLen: fence.length,
+        isCloserOnly: /^[ \t]*$/.test(info),
+        infoHasBacktick: fence[0] === "`" && info.includes("`")
+      });
+    }
+    if (nl === -1)
+      break;
+    pos = nl + 1;
+  }
+  const spans = [];
+  for (let i = 0;i < fenceLines.length; i += 1) {
+    const open = fenceLines[i];
+    if (open.infoHasBacktick)
+      continue;
+    for (let j = i + 1;j < fenceLines.length; j += 1) {
+      const close = fenceLines[j];
+      if (close.isCloserOnly && close.fenceChar === open.fenceChar && close.fenceLen >= open.fenceLen) {
+        spans.push({ start: open.lineStart, end: close.lineEnd });
+        i = j;
+        break;
+      }
+    }
+  }
+  return spans;
+}
+var JSON_OPEN_TAG_RE = /<json(?:\s[^>]*)?>/gi;
+var JSON_TAG_AT_RE = /<\/?json(?:\s[^>]*)?>/iy;
+var JSON_START_RE = /[ \t\n\r]*[-0-9"[{tfn]/y;
+var MAX_REJECTED_JSON_CANDIDATES = 256;
+function indexOfJsonTagOutsideStrings(text, from, limit) {
+  let inString = false;
+  for (let i = from;i < limit; i += 1) {
+    const ch = text.charCodeAt(i);
+    if (inString) {
+      if (ch === 92)
+        i += 1;
+      else if (ch === 34)
+        inString = false;
+    } else if (ch === 34) {
+      inString = true;
+    } else if (ch === 60) {
+      JSON_TAG_AT_RE.lastIndex = i;
+      const m = JSON_TAG_AT_RE.exec(text);
+      if (m && i + m[0].length <= limit)
+        return i;
+    }
+  }
+  return -1;
+}
+function findJsonBlockSpans(text, from, to) {
+  const spans = [];
+  let rejected = 0;
+  const findOpen = (start) => {
+    JSON_OPEN_TAG_RE.lastIndex = start;
+    const m = JSON_OPEN_TAG_RE.exec(text);
+    if (!m || m.index + m[0].length > to)
+      return null;
+    return { start: m.index, end: m.index + m[0].length };
+  };
+  let open = findOpen(from);
+  while (open) {
+    const innerStart = open.end;
+    const tagIdx = indexOfJsonTagOutsideStrings(text, innerStart, to);
+    if (tagIdx >= 0 && text.charCodeAt(tagIdx + 1) !== 47) {
+      open = findOpen(tagIdx);
+      continue;
+    }
+    let validBlockEnd = -1;
+    if (tagIdx >= 0) {
+      JSON_TAG_AT_RE.lastIndex = tagIdx;
+      const closeTag = JSON_TAG_AT_RE.exec(text);
+      if (closeTag && closeTag[0].toLowerCase() === "</json>") {
+        JSON_START_RE.lastIndex = innerStart;
+        if (JSON_START_RE.test(text)) {
+          try {
+            JSON.parse(text.slice(innerStart, tagIdx));
+            validBlockEnd = tagIdx + closeTag[0].length;
+          } catch {
+            validBlockEnd = -1;
+          }
+        }
+      }
+    }
+    if (validBlockEnd >= 0) {
+      spans.push({ start: open.start, end: validBlockEnd });
+      open = findOpen(validBlockEnd);
+    } else if (++rejected === MAX_REJECTED_JSON_CANDIDATES) {
+      return { spans, stoppedAt: open.start };
+    } else {
+      open = findOpen(innerStart);
+    }
+  }
+  return { spans, stoppedAt: to };
+}
+function healInlineBackticksAndProse(segment) {
+  const runs = [];
+  const byLen = new Map;
+  for (let i = 0;i < segment.length; ) {
+    if (segment[i] !== "`") {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < segment.length && segment[i] === "`")
+      i += 1;
+    const len = i - start;
+    const runIdx = runs.length;
+    runs.push({ start, end: i, len });
+    let list = byLen.get(len);
+    if (!list) {
+      list = [];
+      byLen.set(len, list);
+    }
+    list.push(runIdx);
+  }
+  if (runs.length < 2) {
+    return healProseSegment(segment);
+  }
+  const lenCursors = new Map;
+  let result = "";
+  let textCursor = 0;
+  for (let rIdx = 0;rIdx < runs.length; rIdx += 1) {
+    const open = runs[rIdx];
+    if (open.start < textCursor)
+      continue;
+    const list = byLen.get(open.len);
+    let ptr = lenCursors.get(open.len) ?? 0;
+    while (ptr < list.length && list[ptr] <= rIdx) {
+      ptr += 1;
+    }
+    lenCursors.set(open.len, ptr);
+    if (ptr >= list.length)
+      continue;
+    const closeIdx = list[ptr];
+    const close = runs[closeIdx];
+    if (open.start > textCursor) {
+      result += healProseSegment(segment.slice(textCursor, open.start));
+    }
+    result += segment.slice(open.start, close.end);
+    textCursor = close.end;
+    lenCursors.set(open.len, ptr + 1);
+    rIdx = closeIdx;
+  }
+  if (textCursor < segment.length) {
+    result += healProseSegment(segment.slice(textCursor));
+  }
+  return result;
+}
+function healOutsideJsonBlocks(text, from, to) {
+  const { spans, stoppedAt } = findJsonBlockSpans(text, from, to);
+  let result = "";
+  let cursor = from;
+  for (const span of spans) {
+    if (span.start > cursor) {
+      result += healInlineBackticksAndProse(text.slice(cursor, span.start));
+    }
+    result += text.slice(span.start, span.end);
+    cursor = span.end;
+  }
+  if (stoppedAt > cursor) {
+    result += healInlineBackticksAndProse(text.slice(cursor, stoppedAt));
+  }
+  if (stoppedAt < to) {
+    result += text.slice(stoppedAt, to);
+  }
+  return result;
+}
 function healFormattingArtifacts(text) {
   if (!text || typeof text !== "string") {
     return text;
   }
-  const protectedRe = /(```[\s\S]*?```|~~~[\s\S]*?~~~|<json\b[^>]*>[\s\S]*?<\/json>|(`+)[^\n]*?\2)/gi;
+  const fencedSpans = findFencedCodeSpans(text);
   let result = "";
   let lastIndex = 0;
-  let match;
-  while ((match = protectedRe.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      result += healProseSegment(text.slice(lastIndex, match.index));
+  for (const span of fencedSpans) {
+    if (span.start > lastIndex) {
+      result += healOutsideJsonBlocks(text, lastIndex, span.start);
     }
-    result += match[0];
-    lastIndex = match.index + match[0].length;
+    result += text.slice(span.start, span.end);
+    lastIndex = span.end;
   }
   if (lastIndex < text.length) {
-    result += healProseSegment(text.slice(lastIndex));
+    result += healOutsideJsonBlocks(text, lastIndex, text.length);
   }
   return result;
 }
 async function processResponseOutput(options) {
   const processedContent = healFormattingArtifacts(await applyRegexScripts(options.content, options.scripts, "ai_output", 0, {
-    resolveMacros: options.resolveMacros
+    resolveMacros: options.resolveMacros,
+    ...options.previousContent !== undefined ? { previousContent: options.previousContent } : {}
   }));
   let processedReasoning = options.reasoning;
   if (typeof options.reasoning === "string" && options.reasoning.length > 0) {
-    processedReasoning = healFormattingArtifacts(await applyRegexScripts(options.reasoning, options.scripts, "reasoning", 0, {
-      resolveMacros: options.resolveMacros
-    }));
+    processedReasoning = await applyRegexScripts(options.reasoning, options.scripts, "reasoning", 0, {
+      resolveMacros: options.resolveMacros,
+      ...options.previousContent !== undefined ? { previousContent: options.previousContent } : {}
+    });
   }
   return {
     content: processedContent,
@@ -1295,34 +2351,73 @@ class GuidedGenerationRunner {
     this.emitFrontend = emitFrontend;
   }
   dispose() {
+    for (const userRuns of this.activeRuns.values()) {
+      for (const run of userRuns.values()) {
+        run.controller.abort();
+      }
+      userRuns.clear();
+    }
+    this.activeRuns.clear();
+    for (const pendingList of this.pendingUsers.values()) {
+      for (const pending of pendingList) {
+        pending.controller?.abort();
+      }
+    }
+    this.pendingUsers.clear();
+    this.pendingDryRunCaptures.clear();
+    this.chatDryRunQueues.clear();
     if (this.interceptorDisposer) {
       this.interceptorDisposer();
       this.interceptorDisposer = null;
     }
   }
-  ensureInterceptorRegistered() {
-    if (this.interceptorDisposer)
+  syncInterceptorRegistration() {
+    if (!this.spindle.permissions?.has?.("interceptor")) {
+      if (this.interceptorDisposer) {
+        this.interceptorDisposer();
+        this.interceptorDisposer = null;
+      }
       return;
-    if (!this.spindle.permissions?.has?.("interceptor"))
+    }
+    this.ensureInterceptorRegistered();
+  }
+  ensureInterceptorRegistered() {
+    if (!this.spindle.permissions?.has?.("interceptor")) {
+      if (this.interceptorDisposer) {
+        this.interceptorDisposer();
+        this.interceptorDisposer = null;
+      }
+      return;
+    }
+    if (this.interceptorDisposer)
       return;
     if (typeof this.spindle.registerInterceptor !== "function")
       return;
-    this.interceptorDisposer = this.spindle.registerInterceptor(async (messages, context) => {
-      if (this.spindle.permissions?.has && !this.spindle.permissions.has("interceptor")) {
+    try {
+      this.interceptorDisposer = this.spindle.registerInterceptor(async (messages, context) => {
+        if (this.spindle.permissions?.has && !this.spindle.permissions.has("interceptor")) {
+          return messages;
+        }
+        const isDryRun = Boolean(context.dryRun || context.isDryRun);
+        if (!isDryRun) {
+          return messages;
+        }
+        const pending = this.pendingDryRunCaptures.get(context.chatId);
+        if (pending) {
+          const matchesUser = !pending.userId || !context.userId || context.userId === pending.userId;
+          const matchesGenType = !pending.generationType || !context.generationType || context.generationType === pending.generationType;
+          const matchesPreset = !pending.presetId || context.presetId === pending.presetId;
+          if (matchesUser && matchesGenType && matchesPreset) {
+            pending.capturedMessages = messages.map((m) => ({
+              ...m
+            }));
+          }
+        }
         return messages;
-      }
-      const isDryRun = Boolean(context.dryRun || context.isDryRun);
-      if (!isDryRun) {
-        return messages;
-      }
-      const pending = this.pendingDryRunCaptures.get(context.chatId);
-      if (pending) {
-        pending.capturedMessages = messages.map((m) => ({
-          ...m
-        }));
-      }
-      return messages;
-    });
+      });
+    } catch {
+      this.interceptorDisposer = null;
+    }
   }
   enqueueChatDryRun(chatId, task) {
     const prev = this.chatDryRunQueues.get(chatId) ?? Promise.resolve();
@@ -1343,7 +2438,11 @@ class GuidedGenerationRunner {
   async runDryRunWithCapture(chatId, dryRunInput, userId) {
     return this.enqueueChatDryRun(chatId, async () => {
       this.ensureInterceptorRegistered();
-      const capture = {};
+      const capture = {
+        userId,
+        generationType: dryRunInput.generationType ?? "normal",
+        presetId: dryRunInput.presetId ?? null
+      };
       this.pendingDryRunCaptures.set(chatId, capture);
       try {
         const result = await this.spindle.generate.dryRun(dryRunInput, userId);
@@ -1358,34 +2457,129 @@ class GuidedGenerationRunner {
   userKey(userId) {
     return userId && userId.length > 0 ? userId : "__default__";
   }
-  getActiveRun(userId) {
-    const run = this.activeRuns.get(this.userKey(userId));
-    return run ? { ...run.state } : null;
+  setActiveRun(key, run) {
+    let userRuns = this.activeRuns.get(key);
+    if (!userRuns) {
+      userRuns = new Map;
+      this.activeRuns.set(key, userRuns);
+    }
+    userRuns.set(run.state.runId, run);
+  }
+  deleteActiveRun(key, runId) {
+    const userRuns = this.activeRuns.get(key);
+    if (!userRuns || !userRuns.has(runId))
+      return false;
+    userRuns.delete(runId);
+    if (userRuns.size === 0) {
+      this.activeRuns.delete(key);
+    }
+    return true;
+  }
+  addPendingRun(key, entry) {
+    const list = this.pendingUsers.get(key);
+    if (list) {
+      list.push(entry);
+    } else {
+      this.pendingUsers.set(key, [entry]);
+    }
+  }
+  removePendingRun(key, entry) {
+    const list = this.pendingUsers.get(key);
+    if (!list)
+      return;
+    const idx = list.indexOf(entry);
+    if (idx >= 0) {
+      list.splice(idx, 1);
+    }
+    if (list.length === 0) {
+      this.pendingUsers.delete(key);
+    }
+  }
+  isChatBusy(key, chatId, excludePending) {
+    const trimmed = typeof chatId === "string" && chatId.trim().length > 0 ? chatId.trim() : null;
+    const userRuns = this.activeRuns.get(key);
+    if (trimmed && userRuns) {
+      for (const run of userRuns.values()) {
+        if (run.state.chatId === trimmed)
+          return true;
+      }
+    }
+    const pendingList = this.pendingUsers.get(key);
+    if (pendingList && pendingList.length > 0) {
+      for (const pending of pendingList) {
+        if (pending === excludePending)
+          continue;
+        if (trimmed) {
+          if (pending.chatId === trimmed || !pending.chatId)
+            return true;
+        } else {
+          if (!pending.chatId)
+            return true;
+        }
+      }
+    }
+    return false;
+  }
+  getActiveRuns(userId) {
+    const userRuns = this.activeRuns.get(this.userKey(userId));
+    if (!userRuns || userRuns.size === 0)
+      return [];
+    return Array.from(userRuns.values(), (run) => ({ ...run.state }));
+  }
+  getActiveRun(userId, chatId) {
+    const userRuns = this.activeRuns.get(this.userKey(userId));
+    if (!userRuns || userRuns.size === 0)
+      return null;
+    if (typeof chatId === "string" && chatId.length > 0) {
+      for (const run of userRuns.values()) {
+        if (run.state.chatId === chatId) {
+          return { ...run.state };
+        }
+      }
+      return null;
+    }
+    const runs = Array.from(userRuns.values());
+    const latest = runs[runs.length - 1];
+    return latest ? { ...latest.state } : null;
   }
   updateActiveRunState(userId, runId, patch) {
-    const active = this.activeRuns.get(this.userKey(userId));
-    if (!active || active.state.runId !== runId) {
+    const userRuns = this.activeRuns.get(this.userKey(userId));
+    const active = userRuns?.get(runId);
+    if (!active) {
       return;
     }
     active.state = {
       ...active.state,
       ...patch
     };
-    this.emitStatus(userId);
+    this.emitStatus(userId, runId);
   }
-  abortCurrent(userId, runId) {
+  abortCurrent(userId, runId, chatId) {
     const key = this.userKey(userId);
-    const run = this.activeRuns.get(key);
-    if (run) {
-      if (runId && run.state.runId !== runId)
+    const userRuns = this.activeRuns.get(key);
+    const trimmedChatId = typeof chatId === "string" && chatId.trim().length > 0 ? chatId.trim() : undefined;
+    if (runId) {
+      const run = userRuns?.get(runId);
+      if (!run)
         return false;
       run.controller.abort();
       return true;
     }
-    if (!runId) {
-      const pendingController = this.pendingUsers.get(key);
-      if (pendingController) {
-        pendingController.abort();
+    if (userRuns && userRuns.size > 0) {
+      const runs = Array.from(userRuns.values());
+      const targetRun = trimmedChatId ? [...runs].reverse().find((run) => run.state.chatId === trimmedChatId) : runs[runs.length - 1];
+      if (targetRun) {
+        targetRun.controller.abort();
+        return true;
+      }
+    }
+    const pendingList = this.pendingUsers.get(key);
+    if (pendingList && pendingList.length > 0) {
+      const abortablePending = pendingList.filter((entry) => Boolean(entry.controller));
+      const reversedPending = [...abortablePending].reverse();
+      const targetPending = trimmedChatId ? reversedPending.find((entry) => entry.chatId === trimmedChatId) ?? reversedPending.find((entry) => entry.chatId === undefined) : abortablePending[abortablePending.length - 1];
+      if (targetPending?.controller) {
+        targetPending.controller.abort();
         return true;
       }
     }
@@ -1393,13 +2587,21 @@ class GuidedGenerationRunner {
   }
   async run(input, userId) {
     const key = this.userKey(userId);
-    if (this.activeRuns.has(key) || this.pendingUsers.has(key)) {
+    const requestedChatId = typeof input.chatId === "string" && input.chatId.trim().length > 0 ? input.chatId.trim() : null;
+    if (this.isChatBusy(key, requestedChatId)) {
       throw new Error("A Guided Generations action is already running. Stop it before starting another.");
     }
     this.assertRequiredPermissions(input.actionId);
     const controller = new AbortController;
-    this.pendingUsers.set(key, controller);
+    const pendingEntry = {
+      controller,
+      ...requestedChatId ? { chatId: requestedChatId } : {}
+    };
+    this.addPendingRun(key, pendingEntry);
     let runId;
+    let resolvedChatId;
+    let wasAborted = false;
+    let emitErrorStatus = true;
     try {
       const settings = await this.store.getSettings(userId);
       const config = settings.actions[input.actionId];
@@ -1410,9 +2612,16 @@ class GuidedGenerationRunner {
       if (input.actionId === "guided_response" && !trimmedInput) {
         throw new Error("Enter guidance in the composer before running Guided Response.");
       }
-      const { chatId, characterId } = await this.resolveChatContext(input.chatId, userId);
+      const { chatId, characterId, characterName, avatarUrl } = await this.resolveChatContext(requestedChatId, userId);
+      resolvedChatId = chatId;
+      pendingEntry.chatId = chatId;
+      if (this.isChatBusy(key, chatId, pendingEntry)) {
+        emitErrorStatus = false;
+        throw new Error("A Guided Generations action is already running. Stop it before starting another.");
+      }
       runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       if (controller.signal.aborted) {
+        wasAborted = true;
         return {
           runId,
           actionId: input.actionId,
@@ -1421,17 +2630,20 @@ class GuidedGenerationRunner {
           text: ""
         };
       }
-      this.activeRuns.set(key, {
+      this.setActiveRun(key, {
         state: {
           runId,
           actionId: input.actionId,
           chatId,
-          startedAt: Date.now()
+          startedAt: Date.now(),
+          ...characterId ? { characterId } : {},
+          ...characterName ? { characterName } : {},
+          ...avatarUrl ? { avatarUrl } : {}
         },
         controller
       });
-      this.pendingUsers.delete(key);
-      this.emitStatus(userId);
+      this.removePendingRun(key, pendingEntry);
+      this.emitStatus(userId, runId);
       if (trimmedInput && settings.inputRecovery.enabled) {
         const recovery = await this.store.pushRecovery({
           text: input.inputText,
@@ -1454,11 +2666,18 @@ class GuidedGenerationRunner {
       const metricsPreset = this.resolveMetricsPresetContext(presetContext, config.presetId, resolvedConnection);
       let targetAssistantId = null;
       let preTargetMessage = null;
+      let targetSwipeIsBlank = false;
       if (input.actionId === "guided_continue" || input.actionId === "guided_swipe") {
         preTargetMessage = await this.requireLastAssistantMessage(chatId);
         targetAssistantId = preTargetMessage.id;
+        if (input.actionId === "guided_swipe") {
+          const preNorm = normalizeMessageSwipes(preTargetMessage);
+          const activeSwipeText = preNorm.swipes[preNorm.activeIndex] ?? preTargetMessage.content ?? "";
+          targetSwipeIsBlank = activeSwipeText.trim().length === 0;
+        }
       }
       if (controller.signal.aborted) {
+        wasAborted = true;
         return {
           runId,
           actionId: input.actionId,
@@ -1478,23 +2697,30 @@ class GuidedGenerationRunner {
       let createdSwipeDates;
       let swipeSession = null;
       let handoffToAssistantExecution = false;
+      let pendingBlankSlotCreate = false;
+      let pendingSwipeSlotWrite = null;
+      const activeRunId = runId;
+      const createBlankAssistantSlot = async () => {
+        const metadata = resolvedPresetId ? buildPresetContextMetadata(undefined, 0, resolvedPresetId) : undefined;
+        const created = await this.spindle.chat.appendMessage(chatId, {
+          role: "assistant",
+          content: "",
+          ...metadata ? { metadata } : {}
+        }, { triggerGeneration: false });
+        createdMessageId = created.id;
+        createdSwipeDates = [Math.floor(Date.now() / 1000)];
+        this.updateActiveRunState(userId, activeRunId, {
+          messageId: created.id,
+          swipeId: 0
+        });
+      };
       try {
         if (input.actionId === "guided_response") {
-          const metadata = resolvedPresetId ? buildPresetContextMetadata(undefined, 0, resolvedPresetId) : undefined;
-          const created = await this.spindle.chat.appendMessage(chatId, {
-            role: "assistant",
-            content: "",
-            ...metadata ? { metadata } : {}
-          }, { triggerGeneration: false });
-          createdMessageId = created.id;
-          createdSwipeDates = [Math.floor(Date.now() / 1000)];
-          this.updateActiveRunState(userId, runId, {
-            messageId: created.id,
-            swipeId: 0
-          });
+          pendingBlankSlotCreate = true;
         } else if (input.actionId === "guided_regenerate") {
           const trailingAssistant = await this.findTrailingAssistantMessage(chatId);
           if (controller.signal.aborted) {
+            wasAborted = true;
             return {
               runId,
               actionId: input.actionId,
@@ -1508,6 +2734,7 @@ class GuidedGenerationRunner {
             await this.spindle.chat.deleteMessage(chatId, trailingAssistant.id);
           }
           if (controller.signal.aborted) {
+            wasAborted = true;
             if (regeneratedSnapshot) {
               await this.restoreTrailingAssistant(chatId, regeneratedSnapshot, undefined, userId);
             }
@@ -1519,18 +2746,7 @@ class GuidedGenerationRunner {
               text: ""
             };
           }
-          const metadata = resolvedPresetId ? buildPresetContextMetadata(undefined, 0, resolvedPresetId) : undefined;
-          const created = await this.spindle.chat.appendMessage(chatId, {
-            role: "assistant",
-            content: "",
-            ...metadata ? { metadata } : {}
-          }, { triggerGeneration: false });
-          createdMessageId = created.id;
-          createdSwipeDates = [Math.floor(Date.now() / 1000)];
-          this.updateActiveRunState(userId, runId, {
-            messageId: created.id,
-            swipeId: 0
-          });
+          pendingBlankSlotCreate = true;
         } else if (input.actionId === "guided_continue" && preTargetMessage) {
           const { activeIndex } = normalizeMessageSwipes(preTargetMessage);
           this.updateActiveRunState(userId, runId, {
@@ -1546,51 +2762,69 @@ class GuidedGenerationRunner {
           }
         } else if (input.actionId === "guided_swipe" && preTargetMessage) {
           const backgroundSwipe = input.backgroundSwipe === true;
-          swipeSession = this.createGuidedSwipeSession(chatId, preTargetMessage);
-          const metadata = resolvedPresetId ? buildPresetContextMetadata(preTargetMessage.metadata, swipeSession.newSwipeIndex, resolvedPresetId) : undefined;
-          const seqBeforeWrite = swipeSession.getSwipeEventSeq();
-          if (!backgroundSwipe) {
-            await this.spindle.chat.updateMessage(chatId, swipeSession.targetAssistantId, buildActiveSwipePatch({
-              swipes: swipeSession.swipes,
-              swipeIndex: swipeSession.newSwipeIndex,
-              content: "",
-              swipeDates: swipeSession.swipeDates,
-              ...metadata ? { metadata } : {},
-              skipChunkRebuild: true
-            }));
-            if (swipeSession.getSwipeEventSeq() === seqBeforeWrite && swipeSession.getCurrentViewedSwipeId() === swipeSession.initialSwipeId) {
-              swipeSession.setCurrentViewedSwipeId(swipeSession.newSwipeIndex);
+          const session = this.createGuidedSwipeSession(chatId, preTargetMessage, userId, {
+            onTargetSwipeIndexChanged: (swipeId) => {
+              this.updateActiveRunState(userId, activeRunId, { swipeId });
+            },
+            onTargetDeleted: () => {
+              controller.abort();
             }
-          } else {
-            await this.spindle.chat.updateMessage(chatId, swipeSession.targetAssistantId, buildBackgroundSwipePatch({
-              swipes: swipeSession.swipes,
-              swipeIndex: swipeSession.newSwipeIndex,
-              content: "",
-              swipeDates: swipeSession.swipeDates,
-              ...metadata ? { metadata } : {}
-            }));
-          }
-          this.updateActiveRunState(userId, runId, {
-            messageId: swipeSession.targetAssistantId,
-            swipeId: swipeSession.newSwipeIndex,
-            backgroundSwipe
           });
+          swipeSession = session;
+          pendingSwipeSlotWrite = async () => {
+            const latestTarget = await this.readTargetMessageOrThrow(chatId, session.targetAssistantId);
+            session.syncFromLatestMessage(latestTarget);
+            const metadata = resolvedPresetId ? buildPresetContextMetadata(latestTarget.metadata, session.newSwipeIndex, resolvedPresetId) : undefined;
+            const seqBeforeWrite = session.getSwipeEventSeq();
+            if (!backgroundSwipe) {
+              await this.spindle.chat.updateMessage(chatId, session.targetAssistantId, buildActiveSwipePatch({
+                swipes: session.swipes,
+                swipeIndex: session.newSwipeIndex,
+                content: "",
+                swipeDates: session.swipeDates,
+                ...metadata ? { metadata } : {},
+                skipChunkRebuild: true
+              }));
+              if (session.getSwipeEventSeq() === seqBeforeWrite && session.getCurrentViewedSwipeId() === session.initialSwipeId) {
+                session.setCurrentViewedSwipeId(session.newSwipeIndex);
+              }
+            } else {
+              await this.spindle.chat.updateMessage(chatId, session.targetAssistantId, buildBackgroundSwipePatch({
+                swipes: session.swipes,
+                swipeIndex: session.newSwipeIndex,
+                content: "",
+                swipeDates: session.swipeDates,
+                ...metadata ? { metadata } : {}
+              }));
+            }
+            session.markSlotCreated();
+            this.updateActiveRunState(userId, activeRunId, {
+              messageId: session.targetAssistantId,
+              swipeId: session.newSwipeIndex,
+              backgroundSwipe
+            });
+          };
         }
         const dryRunCapture = await this.runDryRunWithCapture(chatId, dryRunInput, userId);
         const dryRunResult = dryRunCapture.result;
         const capturedMessages = dryRunCapture.capturedMessages;
         if (controller.signal.aborted) {
+          wasAborted = true;
           if (regeneratedSnapshot) {
-            await this.restoreTrailingAssistant(chatId, regeneratedSnapshot, createdMessageId, userId);
+            await this.restoreTrailingAssistant(chatId, regeneratedSnapshot, undefined, userId);
           }
           return {
             runId,
             actionId: input.actionId,
             chatId,
             aborted: true,
-            ...input.actionId === "guided_response" && createdMessageId ? { messageId: createdMessageId, swipeId: 0 } : input.actionId === "guided_swipe" && swipeSession ? { messageId: swipeSession.targetAssistantId, swipeId: swipeSession.newSwipeIndex } : {},
             text: ""
           };
+        }
+        if (pendingBlankSlotCreate) {
+          await createBlankAssistantSlot();
+        } else if (pendingSwipeSlotWrite) {
+          await pendingSwipeSlotWrite();
         }
         const {
           rawInput,
@@ -1605,50 +2839,83 @@ class GuidedGenerationRunner {
           inputText: input.inputText,
           connectionId,
           resolvedConnection,
+          resolvedPresetId,
           dryRunResult,
           capturedMessages,
           signal: controller.signal,
           createdMessageId,
-          targetAssistantId
+          targetAssistantId,
+          skipBlankAssistantStrip: pendingBlankSlotCreate,
+          targetSwipeIsBlank
         });
+        let result;
         switch (input.actionId) {
           case "guided_response":
           case "guided_regenerate":
             handoffToAssistantExecution = true;
-            return await this.executeAssistantResponse(input.actionId, runId, chatId, createdMessageId, createdSwipeDates, rawInput, controller.signal, regeneratedSnapshot, transformResponseOutput, userId, metricsPreset);
+            result = await this.executeAssistantResponse(input.actionId, runId, chatId, createdMessageId, createdSwipeDates, rawInput, controller.signal, regeneratedSnapshot, transformResponseOutput, userId, metricsPreset);
+            break;
           case "guided_continue":
-            return await this.executeGuidedContinue(runId, chatId, targetAssistantId, input.inputText, rawInput, controller.signal, userId, transformResponseOutput, metricsPreset);
+            result = await this.executeGuidedContinue(runId, chatId, targetAssistantId, input.inputText, rawInput, controller.signal, userId, transformResponseOutput, metricsPreset);
+            break;
           case "guided_swipe":
-            return await this.executeGuidedSwipe(runId, chatId, swipeSession, rawInput, controller.signal, transformResponseOutput, userId, metricsPreset);
+            handoffToAssistantExecution = true;
+            result = await this.executeGuidedSwipe(runId, chatId, swipeSession, rawInput, controller.signal, transformResponseOutput, userId, metricsPreset);
+            break;
           case "guided_impersonate":
-            return await this.executeImpersonate(runId, chatId, rawInput, controller.signal, userId, transformImpersonateOutput);
+            result = await this.executeImpersonate(runId, chatId, rawInput, controller.signal, userId, transformImpersonateOutput);
+            break;
           default: {
             const exhaustive = input.actionId;
             throw new Error(`Unsupported Guided Generations action: ${String(exhaustive)}`);
           }
         }
+        wasAborted = result.aborted;
+        return result;
       } catch (error) {
-        if (!handoffToAssistantExecution && regeneratedSnapshot) {
-          await this.restoreTrailingAssistant(chatId, regeneratedSnapshot, createdMessageId, userId);
+        if (!handoffToAssistantExecution) {
+          if (regeneratedSnapshot) {
+            await this.restoreTrailingAssistant(chatId, regeneratedSnapshot, createdMessageId, userId);
+          } else if (input.actionId === "guided_response" && createdMessageId) {
+            await this.spindle.chat.deleteMessage(chatId, createdMessageId).catch(() => {
+              return;
+            });
+          } else if (input.actionId === "guided_swipe" && swipeSession) {
+            await this.rollbackUnstartedSwipeSlot(chatId, swipeSession);
+          }
         }
         throw error;
       } finally {
         swipeSession?.dispose();
       }
     } catch (error) {
-      if (runId && this.activeRuns.get(key)?.state.runId === runId) {
-        this.activeRuns.delete(key);
+      if (runId) {
+        this.deleteActiveRun(key, runId);
       }
-      const message = error instanceof Error ? error.message : String(error);
-      this.emitFrontend({ type: "gg:status", error: message, run: null }, userId);
+      if (emitErrorStatus) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorChatId = resolvedChatId ?? requestedChatId ?? undefined;
+        this.emitFrontend({
+          type: "gg:status",
+          error: message,
+          run: this.getActiveRun(userId),
+          ...errorChatId ? { chatId: errorChatId } : {}
+        }, userId);
+      }
       throw error;
     } finally {
-      if (this.pendingUsers.get(key) === controller) {
-        this.pendingUsers.delete(key);
-      }
-      if (runId && this.activeRuns.get(key)?.state.runId === runId) {
-        this.activeRuns.delete(key);
-        this.emitStatus(userId);
+      this.removePendingRun(key, pendingEntry);
+      if (runId && this.deleteActiveRun(key, runId)) {
+        if (controller.signal.aborted) {
+          wasAborted = true;
+        }
+        this.emitFrontend({
+          type: "gg:status",
+          run: this.getActiveRun(userId),
+          ...resolvedChatId ? { chatId: resolvedChatId } : {},
+          done: !wasAborted,
+          aborted: wasAborted
+        }, userId);
       }
     }
   }
@@ -1660,13 +2927,20 @@ class GuidedGenerationRunner {
       throw new Error("Missing required 'chat_mutation' permission for Guided Generations.");
     }
     const key = this.userKey(userId);
-    if (this.activeRuns.has(key) || this.pendingUsers.has(key)) {
+    const requestedChatId = typeof input.chatId === "string" && input.chatId.trim().length > 0 ? input.chatId.trim() : null;
+    if (this.isChatBusy(key, requestedChatId)) {
       throw new Error("A Guided Generations action is already running. Stop it before removing a continue.");
     }
-    const pendingController = new AbortController;
-    this.pendingUsers.set(key, pendingController);
+    const pendingEntry = {
+      ...requestedChatId ? { chatId: requestedChatId } : {}
+    };
+    this.addPendingRun(key, pendingEntry);
     try {
-      const { chatId } = await this.resolveChatContext(input.chatId, userId);
+      const { chatId } = await this.resolveChatContext(requestedChatId, userId);
+      pendingEntry.chatId = chatId;
+      if (this.isChatBusy(key, chatId, pendingEntry)) {
+        throw new Error("A Guided Generations action is already running. Stop it before removing a continue.");
+      }
       const target = await this.requireLastAssistantMessage(chatId);
       const { swipes, swipeDates, activeIndex } = normalizeMessageSwipes(target);
       const currentText = swipes[activeIndex] ?? target.content ?? "";
@@ -1704,28 +2978,41 @@ class GuidedGenerationRunner {
         text: entry.baseText
       };
     } finally {
-      if (this.pendingUsers.get(key) === pendingController) {
-        this.pendingUsers.delete(key);
-      }
+      this.removePendingRun(key, pendingEntry);
     }
   }
   async regenerateLastContinue(input = {}, userId) {
     const key = this.userKey(userId);
-    if (this.activeRuns.has(key) || this.pendingUsers.has(key)) {
+    const requestedChatId = typeof input.chatId === "string" && input.chatId.trim().length > 0 ? input.chatId.trim() : null;
+    if (this.isChatBusy(key, requestedChatId)) {
       throw new Error("A Guided Generations action is already running. Stop it before starting another.");
     }
     this.assertRequiredPermissions("guided_continue");
     const controller = new AbortController;
-    this.pendingUsers.set(key, controller);
+    const pendingEntry = {
+      controller,
+      ...requestedChatId ? { chatId: requestedChatId } : {}
+    };
+    this.addPendingRun(key, pendingEntry);
     let runId;
+    let resolvedChatId;
+    let wasAborted = false;
+    let emitErrorStatus = true;
     try {
       const settings = await this.store.getSettings(userId);
       const config = settings.actions.guided_continue;
       if (!config.enabled) {
         throw new Error("Guided Generations action 'guided_continue' is disabled in Settings.");
       }
-      const { chatId, characterId } = await this.resolveChatContext(input.chatId, userId);
+      const { chatId, characterId, characterName, avatarUrl } = await this.resolveChatContext(requestedChatId, userId);
+      resolvedChatId = chatId;
+      pendingEntry.chatId = chatId;
+      if (this.isChatBusy(key, chatId, pendingEntry)) {
+        emitErrorStatus = false;
+        throw new Error("A Guided Generations action is already running. Stop it before starting another.");
+      }
       if (controller.signal.aborted) {
+        wasAborted = true;
         const earlyRunId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
         return {
           runId: earlyRunId,
@@ -1747,6 +3034,7 @@ class GuidedGenerationRunner {
         throw new Error("The message was edited after the last continue; cannot safely regenerate it.");
       }
       if (controller.signal.aborted) {
+        wasAborted = true;
         const earlyRunId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
         return {
           runId: earlyRunId,
@@ -1770,17 +3058,20 @@ class GuidedGenerationRunner {
         metadata: target.metadata ? this.cloneRecord(target.metadata) : undefined
       };
       const activeRunId = runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      this.activeRuns.set(key, {
+      this.setActiveRun(key, {
         state: {
           runId: activeRunId,
           actionId: "guided_continue",
           chatId,
-          startedAt: Date.now()
+          startedAt: Date.now(),
+          ...characterId ? { characterId } : {},
+          ...characterName ? { characterName } : {},
+          ...avatarUrl ? { avatarUrl } : {}
         },
         controller
       });
-      this.pendingUsers.delete(key);
-      this.emitStatus(userId);
+      this.removePendingRun(key, pendingEntry);
+      this.emitStatus(userId, activeRunId);
       this.updateActiveRunState(userId, activeRunId, {
         messageId: target.id,
         swipeId: activeIndex
@@ -1791,6 +3082,7 @@ class GuidedGenerationRunner {
       const resolvedPresetId = presetContext.presetId;
       const metricsPreset = this.resolveMetricsPresetContext(presetContext, config.presetId, resolvedConnection);
       if (controller.signal.aborted) {
+        wasAborted = true;
         return {
           runId,
           actionId: "guided_continue",
@@ -1813,6 +3105,7 @@ class GuidedGenerationRunner {
         skipChunkRebuild: true
       }));
       let hadStreamOutput = false;
+      let didCommitHistory = false;
       try {
         const dryRunInput = buildDryRunInput({
           chatId,
@@ -1822,6 +3115,7 @@ class GuidedGenerationRunner {
         });
         const dryRunCapture = await this.runDryRunWithCapture(chatId, dryRunInput, userId);
         if (controller.signal.aborted) {
+          wasAborted = true;
           await this.restorePreRegenMessage(chatId, preRegen);
           return {
             runId,
@@ -1842,6 +3136,7 @@ class GuidedGenerationRunner {
           inputText: entry.inputText,
           connectionId,
           resolvedConnection,
+          resolvedPresetId,
           dryRunResult: dryRunCapture.result,
           capturedMessages: dryRunCapture.capturedMessages,
           signal: controller.signal,
@@ -1870,10 +3165,12 @@ class GuidedGenerationRunner {
             baseReasoningDuration: entry.baseReasoningDuration,
             inputText: entry.inputText
           }, userId);
+          didCommitHistory = true;
         }, () => {
           this.updateActiveRunState(userId, activeRunId, { hasContentOutput: true });
         });
         if (!streamRes.hasOutput) {
+          wasAborted = streamRes.aborted;
           await this.restorePreRegenMessage(chatId, preRegen);
           return {
             runId,
@@ -1895,6 +3192,7 @@ class GuidedGenerationRunner {
           baseReasoningDuration: entry.baseReasoningDuration,
           inputText: entry.inputText
         }, userId);
+        didCommitHistory = true;
         await this.emitMetricsForCompletedStream({
           chatId,
           userId,
@@ -1905,6 +3203,7 @@ class GuidedGenerationRunner {
           presetId: metricsPreset.presetId,
           presetName: metricsPreset.presetName
         });
+        wasAborted = streamRes.aborted;
         return {
           runId,
           actionId: "guided_continue",
@@ -1915,25 +3214,39 @@ class GuidedGenerationRunner {
           text: streamRes.finalText
         };
       } catch (error) {
-        if (!hadStreamOutput) {
+        if (!hadStreamOutput || !didCommitHistory) {
           await this.restorePreRegenMessage(chatId, preRegen);
         }
         throw error;
       }
     } catch (error) {
-      if (runId && this.activeRuns.get(key)?.state.runId === runId) {
-        this.activeRuns.delete(key);
+      if (runId) {
+        this.deleteActiveRun(key, runId);
       }
-      const message = error instanceof Error ? error.message : String(error);
-      this.emitFrontend({ type: "gg:status", error: message, run: null }, userId);
+      if (emitErrorStatus) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorChatId = resolvedChatId ?? requestedChatId ?? undefined;
+        this.emitFrontend({
+          type: "gg:status",
+          error: message,
+          run: this.getActiveRun(userId),
+          ...errorChatId ? { chatId: errorChatId } : {}
+        }, userId);
+      }
       throw error;
     } finally {
-      if (this.pendingUsers.get(key) === controller) {
-        this.pendingUsers.delete(key);
-      }
-      if (runId && this.activeRuns.get(key)?.state.runId === runId) {
-        this.activeRuns.delete(key);
-        this.emitStatus(userId);
+      this.removePendingRun(key, pendingEntry);
+      if (runId && this.deleteActiveRun(key, runId)) {
+        if (controller.signal.aborted) {
+          wasAborted = true;
+        }
+        this.emitFrontend({
+          type: "gg:status",
+          run: this.getActiveRun(userId),
+          ...resolvedChatId ? { chatId: resolvedChatId } : {},
+          done: !wasAborted,
+          aborted: wasAborted
+        }, userId);
       }
     }
   }
@@ -1947,11 +3260,14 @@ class GuidedGenerationRunner {
       inputText,
       connectionId,
       resolvedConnection,
+      resolvedPresetId,
       dryRunResult,
       capturedMessages,
       signal,
       createdMessageId,
-      targetAssistantId
+      targetAssistantId,
+      skipBlankAssistantStrip,
+      targetSwipeIsBlank
     } = args;
     const { model, provider } = resolveEffectiveModelAndProvider({
       configuredModel: config.model,
@@ -1960,12 +3276,17 @@ class GuidedGenerationRunner {
       dryRunModel: dryRunResult.model,
       dryRunProvider: dryRunResult.provider
     });
-    const rawAssembled = this.mergeDryRunAndCapturedMessages(dryRunResult, capturedMessages);
+    const {
+      messages: rawAssembled,
+      reapplyRoleMerge,
+      applyEmptyFilter,
+      collapseToSingleRole
+    } = this.mergeDryRunAndCapturedMessages(dryRunResult, capturedMessages);
     let isChatHistory = resolveChatHistoryFlags(rawAssembled, {
       breakdown: dryRunResult.breakdown
     });
     if (!isChatHistory) {
-      const effectivePresetId = config.presetId ?? resolvedConnection?.preset_id ?? null;
+      const effectivePresetId = config.presetId ?? resolvedPresetId ?? resolvedConnection?.preset_id ?? null;
       const presetBlocks = await this.fetchPresetBlocksFallback(effectivePresetId, userId);
       if (presetBlocks && presetBlocks.length > 0) {
         isChatHistory = resolveChatHistoryFlags(rawAssembled, {
@@ -1975,14 +3296,32 @@ class GuidedGenerationRunner {
       }
     }
     let assembledMessages = rawAssembled;
-    if (actionId === "guided_response" || actionId === "guided_regenerate") {
+    if (!skipBlankAssistantStrip && (actionId === "guided_response" || actionId === "guided_regenerate")) {
       const stripped = stripCreatedBlankAssistantTurnWithHistory(rawAssembled, createdMessageId, isChatHistory);
       assembledMessages = stripped.messages;
       isChatHistory = stripped.isChatHistory;
     } else if (actionId === "guided_swipe") {
-      const stripped = stripRejectedSwipeAssistantTurnWithHistory(rawAssembled, targetAssistantId, isChatHistory);
+      const stripped = stripRejectedSwipeAssistantTurnWithHistory(rawAssembled, targetAssistantId, isChatHistory, ...targetSwipeIsBlank ? [{ requireBlankFallback: true }] : []);
       assembledMessages = stripped.messages;
       isChatHistory = stripped.isChatHistory;
+    }
+    if (applyEmptyFilter) {
+      const keptMessages = [];
+      const hasAlignedFlags = Array.isArray(isChatHistory) && isChatHistory.length === assembledMessages.length;
+      const keptFlags = hasAlignedFlags ? [] : undefined;
+      for (let i = 0;i < assembledMessages.length; i += 1) {
+        const msg = assembledMessages[i];
+        if (hasNonEmptyLlmContent(msg)) {
+          keptMessages.push(msg);
+          if (keptFlags) {
+            keptFlags.push(Boolean(isChatHistory[i]));
+          }
+        }
+      }
+      assembledMessages = keptMessages;
+      if (keptFlags) {
+        isChatHistory = keptFlags;
+      }
     }
     const resolveMacros = this.createRegexMacroResolver(chatId, characterId, userId);
     const resolvedTemplate = await this.resolveInstructionTemplate(config.instructionTemplate, { chatId, characterId, userId });
@@ -2018,8 +3357,23 @@ class GuidedGenerationRunner {
       guidanceDepth: config.guidanceDepth,
       isChatHistory
     });
-    const messages = stripInternalMessageMarkers(injectedMessages);
-    const transformResponseOutput = config.applyRegex ? async ({ deltaText, reasoningText }) => {
+    const postProcessedMessages = reapplyRoleMerge ? mergeConsecutiveSameRoleMessages(injectedMessages) : injectedMessages;
+    const filteredMessages = applyEmptyFilter ? postProcessedMessages.filter(hasNonEmptyLlmContent) : postProcessedMessages;
+    const collapsedMessages = collapseToSingleRole ? collapseMessagesToSingleRole(filteredMessages, collapseToSingleRole) : filteredMessages;
+    const messages = stripInternalMessageMarkers(collapsedMessages);
+    const transformResponseOutput = config.applyRegex ? async ({ deltaText, reasoningText, baseText }) => {
+      if (baseText) {
+        const regexedDelta = await applyRegexScripts(deltaText, responseScripts, "ai_output", 0, { resolveMacros });
+        const healedFinal = healFormattingArtifacts(stitchContinueContent(baseText, regexedDelta));
+        const processedReasoning = reasoningText.length > 0 ? await applyRegexScripts(reasoningText, responseScripts, "reasoning", 0, {
+          resolveMacros
+        }) : reasoningText;
+        return {
+          deltaText: regexedDelta,
+          reasoningText: processedReasoning,
+          finalText: healedFinal
+        };
+      }
       const processed = await processResponseOutput({
         content: deltaText,
         ...reasoningText ? { reasoning: reasoningText } : {},
@@ -2067,23 +3421,37 @@ class GuidedGenerationRunner {
     }
   }
   async resolveChatContext(requestedChatId, userId) {
+    let chat = null;
     if (requestedChatId) {
-      const chat = await this.spindle.chats.get(requestedChatId, userId);
+      chat = await this.spindle.chats.get(requestedChatId, userId);
       if (!chat) {
         throw new Error("The requested chat is no longer available.");
       }
-      return {
-        chatId: chat.id,
-        ...typeof chat.character_id === "string" && chat.character_id ? { characterId: chat.character_id } : {}
-      };
+    } else {
+      chat = await this.spindle.chats.getActive(userId);
+      if (!chat) {
+        throw new Error("Open a chat before running a Guided Generations action.");
+      }
     }
-    const active = await this.spindle.chats.getActive(userId);
-    if (!active) {
-      throw new Error("Open a chat before running a Guided Generations action.");
+    const characterId = typeof chat.character_id === "string" && chat.character_id ? chat.character_id : undefined;
+    let characterName;
+    const avatarUrl = characterId ? `/api/v1/characters/${encodeURIComponent(characterId)}/avatar?thumb=1` : undefined;
+    if (characterId && this.spindle.permissions?.has?.("characters")) {
+      const charactersApi = this.spindle.characters;
+      if (typeof charactersApi?.get === "function") {
+        try {
+          const character = await charactersApi.get(characterId, userId);
+          if (typeof character?.name === "string" && character.name.trim().length > 0) {
+            characterName = character.name.trim();
+          }
+        } catch {}
+      }
     }
     return {
-      chatId: active.id,
-      ...typeof active.character_id === "string" && active.character_id ? { characterId: active.character_id } : {}
+      chatId: chat.id,
+      ...characterId ? { characterId } : {},
+      ...characterName ? { characterName } : {},
+      ...avatarUrl ? { avatarUrl } : {}
     };
   }
   mergeDryRunAndCapturedMessages(dryRunResult, capturedMessages) {
@@ -2091,32 +3459,100 @@ class GuidedGenerationRunner {
     if (Array.isArray(requestMessages)) {
       const reqHasMetadata = requestMessages.some((m) => typeof m.__isChatHistory === "boolean" || typeof m.__chatHistorySource === "boolean" || typeof m.sourceMessageId === "string" && m.sourceMessageId.length > 0 || typeof m.__sourceMessageId === "string" && m.__sourceMessageId.length > 0);
       if (capturedMessages && capturedMessages.length > 0) {
+        const copyFlagsFromCapture = (msg, cap) => ({
+          ...msg,
+          ...msg.__isChatHistory === undefined && cap.__isChatHistory !== undefined ? { __isChatHistory: cap.__isChatHistory } : {},
+          ...msg.__isWorldInfoEntry === undefined && cap.__isWorldInfoEntry !== undefined ? { __isWorldInfoEntry: cap.__isWorldInfoEntry } : {},
+          ...msg.__chatHistorySource === undefined && cap.__chatHistorySource !== undefined ? { __chatHistorySource: cap.__chatHistorySource } : {},
+          ...msg.__worldInfoSource === undefined && cap.__worldInfoSource !== undefined ? { __worldInfoSource: cap.__worldInfoSource } : {},
+          ...msg.sourceMessageId === undefined && cap.sourceMessageId !== undefined ? { sourceMessageId: cap.sourceMessageId } : {},
+          ...msg.__sourceMessageId === undefined && cap.__sourceMessageId !== undefined ? { __sourceMessageId: cap.__sourceMessageId } : {},
+          ...msg.sourceIndexInChat === undefined && cap.sourceIndexInChat !== undefined ? { sourceIndexInChat: cap.sourceIndexInChat } : {},
+          ...msg.__sourceIndexInChat === undefined && cap.__sourceIndexInChat !== undefined ? { __sourceIndexInChat: cap.__sourceIndexInChat } : {}
+        });
         if (capturedMessages.length === requestMessages.length) {
-          return requestMessages.map((msg, idx) => {
-            const cap = capturedMessages[idx];
-            return {
-              ...msg,
-              ...msg.__isChatHistory === undefined && cap.__isChatHistory !== undefined ? { __isChatHistory: cap.__isChatHistory } : {},
-              ...msg.__isWorldInfoEntry === undefined && cap.__isWorldInfoEntry !== undefined ? { __isWorldInfoEntry: cap.__isWorldInfoEntry } : {},
-              ...msg.__chatHistorySource === undefined && cap.__chatHistorySource !== undefined ? { __chatHistorySource: cap.__chatHistorySource } : {},
-              ...msg.__worldInfoSource === undefined && cap.__worldInfoSource !== undefined ? { __worldInfoSource: cap.__worldInfoSource } : {},
-              ...msg.sourceMessageId === undefined && cap.sourceMessageId !== undefined ? { sourceMessageId: cap.sourceMessageId } : {},
-              ...msg.__sourceMessageId === undefined && cap.__sourceMessageId !== undefined ? { __sourceMessageId: cap.__sourceMessageId } : {},
-              ...msg.sourceIndexInChat === undefined && cap.sourceIndexInChat !== undefined ? { sourceIndexInChat: cap.sourceIndexInChat } : {},
-              ...msg.__sourceIndexInChat === undefined && cap.__sourceIndexInChat !== undefined ? { __sourceIndexInChat: cap.__sourceIndexInChat } : {}
-            };
+          return {
+            messages: requestMessages.map((msg, idx) => copyFlagsFromCapture(msg, capturedMessages[idx])),
+            reapplyRoleMerge: false,
+            applyEmptyFilter: false
+          };
+        }
+        const filteredIndices = [];
+        for (let i = 0;i < capturedMessages.length; i += 1) {
+          if (hasNonEmptyLlmContent(capturedMessages[i])) {
+            filteredIndices.push(i);
+          }
+        }
+        const matchesFilteredCapture = filteredIndices.length === requestMessages.length && filteredIndices.every((capIdx, reqIdx) => capturedMessages[capIdx].role === requestMessages[reqIdx].role);
+        if (matchesFilteredCapture) {
+          const reqIdxByCapIdx = new Map;
+          filteredIndices.forEach((capIdx, reqIdx) => {
+            reqIdxByCapIdx.set(capIdx, reqIdx);
           });
+          const reconstructed = capturedMessages.map((cap, capIdx) => {
+            const reqIdx = reqIdxByCapIdx.get(capIdx);
+            if (reqIdx === undefined) {
+              return { ...cap };
+            }
+            const req = requestMessages[reqIdx];
+            return copyFlagsFromCapture({
+              ...cap,
+              role: req.role,
+              content: req.content,
+              ...req.name !== undefined ? { name: req.name } : {},
+              ...req.partial !== undefined ? { partial: req.partial } : {}
+            }, cap);
+          });
+          return {
+            messages: reconstructed,
+            reapplyRoleMerge: false,
+            applyEmptyFilter: true
+          };
+        }
+        const mergedFilteredCapture = mergeConsecutiveSameRoleMessages(capturedMessages).filter(hasNonEmptyLlmContent);
+        const didMergeConsecutiveRoles = capturedMessages.length > requestMessages.length && mergedFilteredCapture.length === requestMessages.length && mergedFilteredCapture.every((msg, idx) => msg.role === requestMessages[idx]?.role);
+        if (didMergeConsecutiveRoles) {
+          return {
+            messages: capturedMessages,
+            reapplyRoleMerge: true,
+            applyEmptyFilter: true
+          };
+        }
+        const singleCollapsedRole = requestMessages.length === 1 && capturedMessages.length > 1 && !reqHasMetadata && (requestMessages[0]?.role === "system" || requestMessages[0]?.role === "user") ? requestMessages[0].role : undefined;
+        if (singleCollapsedRole) {
+          return {
+            messages: capturedMessages,
+            reapplyRoleMerge: false,
+            applyEmptyFilter: true,
+            collapseToSingleRole: singleCollapsedRole
+          };
         }
         if (!reqHasMetadata) {
-          return capturedMessages;
+          return {
+            messages: capturedMessages,
+            reapplyRoleMerge: false,
+            applyEmptyFilter: true
+          };
         }
       }
-      return requestMessages;
+      return {
+        messages: requestMessages,
+        reapplyRoleMerge: false,
+        applyEmptyFilter: false
+      };
     }
     if (capturedMessages && capturedMessages.length > 0) {
-      return capturedMessages;
+      return {
+        messages: capturedMessages,
+        reapplyRoleMerge: false,
+        applyEmptyFilter: false
+      };
     }
-    return dryRunResult.messages;
+    return {
+      messages: dryRunResult.messages,
+      reapplyRoleMerge: false,
+      applyEmptyFilter: false
+    };
   }
   async fetchPresetBlocksFallback(presetId, userId) {
     if (!presetId || !this.spindle.permissions?.has?.("presets")) {
@@ -2287,19 +3723,46 @@ class GuidedGenerationRunner {
       this.spindle.log?.warn?.(`[GuidedGenerations] Failed emitting generation metrics: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  createGuidedSwipeSession(chatId, targetMessage) {
+  createGuidedSwipeSession(chatId, targetMessage, sessionUserId, callbacks) {
     const { swipes, swipeDates, activeIndex } = normalizeMessageSwipes(targetMessage);
-    const newSwipeIndex = swipes.length;
-    const slotSwipes = [...swipes, ""];
-    const slotSwipeDates = [...swipeDates, Math.floor(Date.now() / 1000)];
+    let initialSwipeId = activeIndex;
+    let targetSwipeIndex = swipes.length;
+    let targetDeleted = false;
+    let slotCreated = false;
+    let slotSwipes = [...swipes, ""];
+    let slotSwipeDates = [...swipeDates, Math.floor(Date.now() / 1000)];
+    let initialExtra = targetMessage.extra ? this.cloneRecord(targetMessage.extra) : {};
+    let initialMetadata = targetMessage.metadata ? this.cloneRecord(targetMessage.metadata) : undefined;
     let currentViewedSwipeId = activeIndex;
     let swipeEventSeq = 0;
     let finalizing = false;
     let triggerFlush = null;
-    const swipeDisposer = this.spindle.on?.("MESSAGE_SWIPED", (payload) => {
+    const swipeDisposer = this.spindle.on?.("MESSAGE_SWIPED", (payload, eventUserId) => {
+      if (sessionUserId && eventUserId && eventUserId !== sessionUserId) {
+        return;
+      }
       const event = payload;
       if (!event || event.chatId !== chatId || event.message?.id !== targetMessage.id) {
         return;
+      }
+      if (event.action === "deleted" && typeof event.swipeId === "number" && Number.isFinite(event.swipeId)) {
+        const deletedIdx = Math.floor(event.swipeId);
+        if (deletedIdx < initialSwipeId) {
+          initialSwipeId = Math.max(0, initialSwipeId - 1);
+        }
+        if (deletedIdx < targetSwipeIndex) {
+          if (slotCreated && deletedIdx >= 0 && deletedIdx < slotSwipes.length) {
+            slotSwipes.splice(deletedIdx, 1);
+            slotSwipeDates.splice(deletedIdx, 1);
+          }
+          targetSwipeIndex = Math.max(0, targetSwipeIndex - 1);
+          if (slotCreated) {
+            callbacks?.onTargetSwipeIndexChanged?.(targetSwipeIndex);
+          }
+        } else if (slotCreated && deletedIdx === targetSwipeIndex) {
+          targetDeleted = true;
+          callbacks?.onTargetDeleted?.();
+        }
       }
       const nextSwipeId = typeof event.message?.swipe_id === "number" && Number.isFinite(event.message.swipe_id) ? Math.floor(event.message.swipe_id) : typeof event.swipeId === "number" && Number.isFinite(event.swipeId) ? Math.floor(event.swipeId) : undefined;
       if (nextSwipeId === undefined)
@@ -2307,22 +3770,66 @@ class GuidedGenerationRunner {
       swipeEventSeq += 1;
       const previousViewed = currentViewedSwipeId;
       currentViewedSwipeId = nextSwipeId;
-      if (!finalizing && nextSwipeId === newSwipeIndex && previousViewed !== newSwipeIndex) {
+      if (!finalizing && !targetDeleted && nextSwipeId === targetSwipeIndex && previousViewed !== targetSwipeIndex) {
         triggerFlush?.();
+      }
+    });
+    const swipeEditedDisposer = this.spindle.on?.("SWIPE_EDITED", (payload, eventUserId) => {
+      if (sessionUserId && eventUserId && eventUserId !== sessionUserId) {
+        return;
+      }
+      const event = payload;
+      if (!event || event.chatId !== chatId || event.message?.id !== targetMessage.id) {
+        return;
+      }
+      if (typeof event.message?.swipe_id === "number" && Number.isFinite(event.message.swipe_id)) {
+        swipeEventSeq += 1;
+        currentViewedSwipeId = Math.floor(event.message.swipe_id);
       }
     });
     return {
       targetAssistantId: targetMessage.id,
-      initialSwipeId: activeIndex,
-      newSwipeIndex,
-      swipes: slotSwipes,
-      swipeDates: slotSwipeDates,
-      initialExtra: targetMessage.extra ? this.cloneRecord(targetMessage.extra) : {},
+      get initialSwipeId() {
+        return initialSwipeId;
+      },
+      get newSwipeIndex() {
+        return targetSwipeIndex;
+      },
+      get swipes() {
+        return slotSwipes;
+      },
+      get swipeDates() {
+        return slotSwipeDates;
+      },
+      get initialExtra() {
+        return initialExtra;
+      },
+      get initialMetadata() {
+        return initialMetadata;
+      },
+      getTargetSwipeIndex: () => targetSwipeIndex,
+      isTargetDeleted: () => targetDeleted,
       getCurrentViewedSwipeId: () => currentViewedSwipeId,
       setCurrentViewedSwipeId: (id) => {
         currentViewedSwipeId = id;
       },
       getSwipeEventSeq: () => swipeEventSeq,
+      syncFromLatestMessage: (latest) => {
+        const latestNorm = normalizeMessageSwipes(latest);
+        const hadEvents = swipeEventSeq > 0;
+        initialSwipeId = latestNorm.activeIndex;
+        if (!hadEvents) {
+          currentViewedSwipeId = latestNorm.activeIndex;
+        }
+        targetSwipeIndex = latestNorm.swipes.length;
+        slotSwipes = [...latestNorm.swipes, ""];
+        slotSwipeDates = [...latestNorm.swipeDates, Math.floor(Date.now() / 1000)];
+        initialExtra = latest.extra ? this.cloneRecord(latest.extra) : {};
+        initialMetadata = latest.metadata ? this.cloneRecord(latest.metadata) : undefined;
+      },
+      markSlotCreated: () => {
+        slotCreated = true;
+      },
       setTriggerFlush: (trigger) => {
         triggerFlush = trigger;
       },
@@ -2333,8 +3840,46 @@ class GuidedGenerationRunner {
         if (typeof swipeDisposer === "function") {
           swipeDisposer();
         }
+        if (typeof swipeEditedDisposer === "function") {
+          swipeEditedDisposer();
+        }
       }
     };
+  }
+  async rollbackUnstartedSwipeSlot(chatId, swipeSession) {
+    if (swipeSession.isTargetDeleted())
+      return;
+    try {
+      const messages = await this.spindle.chat.getMessages(chatId);
+      const current = messages.find((m) => m.id === swipeSession.targetAssistantId);
+      if (!current)
+        return;
+      const normalized = normalizeMessageSwipes(current);
+      const targetIdx = swipeSession.getTargetSwipeIndex();
+      if (targetIdx < 0 || targetIdx >= normalized.swipes.length)
+        return;
+      if ((normalized.swipes[targetIdx] ?? "") !== "")
+        return;
+      const nextSwipes = [
+        ...normalized.swipes.slice(0, targetIdx),
+        ...normalized.swipes.slice(targetIdx + 1)
+      ];
+      if (nextSwipes.length === 0)
+        return;
+      const nextDates = [
+        ...normalized.swipeDates.slice(0, targetIdx),
+        ...normalized.swipeDates.slice(targetIdx + 1)
+      ];
+      const restoredSwipeId = Math.max(0, Math.min(swipeSession.initialSwipeId, nextSwipes.length - 1));
+      await this.spindle.chat.updateMessage(chatId, swipeSession.targetAssistantId, {
+        content: nextSwipes[restoredSwipeId] ?? "",
+        swipes: nextSwipes,
+        swipe_id: restoredSwipeId,
+        swipe_dates: nextDates,
+        metadata: swipeSession.initialMetadata ?? {},
+        skipChunkRebuild: true
+      });
+    } catch {}
   }
   cloneRecord(record) {
     try {
@@ -2373,7 +3918,8 @@ class GuidedGenerationRunner {
       const hasPerSwipeReasoning = Array.isArray(snapshot.extra?.reasoningBySwipe) || Array.isArray(snapshot.extra?.reasoningDurationBySwipe);
       const rawReasoning = snapshot.extra?.reasoning;
       const rawDuration = snapshot.extra?.reasoningDuration ?? snapshot.extra?.reasoning_duration;
-      const hasReasoning = typeof rawReasoning === "string" || typeof rawDuration === "number";
+      const validDuration = typeof rawDuration === "number" && Number.isFinite(rawDuration) && rawDuration >= 0 ? rawDuration : undefined;
+      const hasReasoning = typeof rawReasoning === "string" || validDuration !== undefined;
       if (hasMultipleSwipes || hasSwipeDates || hasPerSwipeReasoning || hasReasoning) {
         const { swipes, swipeDates, activeIndex } = normalizeMessageSwipes(snapshot);
         const swipeReasoning = hasPerSwipeReasoning ? swipes.map((_, idx) => {
@@ -2383,19 +3929,19 @@ class GuidedGenerationRunner {
             ...r.duration !== null ? { duration: r.duration } : {}
           } : null;
         }) : undefined;
-        await this.spindle.chat.updateMessage(chatId, restored.id, {
+        const patch = {
           content: snapshot.content ?? swipes[activeIndex] ?? "",
           swipes,
           swipe_id: activeIndex,
           swipe_dates: swipeDates,
-          ...swipeReasoning ? { swipe_reasoning: swipeReasoning } : {},
-          ...hasReasoning ? {
+          ...swipeReasoning ? { swipe_reasoning: swipeReasoning } : hasReasoning ? {
             reasoning: {
               ...typeof rawReasoning === "string" ? { text: rawReasoning } : {},
-              ...typeof rawDuration === "number" ? { duration: rawDuration } : {}
+              ...validDuration !== undefined ? { duration: validDuration } : {}
             }
           } : {}
-        });
+        };
+        await this.spindle.chat.updateMessage(chatId, restored.id, patch);
       }
       await this.store.rebindContinueHistoryMessageId(chatId, snapshot.id, restored.id, userId);
     } catch (restoreError) {
@@ -2417,7 +3963,7 @@ class GuidedGenerationRunner {
         swipeDates,
         reasoningText: preRegen.reasoning,
         reasoningDuration: preRegen.reasoningDuration,
-        ...preRegen.metadata !== undefined ? { metadata: preRegen.metadata } : {},
+        metadata: preRegen.metadata ?? {},
         skipChunkRebuild: false
       }));
     } catch (restoreError) {
@@ -2551,7 +4097,7 @@ class GuidedGenerationRunner {
       const baseTarget = {
         messageId: swipeSession.targetAssistantId,
         swipes: swipeSession.swipes,
-        swipeIndex: swipeSession.newSwipeIndex,
+        swipeIndex: swipeSession.getTargetSwipeIndex(),
         swipeDates: swipeSession.swipeDates,
         baseText: "",
         latestSwipeId: swipeSession.getCurrentViewedSwipeId(),
@@ -2564,14 +4110,27 @@ class GuidedGenerationRunner {
       }
       return refreshed;
     }, async (current) => {
+      if (swipeSession.isTargetDeleted()) {
+        return current;
+      }
+      const nextCurrent = {
+        ...current,
+        swipeIndex: swipeSession.getTargetSwipeIndex()
+      };
       const seqBeforeRead = swipeSession.getSwipeEventSeq();
-      const refreshed = await this.refreshSwipeTarget(chatId, current);
+      const refreshed = await this.refreshSwipeTarget(chatId, nextCurrent, () => swipeSession.isTargetDeleted());
       if (swipeSession.getSwipeEventSeq() === seqBeforeRead && refreshed.latestSwipeId !== undefined) {
         swipeSession.setCurrentViewedSwipeId(refreshed.latestSwipeId);
       }
       return refreshed;
     }, transformOutput, {
-      isViewingTargetSwipe: () => swipeSession.getCurrentViewedSwipeId() === swipeSession.newSwipeIndex,
+      isViewingTargetSwipe: () => !swipeSession.isTargetDeleted() && swipeSession.getCurrentViewedSwipeId() === swipeSession.getTargetSwipeIndex(),
+      isTargetDeleted: () => swipeSession.isTargetDeleted(),
+      getTargetSwipeState: () => ({
+        swipeIndex: swipeSession.getTargetSwipeIndex(),
+        swipes: swipeSession.swipes,
+        swipeDates: swipeSession.swipeDates
+      }),
       setTriggerFlush: (trigger) => {
         swipeSession.setTriggerFlush(trigger);
       },
@@ -2660,7 +4219,10 @@ class GuidedGenerationRunner {
   async streamIntoMessage(chatId, rawInput, signal, ensureTarget, refreshTarget, transformOutput, swipeOptions, onFirstOutput, onPartialErrorCommit, onFirstContent) {
     let deltaText = "";
     let reasoningText = "";
+    let finalOverrideText = null;
     let forceReasoningPatch = false;
+    let reasoningStartedAt;
+    let reasoningEndedAt;
     let aborted = false;
     let lastFlushAt = 0;
     let flushChain = Promise.resolve();
@@ -2668,7 +4230,19 @@ class GuidedGenerationRunner {
     let target = null;
     let notifiedFirstOutput = false;
     let notifiedFirstContent = false;
-    const buildMergedContent = (baseText) => baseText ? stitchContinueContent(baseText, deltaText) : deltaText;
+    const buildMergedContent = (baseText) => finalOverrideText !== null ? finalOverrideText : baseText ? stitchContinueContent(baseText, deltaText) : deltaText;
+    const getReasoningDurationPatch = (baseText, includeReasoning) => {
+      if (!includeReasoning) {
+        return {};
+      }
+      if (reasoningText.length === 0) {
+        return baseText.length > 0 || forceReasoningPatch ? { reasoningDuration: null } : {};
+      }
+      if (reasoningStartedAt !== undefined && reasoningEndedAt !== undefined) {
+        return { reasoningDuration: Math.max(0, reasoningEndedAt - reasoningStartedAt) };
+      }
+      return baseText.length > 0 ? { reasoningDuration: null } : {};
+    };
     const runUpdatePatch = async (messageId, patch, swallowError) => {
       try {
         await this.spindle.chat.updateMessage(chatId, messageId, patch);
@@ -2680,25 +4254,45 @@ class GuidedGenerationRunner {
       }
     };
     const enqueuePatchFlush = (targetSnapshot, swallowError, options = {}) => {
-      const mergedContent = buildMergedContent(targetSnapshot.baseText);
+      if (swipeOptions?.isTargetDeleted?.()) {
+        return;
+      }
+      const liveSwipeState = swipeOptions?.getTargetSwipeState?.();
+      const effectiveSnapshot = liveSwipeState ? {
+        ...targetSnapshot,
+        swipeIndex: liveSwipeState.swipeIndex,
+        swipes: liveSwipeState.swipes,
+        swipeDates: liveSwipeState.swipeDates
+      } : targetSnapshot;
+      const mergedContent = buildMergedContent(effectiveSnapshot.baseText);
+      const includeReasoning = Boolean(reasoningText || forceReasoningPatch);
       const patch = buildActiveSwipePatch({
-        swipes: targetSnapshot.swipes,
-        swipeIndex: targetSnapshot.swipeIndex,
+        swipes: effectiveSnapshot.swipes,
+        swipeIndex: effectiveSnapshot.swipeIndex,
         content: mergedContent,
-        swipeDates: targetSnapshot.swipeDates,
-        ...reasoningText || forceReasoningPatch ? { reasoningText } : {},
+        swipeDates: effectiveSnapshot.swipeDates,
+        ...includeReasoning ? {
+          reasoningText,
+          ...getReasoningDurationPatch(effectiveSnapshot.baseText, includeReasoning)
+        } : {},
         ...options.skipChunkRebuild !== undefined ? { skipChunkRebuild: options.skipChunkRebuild } : {}
       });
       flushChain = flushChain.catch(() => {
         return;
       }).then(async () => {
+        if (swipeOptions?.isTargetDeleted?.()) {
+          return;
+        }
         if (options.checkStillViewingMidstream && swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
           return;
         }
-        await runUpdatePatch(targetSnapshot.messageId, patch, swallowError);
+        await runUpdatePatch(effectiveSnapshot.messageId, patch, swallowError);
       });
     };
     const enqueueFinalFlush = (targetSnapshot, swallowError) => {
+      if (swipeOptions?.isTargetDeleted?.()) {
+        return;
+      }
       if (!swipeOptions) {
         enqueuePatchFlush(targetSnapshot, swallowError, {
           skipChunkRebuild: false
@@ -2711,14 +4305,21 @@ class GuidedGenerationRunner {
       flushChain = flushChain.catch(() => {
         return;
       }).then(async () => {
+        if (swipeOptions.isTargetDeleted?.()) {
+          return;
+        }
         const isViewingTarget = swipeOptions.isViewingTargetSwipe();
         if (isViewingTarget) {
+          const includeActiveReasoning = Boolean(capturedReasoning || capturedForceReasoning);
           const patch = buildActiveSwipePatch({
             swipes: targetSnapshot.swipes,
             swipeIndex: targetSnapshot.swipeIndex,
             content: capturedDelta,
             swipeDates: targetSnapshot.swipeDates,
-            ...capturedReasoning || capturedForceReasoning ? { reasoningText: capturedReasoning } : {},
+            ...includeActiveReasoning ? {
+              reasoningText: capturedReasoning,
+              ...getReasoningDurationPatch(targetSnapshot.baseText, includeActiveReasoning)
+            } : {},
             skipChunkRebuild: false
           });
           await runUpdatePatch(targetSnapshot.messageId, patch, swallowError);
@@ -2727,6 +4328,8 @@ class GuidedGenerationRunner {
         const existingBySwipe = targetSnapshot.latestExtra?.reasoningBySwipe;
         const hadStoredSlotReasoning = Array.isArray(existingBySwipe) && existingBySwipe[targetSnapshot.swipeIndex] != null;
         const includeReasoning = capturedReasoning.length > 0 || capturedForceReasoning && hadStoredSlotReasoning;
+        const durationPatch = getReasoningDurationPatch(targetSnapshot.baseText, includeReasoning);
+        const bgReasoningDuration = typeof durationPatch.reasoningDuration === "number" && durationPatch.reasoningDuration > 0 ? durationPatch.reasoningDuration : undefined;
         const patch = buildBackgroundSwipePatch({
           swipes: targetSnapshot.swipes,
           swipeIndex: targetSnapshot.swipeIndex,
@@ -2734,6 +4337,7 @@ class GuidedGenerationRunner {
           swipeDates: targetSnapshot.swipeDates,
           ...includeReasoning ? {
             reasoningText: capturedReasoning,
+            ...bgReasoningDuration !== undefined ? { reasoningDuration: bgReasoningDuration } : {},
             clearReasoningSlot: capturedForceReasoning && capturedReasoning.length === 0,
             existingExtra: targetSnapshot.latestExtra,
             existingActiveSwipeId: targetSnapshot.latestSwipeId
@@ -2745,8 +4349,19 @@ class GuidedGenerationRunner {
     const maybeFlush = (force) => {
       if (!target)
         return;
+      if (swipeOptions?.isTargetDeleted?.())
+        return;
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe())
         return;
+      const liveSwipeState = swipeOptions?.getTargetSwipeState?.();
+      if (liveSwipeState) {
+        target = {
+          ...target,
+          swipeIndex: liveSwipeState.swipeIndex,
+          swipes: liveSwipeState.swipes,
+          swipeDates: liveSwipeState.swipeDates
+        };
+      }
       const now = Date.now();
       if (!force && now - lastFlushAt < STREAM_FLUSH_INTERVAL_MS)
         return;
@@ -2760,6 +4375,9 @@ class GuidedGenerationRunner {
     const ensureInitializedOnOutput = async () => {
       if (deltaText.length === 0 && reasoningText.length === 0)
         return;
+      if (!target) {
+        target = await ensureTarget();
+      }
       if (!notifiedFirstOutput) {
         notifiedFirstOutput = true;
         onFirstOutput?.();
@@ -2768,9 +4386,6 @@ class GuidedGenerationRunner {
         notifiedFirstContent = true;
         onFirstContent?.();
       }
-      if (target)
-        return;
-      target = await ensureTarget();
     };
     const wasStreaming = rawInput.parameters?._streaming !== false;
     let streamingStartedAt = Date.now();
@@ -2804,6 +4419,10 @@ class GuidedGenerationRunner {
           maybeFlush(false);
         } else if (chunk.type === "reasoning") {
           const receivedAt = Date.now();
+          if (reasoningStartedAt === undefined) {
+            reasoningStartedAt = receivedAt;
+          }
+          reasoningEndedAt = receivedAt;
           if (chunk.token.length > 0 && firstTokenAt === undefined) {
             firstTokenAt = receivedAt;
           }
@@ -2831,18 +4450,20 @@ class GuidedGenerationRunner {
         aborted = true;
       } else {
         swipeOptions?.onFinalizing?.();
-        if (target && (deltaText.length > 0 || reasoningText.length > 0)) {
+        if (target && !swipeOptions?.isTargetDeleted?.() && (deltaText.length > 0 || reasoningText.length > 0)) {
           await flushChain.catch(() => {
             return;
           });
-          if (refreshTarget) {
+          if (refreshTarget && !swipeOptions?.isTargetDeleted?.()) {
             target = await refreshTarget(target).catch(() => target);
           }
-          enqueueFinalFlush(target, true);
+          if (!swipeOptions?.isTargetDeleted?.()) {
+            enqueueFinalFlush(target, false);
+          }
           await flushChain.catch(() => {
             return;
           });
-          if (onPartialErrorCommit) {
+          if (!lastFlushError && !swipeOptions?.isTargetDeleted?.() && onPartialErrorCommit) {
             await Promise.resolve(onPartialErrorCommit({
               messageId: target.messageId,
               swipeId: target.swipeIndex,
@@ -2863,7 +4484,8 @@ class GuidedGenerationRunner {
     const rawDeltaText = deltaText;
     const hasReasoning = reasoningText.length > 0;
     const hasOutput = deltaText.length > 0 || reasoningText.length > 0;
-    if (!hasOutput || !target) {
+    let resolvedTarget = target;
+    if (!hasOutput || !resolvedTarget || swipeOptions?.isTargetDeleted?.()) {
       await flushChain.catch(() => {
         return;
       });
@@ -2871,26 +4493,58 @@ class GuidedGenerationRunner {
         finalText: "",
         rawDeltaText,
         hasReasoning,
-        aborted,
+        aborted: aborted || signal.aborted || Boolean(swipeOptions?.isTargetDeleted?.()),
         hasOutput: false
       };
     }
     if (transformOutput) {
       const hadReasoning = reasoningText.length > 0;
-      const transformed = await transformOutput({ deltaText, reasoningText });
+      const transformed = await transformOutput({
+        deltaText,
+        reasoningText,
+        ...resolvedTarget.baseText ? { baseText: resolvedTarget.baseText } : {}
+      });
       deltaText = transformed.deltaText;
       reasoningText = transformed.reasoningText;
+      if (typeof transformed.finalText === "string") {
+        finalOverrideText = transformed.finalText;
+      }
       if (hadReasoning && reasoningText.length === 0) {
         forceReasoningPatch = true;
       }
     }
+    if (swipeOptions?.isTargetDeleted?.()) {
+      await flushChain.catch(() => {
+        return;
+      });
+      return {
+        finalText: "",
+        rawDeltaText,
+        hasReasoning,
+        aborted: true,
+        hasOutput: false
+      };
+    }
     if (refreshTarget) {
       await flushChain;
-      target = await refreshTarget(target);
+      resolvedTarget = await refreshTarget(resolvedTarget);
+      target = resolvedTarget;
     }
-    enqueueFinalFlush(target, false);
+    if (swipeOptions?.isTargetDeleted?.()) {
+      await flushChain.catch(() => {
+        return;
+      });
+      return {
+        finalText: "",
+        rawDeltaText,
+        hasReasoning,
+        aborted: true,
+        hasOutput: false
+      };
+    }
+    enqueueFinalFlush(resolvedTarget, false);
     await flushChain;
-    if (lastFlushError && !aborted) {
+    if (lastFlushError) {
       throw lastFlushError;
     }
     if (!aborted && !signal.aborted) {
@@ -2898,10 +4552,10 @@ class GuidedGenerationRunner {
     } else if (signal.aborted) {
       aborted = true;
     }
-    const finalText = buildMergedContent(target.baseText);
+    const finalText = buildMergedContent(resolvedTarget.baseText);
     return {
-      messageId: target.messageId,
-      swipeId: target.swipeIndex,
+      messageId: resolvedTarget.messageId,
+      swipeId: resolvedTarget.swipeIndex,
       finalText,
       rawDeltaText,
       hasReasoning,
@@ -2918,9 +4572,15 @@ class GuidedGenerationRunner {
       }
     };
   }
-  async refreshSwipeTarget(chatId, current) {
+  async refreshSwipeTarget(chatId, current, isTargetDeleted) {
+    if (isTargetDeleted?.()) {
+      return current;
+    }
     try {
       const messages = await this.spindle.chat.getMessages(chatId);
+      if (isTargetDeleted?.()) {
+        return current;
+      }
       const latest = messages.find((m) => m.id === current.messageId);
       if (!latest)
         return current;
@@ -2961,8 +4621,15 @@ class GuidedGenerationRunner {
     }
     return target;
   }
-  emitStatus(userId) {
-    this.emitFrontend({ type: "gg:status", run: this.getActiveRun(userId) }, userId);
+  emitStatus(userId, runId) {
+    const key = this.userKey(userId);
+    const active = runId ? this.activeRuns.get(key)?.get(runId)?.state : undefined;
+    const run = active ? { ...active } : this.getActiveRun(userId);
+    this.emitFrontend({
+      type: "gg:status",
+      run,
+      ...run?.chatId ? { chatId: run.chatId } : {}
+    }, userId);
   }
 }
 
@@ -3051,11 +4718,12 @@ function appendRecoveryEntry(entries, next, maxEntries) {
   if (entries[0]?.text === text) {
     return [...entries].slice(0, limit);
   }
+  const trimmedChatId = typeof next.chatId === "string" && next.chatId.trim().length > 0 ? next.chatId.trim() : null;
   const entry = {
     id: next.id ?? `rec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     text,
     actionId: next.actionId,
-    chatId: next.chatId ?? null,
+    chatId: trimmedChatId,
     createdAt: next.createdAt ?? Date.now()
   };
   return [entry, ...entries].slice(0, limit);
@@ -3119,9 +4787,15 @@ class SettingsStore {
   settingsCache = new Map;
   recoveryCache = new Map;
   continueHistoryCache = new Map;
+  settingsVersions = new Map;
+  recoveryVersions = new Map;
+  continueVersions = new Map;
   writeQueues = new Map;
   constructor(spindle2) {
     this.spindle = spindle2;
+  }
+  bumpVersion(versions, key) {
+    versions.set(key, (versions.get(key) ?? 0) + 1);
   }
   userKey(userId) {
     return userId && userId.length > 0 ? userId : "__default__";
@@ -3181,20 +4855,30 @@ class SettingsStore {
       if (rechecked)
         return this.cloneSettings(rechecked);
     }
+    const versionBeforeRead = this.settingsVersions.get(key) ?? 0;
+    let resolved;
     try {
       if (await this.spindle.userStorage.exists(SETTINGS_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(SETTINGS_FILE, userId);
-        const parsed = normalizeSettings(JSON.parse(raw));
-        this.settingsCache.set(key, parsed);
-        return this.cloneSettings(parsed);
+        resolved = normalizeSettings(JSON.parse(raw));
+      } else {
+        resolved = createDefaultSettings();
       }
     } catch (error) {
       this.spindle.log.warn(`[GuidedGenerations] Failed reading settings, using defaults: ${error instanceof Error ? error.message : String(error)}`);
       return createDefaultSettings();
     }
-    const defaults = createDefaultSettings();
-    this.settingsCache.set(key, defaults);
-    return this.cloneSettings(defaults);
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.settingsCache.get(key);
+    if (concurrentCached) {
+      return this.cloneSettings(concurrentCached);
+    }
+    if ((this.settingsVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.settingsCache.set(key, resolved);
+    }
+    return this.cloneSettings(resolved);
   }
   async saveSettingsWithMeta(next, userId) {
     return this.enqueueUserWrite(userId, async () => {
@@ -3202,13 +4886,13 @@ class SettingsStore {
       const normalized = normalizeSettings(next);
       await this.spindle.userStorage.write(SETTINGS_FILE, JSON.stringify(normalized, null, 2), userId);
       this.settingsCache.set(key, normalized);
+      this.bumpVersion(this.settingsVersions, key);
       const currentRecovery = await this.readRawRecoveryUnlocked(userId, true);
       const recoveryPruned = currentRecovery.length > normalized.inputRecovery.maxEntries;
       const trimmed = currentRecovery.slice(0, normalized.inputRecovery.maxEntries);
       if (recoveryPruned) {
         await this.writeRecoveryUnlocked(trimmed, userId);
       }
-      this.recoveryCache.set(key, trimmed.map((e) => ({ ...e })));
       return {
         settings: this.cloneSettings(normalized),
         recoveryPruned,
@@ -3253,48 +4937,41 @@ class SettingsStore {
       if (rechecked)
         return rechecked.map((e) => ({ ...e }));
     }
+    const versionBeforeRead = this.recoveryVersions.get(key) ?? 0;
+    let parsed;
     try {
       if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
-        const parsed = normalizeRecoveryList(JSON.parse(raw), 50);
-        this.recoveryCache.set(key, parsed.map((e) => ({ ...e })));
-        return parsed.map((e) => ({ ...e }));
+        parsed = normalizeRecoveryList(JSON.parse(raw), 50);
+      } else {
+        parsed = [];
       }
     } catch (error) {
       this.spindle.log.warn(`[GuidedGenerations] Failed reading recovery history: ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
-    this.recoveryCache.set(key, []);
-    return [];
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.recoveryCache.get(key);
+    if (concurrentCached) {
+      return concurrentCached.map((e) => ({ ...e }));
+    }
+    if ((this.recoveryVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.recoveryCache.set(key, parsed.map((e) => ({ ...e })));
+    }
+    return parsed.map((e) => ({ ...e }));
   }
   async readRecoveryUnlocked(userId, maxEntries, skipWriteWait = false) {
-    const key = this.userKey(userId);
-    const cached = this.recoveryCache.get(key);
-    if (cached)
-      return cached.slice(0, maxEntries).map((e) => ({ ...e }));
-    if (!skipWriteWait) {
-      await this.waitForPendingWrites(key);
-      const rechecked = this.recoveryCache.get(key);
-      if (rechecked)
-        return rechecked.slice(0, maxEntries).map((e) => ({ ...e }));
-    }
-    try {
-      if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
-        const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
-        const parsed = normalizeRecoveryList(JSON.parse(raw), maxEntries);
-        this.recoveryCache.set(key, parsed.map((e) => ({ ...e })));
-        return parsed.map((e) => ({ ...e }));
-      }
-    } catch (error) {
-      this.spindle.log.warn(`[GuidedGenerations] Failed reading recovery history: ${error instanceof Error ? error.message : String(error)}`);
-      return [];
-    }
-    this.recoveryCache.set(key, []);
-    return [];
+    const limit = Number.isFinite(maxEntries) ? Math.max(1, Math.floor(maxEntries)) : 10;
+    const all = await this.readRawRecoveryUnlocked(userId, skipWriteWait);
+    return all.slice(0, limit);
   }
   async writeRecoveryUnlocked(entries, userId) {
+    const key = this.userKey(userId);
     await this.spindle.userStorage.write(RECOVERY_FILE, JSON.stringify(entries, null, 2), userId);
-    this.recoveryCache.set(this.userKey(userId), entries.map((e) => ({ ...e })));
+    this.recoveryCache.set(key, entries.map((e) => ({ ...e })));
+    this.bumpVersion(this.recoveryVersions, key);
   }
   async getContinueHistory(userId) {
     const entries = await this.readContinueHistoryUnlocked(userId, false);
@@ -3371,23 +5048,36 @@ class SettingsStore {
       if (rechecked)
         return rechecked.map((entry) => ({ ...entry }));
     }
+    const versionBeforeRead = this.continueVersions.get(key) ?? 0;
+    let parsed;
     try {
       if (await this.spindle.userStorage.exists(CONTINUE_HISTORY_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(CONTINUE_HISTORY_FILE, userId);
-        const parsed = normalizeContinueHistoryList(JSON.parse(raw), MAX_CONTINUE_ENTRIES);
-        this.continueHistoryCache.set(key, parsed.map((entry) => ({ ...entry })));
-        return parsed.map((entry) => ({ ...entry }));
+        parsed = normalizeContinueHistoryList(JSON.parse(raw), MAX_CONTINUE_ENTRIES);
+      } else {
+        parsed = [];
       }
     } catch (error) {
       this.spindle.log.warn(`[GuidedGenerations] Failed reading continue history: ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
-    this.continueHistoryCache.set(key, []);
-    return [];
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.continueHistoryCache.get(key);
+    if (concurrentCached) {
+      return concurrentCached.map((entry) => ({ ...entry }));
+    }
+    if ((this.continueVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.continueHistoryCache.set(key, parsed.map((entry) => ({ ...entry })));
+    }
+    return parsed.map((entry) => ({ ...entry }));
   }
   async writeContinueHistoryUnlocked(entries, userId) {
+    const key = this.userKey(userId);
     await this.spindle.userStorage.write(CONTINUE_HISTORY_FILE, JSON.stringify(entries, null, 2), userId);
-    this.continueHistoryCache.set(this.userKey(userId), entries.map((entry) => ({ ...entry })));
+    this.continueHistoryCache.set(key, entries.map((entry) => ({ ...entry })));
+    this.bumpVersion(this.continueVersions, key);
   }
   async listConnections(userId) {
     const { items } = await this.fetchConnections(userId);
@@ -3482,6 +5172,7 @@ function registerBackend(api) {
     api.sendToFrontend(event, userId);
   }
   const runner = new GuidedGenerationRunner(api, store, emitFrontend);
+  runner.syncInterceptorRegistration();
   async function buildBootstrapView(userId) {
     const [settings, catalogs, recovery] = await Promise.all([
       store.getSettings(userId),
@@ -3494,10 +5185,12 @@ function registerBackend(api) {
       presets: catalogs.presets,
       recovery,
       activeRun: runner.getActiveRun(userId),
+      activeRuns: runner.getActiveRuns(userId),
       permissions: {
         generation: api.permissions.has("generation"),
         chats: api.permissions.has("chats"),
         chat_mutation: api.permissions.has("chat_mutation"),
+        characters: api.permissions.has("characters"),
         presets: api.permissions.has("presets"),
         regex_scripts: api.permissions.has("regex_scripts"),
         interceptor: api.permissions.has("interceptor")
@@ -3521,6 +5214,9 @@ function registerBackend(api) {
           return;
         }
         case "save_settings": {
+          if (!isRecord2(req.input)) {
+            throw new Error("Invalid settings payload: expected an object.");
+          }
           const { settings, recoveryPruned, recovery } = await store.saveSettingsWithMeta(req.input, userId);
           if (recoveryPruned) {
             emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
@@ -3536,7 +5232,9 @@ function registerBackend(api) {
         }
         case "abort_action": {
           const record = isRecord2(req.input) ? req.input : {};
-          const aborted = runner.abortCurrent(userId, typeof record.runId === "string" ? record.runId : undefined);
+          const runId = typeof record.runId === "string" && record.runId.trim().length > 0 ? record.runId.trim() : undefined;
+          const chatId = typeof record.chatId === "string" && record.chatId.trim().length > 0 ? record.chatId.trim() : undefined;
+          const aborted = runner.abortCurrent(userId, runId, chatId);
           reply({ aborted });
           return;
         }
@@ -3553,10 +5251,11 @@ function registerBackend(api) {
             reply(await store.getRecovery(userId));
             return;
           }
+          const rawChatId = typeof record.chatId === "string" ? record.chatId.trim() : "";
           const recovery = await store.pushRecovery({
             text,
             actionId,
-            chatId: typeof record.chatId === "string" ? record.chatId : null
+            chatId: rawChatId.length > 0 ? rawChatId : null
           }, userId);
           emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
           reply(recovery);
@@ -3604,6 +5303,7 @@ function registerBackend(api) {
     handleRpc(req, userId);
   }));
   disposers.push(api.permissions.onChanged((arg1, arg2) => {
+    runner.syncInterceptorRegistration();
     const userId = typeof arg1 === "string" && arg1.length > 0 ? arg1 : typeof arg2 === "string" && arg2.length > 0 ? arg2 : isRecord2(arg1) && typeof arg1.userId === "string" && arg1.userId.length > 0 ? arg1.userId : undefined;
     emitFrontend({ type: "gg:changed", reason: "permissions" }, userId);
   }));

@@ -1,3 +1,841 @@
+// src/frontend/chat-head.ts
+var STORAGE_POS_KEY = "gg:chatHeadsPos";
+var NATIVE_STORAGE_POS_KEY = "lumiverse:chatHeadsPos";
+var DEFAULT_POS = { xPct: 94, yPct: 22 };
+var DRAG_THRESHOLD_PX = 6;
+var HEAD_SIZE_PX = 48;
+var HEAD_GAP_PX = 10;
+var ROOT_PAD_PX = 6;
+var VIEWPORT_PAD_PX = 12;
+var NATIVE_COLLISION_GAP_PX = 8;
+var SUPPRESS_CLICK_FALLBACK_MS = 350;
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function clamp(value, min, max) {
+  if (!Number.isFinite(value))
+    return min;
+  if (min > max)
+    return (min + max) / 2;
+  return Math.max(min, Math.min(max, value));
+}
+function clampPct(value, min = 2, max = 98) {
+  return clamp(value, min, max);
+}
+function isThenable(value) {
+  return Boolean(value) && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
+}
+function extractChatIdFromEventPayload(rawPayload) {
+  if (!isRecord(rawPayload))
+    return null;
+  if (typeof rawPayload.chatId === "string" && rawPayload.chatId) {
+    return rawPayload.chatId;
+  }
+  if (typeof rawPayload.id === "string" && rawPayload.id) {
+    return rawPayload.id;
+  }
+  if (isRecord(rawPayload.chat) && typeof rawPayload.chat.id === "string" && rawPayload.chat.id) {
+    return rawPayload.chat.id;
+  }
+  return null;
+}
+function computeInitials(label) {
+  const cleaned = label.trim();
+  if (!cleaned)
+    return "GG";
+  const words = cleaned.split(/[\s_-]+/).filter(Boolean);
+  if (words.length >= 2) {
+    return `${words[0][0] ?? ""}${words[1][0] ?? ""}`.toUpperCase();
+  }
+  return cleaned.slice(0, 2).toUpperCase();
+}
+function buildDefaultAvatarUrl(characterId) {
+  return `/api/v1/characters/${encodeURIComponent(characterId)}/avatar?thumb=1`;
+}
+function sanitizeAvatarUrl(raw) {
+  if (typeof raw !== "string")
+    return;
+  const trimmed = raw.trim();
+  if (!trimmed)
+    return;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+    return trimmed;
+  }
+  if (/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?,/i.test(trimmed)) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return trimmed;
+    }
+  } catch {}
+  return;
+}
+function boxesOverlap(a, b, gap = 0) {
+  return !(a.right + gap <= b.left || a.left >= b.right + gap || a.bottom + gap <= b.top || a.top >= b.bottom + gap);
+}
+
+class ChatHeadController {
+  ctx;
+  heads = new Map;
+  characterCache = new Map;
+  pendingCharacterFetches = new Set;
+  disposers = [];
+  rootEl = null;
+  resizeCleanup = null;
+  dragCleanup = null;
+  suppressClickTimer = null;
+  suppressNextClick = false;
+  pos;
+  destroyed = false;
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.pos = this.loadPosition();
+    if (typeof this.ctx.events?.on === "function") {
+      try {
+        this.disposers.push(this.ctx.events.on("CHAT_DELETED", (payload) => {
+          this.onChatDeleted(extractChatIdFromEventPayload(payload));
+        }));
+      } catch {}
+    }
+  }
+  syncRuns(runs, activeChatId) {
+    if (this.destroyed)
+      return;
+    const currentActiveChatId = activeChatId !== undefined ? activeChatId : this.safeGetActiveChatId();
+    if (currentActiveChatId) {
+      const activeHead = this.heads.get(currentActiveChatId);
+      if (activeHead?.status === "completed") {
+        this.heads.delete(currentActiveChatId);
+      }
+    }
+    const incomingByChat = new Map;
+    for (const rawRun of runs) {
+      const run = rawRun;
+      if (run && typeof run.chatId === "string" && run.chatId.length > 0) {
+        incomingByChat.set(run.chatId, run);
+      }
+    }
+    for (const [chatId, existing] of [...this.heads.entries()]) {
+      if (existing.status === "completed")
+        continue;
+      if (!incomingByChat.has(chatId)) {
+        this.heads.delete(chatId);
+      }
+    }
+    for (const [, run] of incomingByChat.entries()) {
+      this.upsertFromActiveRun(run, currentActiveChatId);
+    }
+    this.render(currentActiveChatId);
+  }
+  handleStatusEvent(event, activeChatId) {
+    if (this.destroyed)
+      return;
+    const currentActiveChatId = activeChatId !== undefined ? activeChatId : this.safeGetActiveChatId();
+    const eventChatId = typeof event.chatId === "string" && event.chatId.length > 0 ? event.chatId : undefined;
+    const run = event.run ?? null;
+    const hasTerminalSignal = Boolean(event.done) || Boolean(event.aborted) || Boolean(event.error);
+    if (eventChatId && (hasTerminalSignal || !run || run.chatId !== eventChatId)) {
+      this.finalizeChatRun(eventChatId, {
+        aborted: Boolean(event.aborted),
+        hasError: Boolean(event.error)
+      }, currentActiveChatId);
+    }
+    if (run && typeof run.chatId === "string" && run.chatId.length > 0) {
+      if (!hasTerminalSignal || eventChatId !== undefined && run.chatId !== eventChatId) {
+        this.upsertFromActiveRun(run, currentActiveChatId);
+      } else if (!eventChatId && hasTerminalSignal) {
+        this.finalizeChatRun(run.chatId, {
+          aborted: Boolean(event.aborted),
+          hasError: Boolean(event.error)
+        }, currentActiveChatId);
+      }
+    } else if (!eventChatId) {
+      for (const [chatId, entry] of [...this.heads.entries()]) {
+        if (entry.status === "running" || entry.status === "streaming") {
+          this.finalizeChatRun(chatId, {
+            aborted: Boolean(event.aborted),
+            hasError: Boolean(event.error)
+          }, currentActiveChatId);
+        }
+      }
+    }
+    this.render(currentActiveChatId);
+  }
+  onChatChanged(activeChatId) {
+    if (this.destroyed)
+      return;
+    const currentActiveChatId = activeChatId !== undefined ? activeChatId : this.safeGetActiveChatId();
+    if (currentActiveChatId) {
+      const existing = this.heads.get(currentActiveChatId);
+      if (existing?.status === "completed") {
+        this.heads.delete(currentActiveChatId);
+      }
+    }
+    this.render(currentActiveChatId);
+  }
+  onChatDeleted(chatId) {
+    if (this.destroyed || !chatId)
+      return;
+    if (this.heads.delete(chatId)) {
+      this.render();
+    }
+  }
+  destroy() {
+    if (this.destroyed)
+      return;
+    this.destroyed = true;
+    this.clearDragSession();
+    this.clearResizeListener();
+    this.clearSuppressClickTimer();
+    this.suppressNextClick = false;
+    for (const dispose of this.disposers) {
+      try {
+        dispose();
+      } catch {}
+    }
+    this.disposers.length = 0;
+    this.heads.clear();
+    this.pendingCharacterFetches.clear();
+    if (this.rootEl) {
+      this.rootEl.remove();
+      this.rootEl = null;
+    }
+  }
+  upsertFromActiveRun(run, currentActiveChatId) {
+    const existing = this.heads.get(run.chatId);
+    const activeChatMeta = currentActiveChatId === run.chatId ? this.safeGetActiveChat() : null;
+    const characterId = (typeof run.characterId === "string" && run.characterId.length > 0 ? run.characterId : undefined) ?? existing?.characterId ?? (typeof activeChatMeta?.characterId === "string" && activeChatMeta.characterId.length > 0 ? activeChatMeta.characterId : undefined);
+    const cached = characterId ? this.characterCache.get(characterId) : undefined;
+    const characterName = (typeof run.characterName === "string" && run.characterName.trim().length > 0 ? run.characterName.trim() : undefined) ?? existing?.characterName ?? cached?.name;
+    const avatarUrl = sanitizeAvatarUrl(run.avatarUrl) ?? sanitizeAvatarUrl(existing?.avatarUrl) ?? sanitizeAvatarUrl(cached?.avatarUrl) ?? (characterId ? buildDefaultAvatarUrl(characterId) : undefined);
+    const status = run.hasContentOutput ? "streaming" : "running";
+    const nextEntry = {
+      chatId: run.chatId,
+      runId: run.runId,
+      status,
+      startedAt: run.startedAt,
+      ...characterId ? { characterId } : {},
+      ...characterName ? { characterName } : {},
+      ...avatarUrl ? { avatarUrl } : {},
+      ...existing?.avatarFailed && existing.avatarUrl === avatarUrl ? { avatarFailed: true } : {}
+    };
+    this.heads.set(run.chatId, nextEntry);
+    if (characterId && !characterName && !this.characterCache.has(characterId)) {
+      this.resolveCharacterMeta(run.chatId, characterId);
+    }
+  }
+  finalizeChatRun(chatId, outcome, currentActiveChatId) {
+    const existing = this.heads.get(chatId);
+    if (outcome.aborted || outcome.hasError || currentActiveChatId === chatId) {
+      this.heads.delete(chatId);
+      return;
+    }
+    if (existing) {
+      this.heads.set(chatId, {
+        ...existing,
+        status: "completed"
+      });
+    } else {
+      this.heads.set(chatId, {
+        chatId,
+        runId: `gg-completed-${chatId}`,
+        status: "completed",
+        startedAt: Date.now()
+      });
+    }
+  }
+  async resolveCharacterMeta(chatId, characterId) {
+    if (this.destroyed || !characterId)
+      return;
+    if (this.pendingCharacterFetches.has(characterId) || this.characterCache.has(characterId)) {
+      return;
+    }
+    const charactersApi = this.ctx.characters;
+    if (typeof charactersApi?.get !== "function")
+      return;
+    this.pendingCharacterFetches.add(characterId);
+    try {
+      const raw = await Promise.resolve(charactersApi.get(characterId));
+      if (this.destroyed)
+        return;
+      if (!isRecord(raw)) {
+        this.characterCache.set(characterId, {});
+        return;
+      }
+      const name = typeof raw.name === "string" && raw.name.trim().length > 0 ? raw.name.trim() : undefined;
+      const defaultAvatar = buildDefaultAvatarUrl(characterId);
+      const customAvatar = sanitizeAvatarUrl(raw.avatarUrl) ?? sanitizeAvatarUrl(raw.avatar_url);
+      const safeAvatar = customAvatar ?? defaultAvatar;
+      this.characterCache.set(characterId, {
+        ...name ? { name } : {},
+        avatarUrl: safeAvatar
+      });
+      const entry = this.heads.get(chatId);
+      if (entry && entry.characterId === characterId) {
+        let changed = false;
+        if (name && !entry.characterName) {
+          entry.characterName = name;
+          changed = true;
+        }
+        if (customAvatar && (!entry.avatarUrl || entry.avatarUrl === defaultAvatar)) {
+          if (entry.avatarUrl !== customAvatar) {
+            entry.avatarUrl = customAvatar;
+            delete entry.avatarFailed;
+            changed = true;
+          }
+        } else if (safeAvatar && !entry.avatarUrl) {
+          entry.avatarUrl = safeAvatar;
+          changed = true;
+        }
+        if (changed) {
+          this.render();
+        }
+      }
+    } catch {
+      if (!this.destroyed) {
+        this.characterCache.set(characterId, {});
+      }
+    } finally {
+      this.pendingCharacterFetches.delete(characterId);
+    }
+  }
+  render(activeChatId) {
+    if (this.destroyed)
+      return;
+    if (typeof document === "undefined" || !document.body)
+      return;
+    const currentActiveChatId = activeChatId !== undefined ? activeChatId : this.safeGetActiveChatId();
+    const visibleEntries = [];
+    for (const entry of this.heads.values()) {
+      if (entry.chatId === currentActiveChatId)
+        continue;
+      if (this.hasNativeChatHead(entry.chatId))
+        continue;
+      visibleEntries.push(entry);
+    }
+    if (visibleEntries.length === 0) {
+      this.clearDragSession();
+      this.clearResizeListener();
+      if (this.rootEl) {
+        this.rootEl.remove();
+        this.rootEl = null;
+      }
+      return;
+    }
+    if (!this.rootEl) {
+      this.rootEl = document.createElement("div");
+      this.rootEl.className = "gg-chat-heads-root";
+      this.rootEl.setAttribute("data-gg-chat-heads-root", "true");
+      this.attachDragHandlers(this.rootEl);
+      this.ensureResizeListener();
+    }
+    const items = visibleEntries.map((entry) => this.buildHeadItem(entry));
+    this.rootEl.replaceChildren(...items);
+    this.applyRootPosition(this.rootEl, visibleEntries.length);
+    if (!this.rootEl.isConnected) {
+      document.body.append(this.rootEl);
+    }
+  }
+  buildHeadItem(entry) {
+    const item = document.createElement("div");
+    item.className = "gg-chat-head-item";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "gg-chat-head";
+    if (entry.status === "running" || entry.status === "streaming") {
+      btn.classList.add("is-running");
+    }
+    if (entry.status === "streaming") {
+      btn.classList.add("is-streaming");
+    }
+    if (entry.status === "completed") {
+      btn.classList.add("is-completed");
+    }
+    btn.setAttribute("data-gg-chat-head", "true");
+    btn.setAttribute("data-chat-id", entry.chatId);
+    btn.setAttribute("data-status", entry.status);
+    const displayName = entry.characterName || entry.chatId;
+    const statusDescription = entry.status === "completed" ? "Generation completed — click to open chat" : entry.status === "streaming" ? "Streaming response in background — click to open chat" : "Generating response in background — click to open chat";
+    const fullLabel = `${displayName}: ${statusDescription}`;
+    btn.setAttribute("aria-label", fullLabel);
+    btn.title = fullLabel;
+    const effectiveAvatarUrl = sanitizeAvatarUrl(entry.avatarUrl) ?? (entry.characterId ? buildDefaultAvatarUrl(entry.characterId) : undefined);
+    if (effectiveAvatarUrl && !entry.avatarFailed) {
+      const img = document.createElement("img");
+      img.className = "gg-chat-head-avatar";
+      img.src = effectiveAvatarUrl;
+      img.alt = displayName;
+      img.draggable = false;
+      img.addEventListener("error", () => {
+        if (this.destroyed)
+          return;
+        const current = this.heads.get(entry.chatId);
+        if (current) {
+          current.avatarFailed = true;
+        }
+        if (img.isConnected) {
+          const initials = document.createElement("span");
+          initials.className = "gg-chat-head-initials";
+          initials.textContent = computeInitials(displayName);
+          img.replaceWith(initials);
+        }
+      });
+      btn.append(img);
+    } else {
+      const initials = document.createElement("span");
+      initials.className = "gg-chat-head-initials";
+      initials.textContent = computeInitials(displayName);
+      btn.append(initials);
+    }
+    const badge = document.createElement("span");
+    badge.className = "gg-chat-head-badge";
+    badge.setAttribute("aria-hidden", "true");
+    btn.append(badge);
+    if (entry.status === "completed") {
+      const pip = document.createElement("span");
+      pip.className = "gg-chat-head-pip";
+      pip.setAttribute("aria-hidden", "true");
+      btn.append(pip);
+      btn.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.dismissCompletedHead(entry.chatId);
+      });
+    }
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (this.suppressNextClick) {
+        this.suppressNextClick = false;
+        this.clearSuppressClickTimer();
+        return;
+      }
+      this.navigateToChat(entry.chatId, () => {
+        if (this.destroyed)
+          return;
+        const latest = this.heads.get(entry.chatId);
+        if (latest?.status === "completed") {
+          this.heads.delete(entry.chatId);
+          this.render();
+        }
+      });
+    });
+    item.append(btn);
+    if (entry.status === "completed") {
+      const dismissBtn = document.createElement("button");
+      dismissBtn.type = "button";
+      dismissBtn.className = "gg-chat-head-dismiss";
+      dismissBtn.setAttribute("data-gg-chat-head-dismiss", "true");
+      dismissBtn.setAttribute("aria-label", `Dismiss ${displayName}`);
+      dismissBtn.title = "Dismiss";
+      dismissBtn.textContent = "×";
+      dismissBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.dismissCompletedHead(entry.chatId);
+      });
+      item.append(dismissBtn);
+    }
+    return item;
+  }
+  dismissCompletedHead(chatId) {
+    if (this.destroyed)
+      return;
+    const entry = this.heads.get(chatId);
+    if (entry?.status === "completed") {
+      this.heads.delete(chatId);
+      this.render();
+    }
+  }
+  isNativeChatHeadElement(el) {
+    if (el.hasAttribute("data-gg-chat-head"))
+      return false;
+    if (el.closest("[data-gg-chat-heads-root]"))
+      return false;
+    if (el.hasAttribute("data-head-idx"))
+      return true;
+    if (el.hasAttribute("data-chat-head"))
+      return true;
+    const parent = el.parentElement;
+    if (parent && parent.parentElement === document.body) {
+      const cls = typeof parent.className === "string" ? parent.className : "";
+      if (parent.querySelector("[data-head-idx]") !== null || /ChatHeads/i.test(cls)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  hasNativeChatHead(chatId) {
+    if (typeof document === "undefined" || !document.body)
+      return false;
+    const candidates = document.body.querySelectorAll("[data-chat-id]");
+    for (const el of candidates) {
+      if (el.getAttribute("data-chat-id") === chatId && this.isNativeChatHeadElement(el)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  findNativeChatHeadsContainer() {
+    if (typeof document === "undefined" || !document.body)
+      return null;
+    const firstHead = document.body.querySelector("[data-head-idx][data-chat-id]:not([data-gg-chat-head]), [data-chat-head][data-chat-id]:not([data-gg-chat-head])");
+    if (!firstHead || firstHead.closest("[data-gg-chat-heads-root]")) {
+      return null;
+    }
+    const parent = firstHead.parentElement;
+    if (!parent || parent === document.body)
+      return firstHead;
+    return parent;
+  }
+  getViewportSize() {
+    const win = typeof window !== "undefined" ? window : typeof document !== "undefined" ? document.defaultView : null;
+    const vw = win && typeof win.innerWidth === "number" && win.innerWidth > 0 ? win.innerWidth : (typeof document !== "undefined" ? document.documentElement?.clientWidth : 0) || 1024;
+    const vh = win && typeof win.innerHeight === "number" && win.innerHeight > 0 ? win.innerHeight : (typeof document !== "undefined" ? document.documentElement?.clientHeight : 0) || 768;
+    return { vw, vh };
+  }
+  getStackDimensions(headCount, vh) {
+    const count = Math.max(1, headCount);
+    const rawWidth = HEAD_SIZE_PX + ROOT_PAD_PX * 2;
+    const rawHeight = count * HEAD_SIZE_PX + Math.max(0, count - 1) * HEAD_GAP_PX + ROOT_PAD_PX * 2;
+    const maxHeight = Math.max(HEAD_SIZE_PX + ROOT_PAD_PX * 2, vh - VIEWPORT_PAD_PX * 2);
+    return {
+      width: rawWidth,
+      height: Math.min(rawHeight, maxHeight)
+    };
+  }
+  clampCenterPos(pos, headCount) {
+    const { vw, vh } = this.getViewportSize();
+    const { width, height } = this.getStackDimensions(headCount, vh);
+    const minX = VIEWPORT_PAD_PX + width / 2;
+    const maxX = vw - VIEWPORT_PAD_PX - width / 2;
+    const minY = VIEWPORT_PAD_PX + height / 2;
+    const maxY = vh - VIEWPORT_PAD_PX - height / 2;
+    const cx = clamp(pos.xPct / 100 * vw, minX, maxX);
+    const cy = clamp(pos.yPct / 100 * vh, minY, maxY);
+    return {
+      xPct: cx / vw * 100,
+      yPct: cy / vh * 100
+    };
+  }
+  resolveNativeBounds(container, vw, vh) {
+    try {
+      const rect = container.getBoundingClientRect?.();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        return {
+          left: rect.left,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom
+        };
+      }
+    } catch {}
+    const nativeHeads = container.querySelectorAll("[data-head-idx], [data-chat-head]");
+    const nativeCount = Math.max(1, nativeHeads.length);
+    const isRow = container.style?.flexDirection === "row";
+    const estWidth = isRow ? nativeCount * HEAD_SIZE_PX + Math.max(0, nativeCount - 1) * 8 + 12 : HEAD_SIZE_PX + 12;
+    const estHeight = isRow ? HEAD_SIZE_PX + 12 : nativeCount * HEAD_SIZE_PX + Math.max(0, nativeCount - 1) * 8 + 12;
+    const styleLeft = parseFloat(container.style?.left ?? "");
+    const styleTop = parseFloat(container.style?.top ?? "");
+    if (Number.isFinite(styleLeft) && Number.isFinite(styleTop) && styleLeft >= 0 && styleTop >= 0) {
+      return {
+        left: styleLeft,
+        top: styleTop,
+        right: styleLeft + estWidth,
+        bottom: styleTop + estHeight
+      };
+    }
+    const stored = this.readNativeStoredPosition();
+    if (stored) {
+      let left;
+      let top;
+      if (stored.xPct < 0 || stored.yPct < 0) {
+        left = vw - estWidth - VIEWPORT_PAD_PX;
+        top = Math.round((vh - estHeight) / 2);
+      } else if (stored.xPct <= 1 && stored.yPct <= 1) {
+        left = clamp(stored.xPct * vw, VIEWPORT_PAD_PX, vw - estWidth - VIEWPORT_PAD_PX);
+        top = clamp(stored.yPct * vh, VIEWPORT_PAD_PX, vh - estHeight - VIEWPORT_PAD_PX);
+      } else {
+        left = clamp(stored.xPct / 100 * vw, VIEWPORT_PAD_PX, vw - estWidth - VIEWPORT_PAD_PX);
+        top = clamp(stored.yPct / 100 * vh, VIEWPORT_PAD_PX, vh - estHeight - VIEWPORT_PAD_PX);
+      }
+      return {
+        left,
+        top,
+        right: left + estWidth,
+        bottom: top + estHeight
+      };
+    }
+    const defaultLeft = vw - estWidth - VIEWPORT_PAD_PX;
+    const defaultTop = Math.round((vh - estHeight) / 2);
+    return {
+      left: defaultLeft,
+      top: defaultTop,
+      right: defaultLeft + estWidth,
+      bottom: defaultTop + estHeight
+    };
+  }
+  readNativeStoredPosition() {
+    try {
+      const storage = this.getStorage();
+      const raw = storage?.getItem(NATIVE_STORAGE_POS_KEY);
+      if (!raw)
+        return null;
+      const parsed = JSON.parse(raw);
+      if (isRecord(parsed) && typeof parsed.xPct === "number" && Number.isFinite(parsed.xPct) && typeof parsed.yPct === "number" && Number.isFinite(parsed.yPct)) {
+        return { xPct: parsed.xPct, yPct: parsed.yPct };
+      }
+    } catch {}
+    return null;
+  }
+  attachDragHandlers(root) {
+    root.addEventListener("click", () => {
+      if (this.suppressNextClick) {
+        this.suppressNextClick = false;
+        this.clearSuppressClickTimer();
+      }
+    });
+    root.addEventListener("pointerdown", (event) => {
+      if (this.destroyed)
+        return;
+      if (event.pointerType === "mouse" && event.button !== 0)
+        return;
+      if (typeof document === "undefined")
+        return;
+      const target = event.target;
+      if (target?.closest?.("[data-gg-chat-head-dismiss]")) {
+        return;
+      }
+      this.clearSuppressClickTimer();
+      this.suppressNextClick = false;
+      this.clearDragSession();
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startPos = { ...this.pos };
+      let moved = false;
+      const onPointerMove = (moveEvent) => {
+        if (moveEvent.pointerId !== pointerId)
+          return;
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        if (!moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
+          moved = true;
+          this.suppressNextClick = true;
+          try {
+            root.setPointerCapture?.(pointerId);
+          } catch {}
+        }
+        if (!moved)
+          return;
+        const { vw, vh } = this.getViewportSize();
+        const visibleCount = this.rootEl?.children.length || this.heads.size || 1;
+        this.pos = this.clampCenterPos({
+          xPct: startPos.xPct + dx / vw * 100,
+          yPct: startPos.yPct + dy / vh * 100
+        }, visibleCount);
+        if (this.rootEl) {
+          this.applyRootPosition(this.rootEl, visibleCount, { avoidNative: false });
+        }
+      };
+      const finishDrag = () => {
+        try {
+          if (root.hasPointerCapture?.(pointerId)) {
+            root.releasePointerCapture?.(pointerId);
+          }
+        } catch {}
+        this.clearDragSession();
+        if (moved) {
+          this.savePosition(this.pos);
+          if (this.rootEl) {
+            const visibleCount = this.rootEl.children.length || this.heads.size || 1;
+            this.applyRootPosition(this.rootEl, visibleCount);
+          }
+          this.clearSuppressClickTimer();
+          this.suppressClickTimer = setTimeout(() => {
+            this.suppressClickTimer = null;
+            this.suppressNextClick = false;
+          }, SUPPRESS_CLICK_FALLBACK_MS);
+        }
+      };
+      const onPointerEnd = (endEvent) => {
+        if (endEvent.pointerId !== pointerId)
+          return;
+        finishDrag();
+      };
+      const onWindowBlur = () => {
+        finishDrag();
+      };
+      const win = typeof window !== "undefined" ? window : document.defaultView;
+      document.addEventListener("pointermove", onPointerMove, true);
+      document.addEventListener("pointerup", onPointerEnd, true);
+      document.addEventListener("pointercancel", onPointerEnd, true);
+      root.addEventListener("lostpointercapture", onPointerEnd);
+      win?.addEventListener("blur", onWindowBlur);
+      this.dragCleanup = () => {
+        document.removeEventListener("pointermove", onPointerMove, true);
+        document.removeEventListener("pointerup", onPointerEnd, true);
+        document.removeEventListener("pointercancel", onPointerEnd, true);
+        root.removeEventListener("lostpointercapture", onPointerEnd);
+        win?.removeEventListener("blur", onWindowBlur);
+      };
+    });
+  }
+  clearDragSession() {
+    if (this.dragCleanup) {
+      const cleanup = this.dragCleanup;
+      this.dragCleanup = null;
+      cleanup();
+    }
+  }
+  clearSuppressClickTimer() {
+    if (this.suppressClickTimer !== null) {
+      clearTimeout(this.suppressClickTimer);
+      this.suppressClickTimer = null;
+    }
+  }
+  ensureResizeListener() {
+    if (this.resizeCleanup)
+      return;
+    const win = typeof window !== "undefined" ? window : typeof document !== "undefined" ? document.defaultView : null;
+    if (!win)
+      return;
+    const onResize = () => {
+      if (this.destroyed || !this.rootEl)
+        return;
+      const count = this.rootEl.children.length || this.heads.size || 1;
+      this.applyRootPosition(this.rootEl, count);
+    };
+    win.addEventListener("resize", onResize);
+    this.resizeCleanup = () => {
+      win.removeEventListener("resize", onResize);
+    };
+  }
+  clearResizeListener() {
+    if (this.resizeCleanup) {
+      const cleanup = this.resizeCleanup;
+      this.resizeCleanup = null;
+      cleanup();
+    }
+  }
+  applyRootPosition(root, headCount = this.heads.size || 1, options = {}) {
+    const { vw, vh } = this.getViewportSize();
+    const { width, height } = this.getStackDimensions(headCount, vh);
+    const clamped = this.clampCenterPos(this.pos, headCount);
+    let cx = clamped.xPct / 100 * vw;
+    let cy = clamped.yPct / 100 * vh;
+    if (options.avoidNative !== false) {
+      const nativeContainer = this.findNativeChatHeadsContainer();
+      const nativeBox = nativeContainer ? this.resolveNativeBounds(nativeContainer, vw, vh) : null;
+      if (nativeBox) {
+        const minX = VIEWPORT_PAD_PX + width / 2;
+        const maxX = vw - VIEWPORT_PAD_PX - width / 2;
+        const minY = VIEWPORT_PAD_PX + height / 2;
+        const maxY = vh - VIEWPORT_PAD_PX - height / 2;
+        const ggBox = {
+          left: cx - width / 2,
+          top: cy - height / 2,
+          right: cx + width / 2,
+          bottom: cy + height / 2
+        };
+        if (boxesOverlap(ggBox, nativeBox, NATIVE_COLLISION_GAP_PX)) {
+          const belowCy = nativeBox.bottom + NATIVE_COLLISION_GAP_PX + height / 2;
+          const aboveCy = nativeBox.top - NATIVE_COLLISION_GAP_PX - height / 2;
+          const leftCx = nativeBox.left - NATIVE_COLLISION_GAP_PX - width / 2;
+          const rightCx = nativeBox.right + NATIVE_COLLISION_GAP_PX + width / 2;
+          if (belowCy >= minY && belowCy <= maxY) {
+            cy = belowCy;
+          } else if (aboveCy >= minY && aboveCy <= maxY) {
+            cy = aboveCy;
+          } else if (leftCx >= minX && leftCx <= maxX) {
+            cx = leftCx;
+          } else if (rightCx >= minX && rightCx <= maxX) {
+            cx = rightCx;
+          }
+        }
+      }
+    }
+    const finalXPct = clampPct(cx / vw * 100, 0, 100);
+    const finalYPct = clampPct(cy / vh * 100, 0, 100);
+    root.style.left = `${finalXPct}%`;
+    root.style.top = `${finalYPct}%`;
+  }
+  getStorage() {
+    try {
+      return typeof localStorage !== "undefined" ? localStorage : typeof window !== "undefined" ? window.localStorage : null;
+    } catch {
+      return null;
+    }
+  }
+  loadPosition() {
+    try {
+      const raw = this.getStorage()?.getItem(STORAGE_POS_KEY);
+      if (!raw)
+        return { ...DEFAULT_POS };
+      const parsed = JSON.parse(raw);
+      if (isRecord(parsed) && typeof parsed.xPct === "number" && Number.isFinite(parsed.xPct) && typeof parsed.yPct === "number" && Number.isFinite(parsed.yPct)) {
+        return {
+          xPct: clampPct(parsed.xPct),
+          yPct: clampPct(parsed.yPct)
+        };
+      }
+    } catch {}
+    return { ...DEFAULT_POS };
+  }
+  savePosition(pos) {
+    try {
+      this.getStorage()?.setItem(STORAGE_POS_KEY, JSON.stringify(pos));
+    } catch {}
+  }
+  navigateToChat(chatId, onSuccess) {
+    try {
+      const surfaces = this.ctx.host?.surfaces;
+      if (surfaces && typeof surfaces.invoke === "function") {
+        const result = surfaces.invoke({ kind: "route", id: "/chat/:chatId" }, { chatId });
+        if (isThenable(result)) {
+          Promise.resolve(result).then(() => {
+            onSuccess?.();
+          }, () => {
+            if (this.fallbackHistoryNavigate(chatId)) {
+              onSuccess?.();
+            }
+          });
+          return;
+        }
+        onSuccess?.();
+        return;
+      }
+    } catch {}
+    if (this.fallbackHistoryNavigate(chatId)) {
+      onSuccess?.();
+    }
+  }
+  fallbackHistoryNavigate(chatId) {
+    try {
+      const win = typeof window !== "undefined" ? window : typeof document !== "undefined" ? document.defaultView : null;
+      if (win?.history && typeof win.history.pushState === "function") {
+        win.history.pushState(null, "", `/chat/${encodeURIComponent(chatId)}`);
+        const PopStateCtor = win.PopStateEvent ?? (typeof PopStateEvent !== "undefined" ? PopStateEvent : Event);
+        win.dispatchEvent(new PopStateCtor("popstate"));
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+  safeGetActiveChat() {
+    try {
+      return this.ctx.getActiveChat?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+  safeGetActiveChatId() {
+    return this.safeGetActiveChat()?.chatId ?? null;
+  }
+}
+
 // src/shared/defaults.ts
 var GUIDED_ACTION_ORDER = [
   "guided_response",
@@ -162,6 +1000,27 @@ var CONTINUE_MENU_ICONS = {
   remove_last_continue: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>`,
   regenerate_last_continue: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>`
 };
+var RECOVERY_MENU_ICONS = {
+  history: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>`,
+  clear_history: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`
+};
+
+// src/frontend/recovery-store.ts
+function formatRecoverySnippet(text, maxLength = 68) {
+  const safeMax = Number.isFinite(maxLength) ? Math.max(4, Math.floor(maxLength)) : 60;
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= safeMax)
+    return singleLine;
+  return `${singleLine.slice(0, safeMax - 1)}…`;
+}
+function pickRecoveryEntry(entries, preferredId) {
+  if (entries.length === 0)
+    return null;
+  if (preferredId) {
+    return entries.find((item) => item.id === preferredId) ?? entries[0] ?? null;
+  }
+  return entries[0] ?? null;
+}
 
 // src/frontend/input-toolbar.ts
 var HOST_CLASSES = [
@@ -173,6 +1032,9 @@ var HOST_CLASSES = [
 var HOLD_DURATION_MS = 450;
 var HOLD_MOVE_TOLERANCE_PX = 10;
 var MENU_DISMISS_GRACE_MS = 150;
+var PRE_RELEASE_SUPPRESS_FALLBACK_MS = 3000;
+var POST_RELEASE_SUPPRESS_MS = 0;
+var POST_RELEASE_MAX_WINDOW_MS = 250;
 
 class InputToolbarController {
   ctx;
@@ -184,10 +1046,14 @@ class InputToolbarController {
   activeActionId = null;
   activeHoldCancel = null;
   suppressNextHoldClick = false;
+  suppressHoldClickActionId = null;
+  suppressHoldClickUntil = 0;
   clearSuppressHoldClickTimer = null;
   holdReleaseCleanup = null;
   postHoldCleanup = null;
   continueMenu = null;
+  latestRecovery = [];
+  destroyed = false;
   onKeyDown;
   onFocusIn;
   constructor(ctx, handlers) {
@@ -218,8 +1084,13 @@ class InputToolbarController {
     this.actionsMountRoot.replaceChildren(this.toolbarEl);
   }
   render(state) {
+    if (this.destroyed)
+      return;
+    const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+    const focusedActionId = activeEl && this.toolbarEl.contains(activeEl) ? activeEl.getAttribute?.("data-gg-action") : null;
     this.closeContinueMenu({ restoreFocus: false });
     this.clearActiveHold();
+    this.latestRecovery = state.recovery;
     const buttons = [];
     const order = normalizeButtonOrder(state.settings.buttonOrder);
     for (const optionId of order) {
@@ -233,6 +1104,14 @@ class InputToolbarController {
     const visible = buttons.length > 0;
     const placement = normalizeToolbarPlacement(state.settings.toolbarPlacement);
     this.applyPlacement(placement, visible);
+    if (focusedActionId) {
+      const matchingBtn = this.buttons.find((btn) => !btn.disabled && btn.getAttribute("data-gg-action") === focusedActionId);
+      if (matchingBtn) {
+        this.activeActionId = focusedActionId;
+        this.applyRovingTabIndex();
+        matchingBtn.focus();
+      }
+    }
   }
   applyRovingTabIndex() {
     const enabled = this.buttons.filter((btn) => !btn.disabled);
@@ -336,6 +1215,8 @@ class InputToolbarController {
   }
   clearPostHoldClickSuppression() {
     this.suppressNextHoldClick = false;
+    this.suppressHoldClickActionId = null;
+    this.suppressHoldClickUntil = 0;
     if (this.clearSuppressHoldClickTimer !== null) {
       clearTimeout(this.clearSuppressHoldClickTimer);
       this.clearSuppressHoldClickTimer = null;
@@ -351,35 +1232,68 @@ class InputToolbarController {
       onCleanup();
     }
   }
-  armPostHoldClickSuppression(onSuppressionCleared) {
+  isHoldClickSuppressed(targetBtn) {
+    if (!this.suppressNextHoldClick)
+      return false;
+    if (this.suppressHoldClickUntil > 0 && Date.now() > this.suppressHoldClickUntil) {
+      this.clearPostHoldClickSuppression();
+      return false;
+    }
+    if (targetBtn && this.suppressHoldClickActionId !== null) {
+      const actionId = targetBtn.getAttribute("data-gg-action");
+      if (actionId !== this.suppressHoldClickActionId) {
+        return false;
+      }
+    }
+    return true;
+  }
+  armPostHoldClickSuppression(targetBtn, onSuppressionCleared) {
     this.clearPostHoldClickSuppression();
     this.suppressNextHoldClick = true;
+    this.suppressHoldClickActionId = targetBtn.getAttribute("data-gg-action");
+    this.suppressHoldClickUntil = Date.now() + PRE_RELEASE_SUPPRESS_FALLBACK_MS;
     this.postHoldCleanup = onSuppressionCleared ?? null;
     if (typeof document === "undefined")
       return;
+    const win = typeof window !== "undefined" ? window : document.defaultView;
     const cleanupListeners = () => {
       document.removeEventListener("pointerup", onRelease, true);
       document.removeEventListener("pointercancel", onRelease, true);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      win?.removeEventListener("blur", onAbortSuppression);
       if (this.holdReleaseCleanup === cleanupListeners) {
         this.holdReleaseCleanup = null;
       }
     };
-    const onRelease = () => {
+    const onAbortSuppression = () => {
+      this.clearPostHoldClickSuppression();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        this.clearPostHoldClickSuppression();
+      }
+    };
+    const onRelease = (event) => {
       cleanupListeners();
       if (this.clearSuppressHoldClickTimer !== null) {
         clearTimeout(this.clearSuppressHoldClickTimer);
       }
+      const suppressWindowMs = event.type === "pointercancel" || event.pointerType === "mouse" ? POST_RELEASE_SUPPRESS_MS : POST_RELEASE_MAX_WINDOW_MS;
+      this.suppressHoldClickUntil = Date.now() + suppressWindowMs;
       this.clearSuppressHoldClickTimer = setTimeout(() => {
         this.clearSuppressHoldClickTimer = null;
-        this.suppressNextHoldClick = false;
-        const onCleanup = this.postHoldCleanup;
-        this.postHoldCleanup = null;
-        onCleanup?.();
-      }, 0);
+        this.clearPostHoldClickSuppression();
+      }, suppressWindowMs);
     };
     this.holdReleaseCleanup = cleanupListeners;
     document.addEventListener("pointerup", onRelease, true);
     document.addEventListener("pointercancel", onRelease, true);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    win?.addEventListener("blur", onAbortSuppression);
+    this.clearSuppressHoldClickTimer = setTimeout(() => {
+      this.clearSuppressHoldClickTimer = null;
+      this.clearPostHoldClickSuppression();
+    }, PRE_RELEASE_SUPPRESS_FALLBACK_MS);
   }
   attachLongPressHandlers(btn, state, isThisRunning, disabled, options) {
     const hold = {
@@ -440,7 +1354,7 @@ class InputToolbarController {
           this.activeHoldCancel = null;
         }
         hold.fired = true;
-        this.armPostHoldClickSuppression(() => {
+        this.armPostHoldClickSuppression(btn, () => {
           hold.fired = false;
         });
         options.onHold();
@@ -459,13 +1373,13 @@ class InputToolbarController {
     btn.addEventListener("pointercancel", cancelHold);
     btn.addEventListener("pointerleave", cancelHold);
     btn.addEventListener("contextmenu", (event) => {
-      if (hold.timer !== undefined || hold.fired || this.suppressNextHoldClick) {
+      if (hold.timer !== undefined || hold.fired || this.isHoldClickSuppressed(btn)) {
         event.preventDefault();
         event.stopPropagation();
       }
     });
     btn.addEventListener("click", (event) => {
-      if (hold.fired || this.suppressNextHoldClick) {
+      if (hold.fired || this.isHoldClickSuppressed(btn)) {
         hold.fired = false;
         this.clearPostHoldClickSuppression();
         event.preventDefault();
@@ -511,10 +1425,11 @@ class InputToolbarController {
   attachContinueHoldHandlers(btn, state, isThisRunning, disabled) {
     this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
       onClick: (event) => {
-        if (this.continueMenu !== null) {
+        if (this.continueMenu !== null && this.continueMenu.anchorBtn === btn) {
           this.closeContinueMenu({ restoreFocus: true });
           return;
         }
+        this.closeContinueMenu({ restoreFocus: false });
         if (event.ctrlKey || event.metaKey) {
           this.openContinueMenu(btn);
           return;
@@ -534,7 +1449,7 @@ class InputToolbarController {
     });
   }
   openContinueMenu(anchorBtn) {
-    if (typeof document === "undefined" || !document.body)
+    if (this.destroyed || typeof document === "undefined" || !document.body)
       return;
     this.closeContinueMenu({ restoreFocus: false });
     const menuEl = document.createElement("div");
@@ -624,7 +1539,7 @@ class InputToolbarController {
       this.closeContinueMenu({ restoreFocus: false });
     };
     const onOutsideClick = (event) => {
-      if (this.suppressNextHoldClick)
+      if (this.isHoldClickSuppressed(anchorBtn))
         return;
       if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS)
         return;
@@ -679,6 +1594,12 @@ class InputToolbarController {
     const uiScale = Number.isFinite(zoomVal) && zoomVal > 0 && zoomVal !== 1 ? zoomVal : Number.isFinite(scaleProp) && scaleProp > 0 && scaleProp !== 1 ? scaleProp : Number.isFinite(varScale) && varScale > 0 && varScale !== 1 ? varScale : 1;
     const vw = win && typeof win.innerWidth === "number" ? win.innerWidth : document.documentElement?.clientWidth || 1024;
     const vh = win && typeof win.innerHeight === "number" ? win.innerHeight : document.documentElement?.clientHeight || 768;
+    menuEl.style.maxHeight = "";
+    menuEl.style.overflowY = "";
+    const historyListEl = menuEl.querySelector(".gg-dropup-history-list");
+    if (historyListEl) {
+      historyListEl.style.maxHeight = "";
+    }
     const menuWidth = menuEl.offsetWidth * uiScale;
     const menuHeight = menuEl.offsetHeight * uiScale;
     const gapPx = 6;
@@ -689,12 +1610,25 @@ class InputToolbarController {
     const spaceAbove = rect.top;
     const spaceBelow = vh - rect.bottom;
     const neededHeight = menuHeight + gapPx * uiScale + edgePadding;
+    let availableViewportPx;
     if (spaceAbove < neededHeight && spaceBelow > spaceAbove) {
-      menuEl.style.top = `${Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx)}px`;
+      const topCss = Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx);
+      menuEl.style.top = `${topCss}px`;
       menuEl.style.bottom = "";
+      availableViewportPx = Math.max(0, vh - topCss * uiScale - edgePadding);
     } else {
       menuEl.style.bottom = `${(vh - rect.top) / uiScale + gapPx}px`;
       menuEl.style.top = "";
+      availableViewportPx = Math.max(0, spaceAbove - gapPx * uiScale - edgePadding);
+    }
+    const maxMenuHeightCss = Math.max(0, Math.floor(availableViewportPx / uiScale));
+    menuEl.style.maxHeight = `${maxMenuHeightCss}px`;
+    menuEl.style.overflowY = "auto";
+    if (historyListEl) {
+      const headerEl = menuEl.querySelector(".gg-dropup-header");
+      const chromeHeightCss = historyListEl.offsetHeight > 0 && menuEl.offsetHeight >= historyListEl.offsetHeight ? menuEl.offsetHeight - historyListEl.offsetHeight : (headerEl?.offsetHeight || 32) + 12;
+      const listMaxCss = Math.min(220, Math.max(0, maxMenuHeightCss - chromeHeightCss));
+      historyListEl.style.maxHeight = `${listMaxCss}px`;
     }
   }
   closeContinueMenu(options) {
@@ -722,14 +1656,292 @@ class InputToolbarController {
     recoverBtn.disabled = disabled;
     recoverBtn.setAttribute("data-gg-action", "input_recovery");
     recoverBtn.setAttribute("aria-label", hasRecovery ? "Restore last input" : "Clear current input");
+    if (!disabled) {
+      recoverBtn.setAttribute("aria-haspopup", "menu");
+      recoverBtn.setAttribute("aria-expanded", "false");
+      recoverBtn.setAttribute("aria-keyshortcuts", "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter");
+    }
     recoverBtn.title = hasRecovery ? `Restore last cleared input${latestPreview}` : "Input Recovery — clear current input";
     recoverBtn.innerHTML = TOOLBAR_ICONS.input_recovery;
-    recoverBtn.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.handlers.onRestoreLatest();
-    });
+    this.attachRecoveryHoldHandlers(recoverBtn, state, disabled);
     return recoverBtn;
+  }
+  attachRecoveryHoldHandlers(btn, state, disabled) {
+    this.attachLongPressHandlers(btn, state, false, disabled, {
+      onClick: (event) => {
+        if (this.continueMenu !== null && this.continueMenu.anchorBtn === btn) {
+          this.closeContinueMenu({ restoreFocus: true });
+          return;
+        }
+        this.closeContinueMenu({ restoreFocus: false });
+        if (event.ctrlKey || event.metaKey) {
+          this.openRecoveryMenu(btn);
+          return;
+        }
+        this.handlers.onRestoreLatest();
+      },
+      onHold: () => {
+        this.openRecoveryMenu(btn);
+      },
+      onShortcutKeyDown: (event) => {
+        if (event.shiftKey && event.key === "F10" || event.altKey && event.key === "ArrowUp" || (event.ctrlKey || event.metaKey) && event.key === "Enter") {
+          this.openRecoveryMenu(btn);
+          return true;
+        }
+        return false;
+      }
+    });
+  }
+  openRecoveryMenu(anchorBtn) {
+    if (this.destroyed || typeof document === "undefined" || !document.body)
+      return;
+    this.closeContinueMenu({ restoreFocus: false });
+    const menuEl = document.createElement("div");
+    menuEl.className = "gg-dropup-menu";
+    menuEl.setAttribute("role", "menu");
+    menuEl.setAttribute("aria-label", "Input Recovery options");
+    const items = [];
+    let inHistoryView = false;
+    const renderRootOptions = () => {
+      inHistoryView = false;
+      items.length = 0;
+      menuEl.replaceChildren();
+      menuEl.setAttribute("aria-label", "Input Recovery options");
+      const isHistoryEmpty = this.latestRecovery.length === 0;
+      const menuDefs = [
+        {
+          id: "history",
+          label: "History",
+          icon: RECOVERY_MENU_ICONS.history,
+          disabled: false,
+          onSelect: () => {
+            renderHistoryView();
+          }
+        },
+        {
+          id: "clear_history",
+          label: "Clear History",
+          icon: RECOVERY_MENU_ICONS.clear_history,
+          disabled: isHistoryEmpty,
+          onSelect: () => {
+            if (this.latestRecovery.length === 0)
+              return;
+            this.closeContinueMenu({ restoreFocus: false });
+            this.handlers.onClearRecovery?.();
+          }
+        }
+      ];
+      for (const def of menuDefs) {
+        const itemBtn = document.createElement("button");
+        itemBtn.type = "button";
+        itemBtn.className = "gg-dropup-item";
+        itemBtn.setAttribute("role", "menuitem");
+        itemBtn.setAttribute("data-gg-menu-action", def.id);
+        itemBtn.tabIndex = -1;
+        if (def.disabled) {
+          itemBtn.disabled = true;
+          itemBtn.setAttribute("aria-disabled", "true");
+          itemBtn.style.opacity = "0.45";
+          itemBtn.style.cursor = "not-allowed";
+        }
+        itemBtn.innerHTML = `${def.icon}<span>${def.label}</span>`;
+        itemBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (def.disabled)
+            return;
+          def.onSelect();
+        });
+        items.push(itemBtn);
+        menuEl.append(itemBtn);
+      }
+      if (menuEl.isConnected) {
+        this.positionContinueMenu(menuEl, anchorBtn);
+        items[0]?.focus();
+      }
+    };
+    const renderHistoryView = () => {
+      inHistoryView = true;
+      items.length = 0;
+      menuEl.replaceChildren();
+      menuEl.setAttribute("aria-label", "Input Recovery History");
+      const header = document.createElement("div");
+      header.className = "gg-dropup-header";
+      header.style.flexShrink = "0";
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.className = "gg-dropup-back";
+      backBtn.setAttribute("data-gg-menu-action", "back");
+      backBtn.setAttribute("aria-label", "Back to Input Recovery options");
+      backBtn.setAttribute("aria-keyshortcuts", "ArrowLeft Backspace");
+      backBtn.tabIndex = -1;
+      backBtn.textContent = "← Back";
+      backBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        renderRootOptions();
+      });
+      const title = document.createElement("span");
+      title.className = "gg-dropup-title";
+      title.textContent = `History (${this.latestRecovery.length})`;
+      header.append(backBtn, title);
+      menuEl.append(header);
+      items.push(backBtn);
+      const listEl = document.createElement("div");
+      listEl.className = "gg-dropup-history-list";
+      listEl.style.minHeight = "0";
+      if (this.latestRecovery.length === 0) {
+        const emptyEl = document.createElement("div");
+        emptyEl.className = "gg-dropup-empty";
+        emptyEl.setAttribute("role", "status");
+        emptyEl.textContent = "No saved inputs yet.";
+        listEl.append(emptyEl);
+        menuEl.append(listEl);
+      } else {
+        for (const entry of this.latestRecovery) {
+          const actionLabel = ACTION_METADATA[entry.actionId]?.label ?? entry.actionId;
+          const snippetText = formatRecoverySnippet(entry.text, 56);
+          const itemBtn = document.createElement("button");
+          itemBtn.type = "button";
+          itemBtn.className = "gg-dropup-item gg-dropup-history-item";
+          itemBtn.setAttribute("role", "menuitem");
+          itemBtn.setAttribute("data-gg-menu-action", "restore_recovery_entry");
+          itemBtn.setAttribute("data-gg-recovery-id", entry.id);
+          itemBtn.setAttribute("aria-label", `Restore ${actionLabel} draft: ${formatRecoverySnippet(entry.text, 40)}`);
+          itemBtn.title = entry.text;
+          itemBtn.tabIndex = -1;
+          const tagSpan = document.createElement("span");
+          tagSpan.className = "gg-dropup-history-tag";
+          tagSpan.textContent = actionLabel;
+          const snippetSpan = document.createElement("span");
+          snippetSpan.className = "gg-dropup-history-snippet";
+          snippetSpan.textContent = snippetText;
+          itemBtn.append(tagSpan, snippetSpan);
+          itemBtn.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.closeContinueMenu({ restoreFocus: false });
+            if (this.handlers.onRestoreEntry) {
+              this.handlers.onRestoreEntry(entry);
+            } else {
+              this.handlers.onRestoreLatest();
+            }
+          });
+          items.push(itemBtn);
+          listEl.append(itemBtn);
+        }
+        menuEl.append(listEl);
+      }
+      if (menuEl.isConnected) {
+        this.positionContinueMenu(menuEl, anchorBtn);
+        const initialFocusItem = this.latestRecovery.length > 0 ? items[1] ?? items[0] : items[0];
+        initialFocusItem?.focus();
+      }
+    };
+    renderRootOptions();
+    document.body.append(menuEl);
+    anchorBtn.setAttribute("aria-expanded", "true");
+    this.positionContinueMenu(menuEl, anchorBtn);
+    const openedAt = Date.now();
+    const onMenuKeyDown = (event) => {
+      const focusable = items.filter((el) => !el.disabled);
+      const activeIdx = focusable.indexOf(document.activeElement);
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (focusable.length === 0)
+          return;
+        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % focusable.length;
+        focusable[nextIdx]?.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (focusable.length === 0)
+          return;
+        const nextIdx = activeIdx <= 0 ? focusable.length - 1 : activeIdx - 1;
+        focusable[nextIdx]?.focus();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        event.stopPropagation();
+        focusable[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        event.stopPropagation();
+        focusable[focusable.length - 1]?.focus();
+      } else if (inHistoryView && (event.key === "ArrowLeft" || event.key === "Backspace")) {
+        event.preventDefault();
+        event.stopPropagation();
+        renderRootOptions();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+    const onDocumentKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: true });
+      }
+    };
+    const onOutsidePointerDown = (event) => {
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS)
+        return;
+      const target = event.target;
+      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onOutsideClick = (event) => {
+      if (this.isHoldClickSuppressed(anchorBtn))
+        return;
+      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS)
+        return;
+      const target = event.target;
+      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+        return;
+      }
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onViewportResize = () => {
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const onViewportScroll = (event) => {
+      const target = event.target;
+      if (target && menuEl.contains(target))
+        return;
+      this.closeContinueMenu({ restoreFocus: false });
+    };
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    menuEl.addEventListener("keydown", onMenuKeyDown);
+    document.addEventListener("keydown", onDocumentKeyDown, true);
+    document.addEventListener("pointerdown", onOutsidePointerDown, true);
+    document.addEventListener("click", onOutsideClick, true);
+    document.addEventListener("scroll", onViewportScroll, true);
+    if (win) {
+      win.addEventListener("resize", onViewportResize);
+      win.addEventListener("scroll", onViewportScroll, true);
+    }
+    const cleanup = () => {
+      menuEl.removeEventListener("keydown", onMenuKeyDown);
+      document.removeEventListener("keydown", onDocumentKeyDown, true);
+      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
+      document.removeEventListener("click", onOutsideClick, true);
+      document.removeEventListener("scroll", onViewportScroll, true);
+      if (win) {
+        win.removeEventListener("resize", onViewportResize);
+        win.removeEventListener("scroll", onViewportScroll, true);
+      }
+      menuEl.remove();
+    };
+    this.continueMenu = { menuEl, anchorBtn, items, cleanup };
+    items[0]?.focus();
   }
   applyPlacement(placement, visible) {
     this.toolbarEl.style.display = visible ? "inline-flex" : "none";
@@ -768,6 +1980,9 @@ class InputToolbarController {
       el.replaceChildren();
   }
   destroy() {
+    if (this.destroyed)
+      return;
+    this.destroyed = true;
     this.closeContinueMenu({ restoreFocus: false });
     this.clearActiveHold();
     this.clearPostHoldClickSuppression();
@@ -785,18 +2000,28 @@ class InputToolbarController {
 
 // src/frontend/pill-metrics.ts
 var MESSAGE_READ_LIMIT = 50;
-function isRecord(value) {
+var WIDER_MESSAGE_READ_LIMIT = 200;
+var RETRY_DELAYS_MS = [0, 50, 150];
+function isRecord2(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 function extractMessageList(page) {
-  const rawList = Array.isArray(page) ? page : isRecord(page) && Array.isArray(page.data) ? page.data : isRecord(page) && Array.isArray(page.items) ? page.items : [];
+  const rawList = Array.isArray(page) ? page : isRecord2(page) && Array.isArray(page.data) ? page.data : isRecord2(page) && Array.isArray(page.items) ? page.items : [];
   const result = [];
   for (const item of rawList) {
-    if (isRecord(item) && typeof item.id === "string") {
+    if (isRecord2(item) && typeof item.id === "string") {
       result.push(item);
     }
   }
   return result;
+}
+function isPageTruncated(page, messageCount, limit) {
+  if (messageCount >= limit)
+    return true;
+  if (isRecord2(page) && typeof page.total === "number" && page.total > messageCount) {
+    return true;
+  }
+  return false;
 }
 function isPermanentError(error) {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
@@ -847,8 +2072,8 @@ class PillMetricsController {
   onMessageEvent(rawPayload) {
     if (this.destroyed || this.pending.size === 0)
       return;
-    const payload = isRecord(rawPayload) ? rawPayload : null;
-    const msg = payload && isRecord(payload.message) ? payload.message : null;
+    const payload = isRecord2(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord2(payload.message) ? payload.message : null;
     const messageId = typeof msg?.id === "string" ? msg.id : typeof payload?.messageId === "string" ? payload.messageId : null;
     if (!messageId)
       return;
@@ -872,10 +2097,14 @@ class PillMetricsController {
           this.pending.delete(key);
           this.scheduledKeys.delete(key);
           this.clearRetryTimer(key);
-          entry.swipeId -= 1;
-          entry.latestFallback = null;
-          entry.key = this.makeKey(entry.chatId, entry.messageId, entry.swipeId);
-          shifted.push(entry);
+          const nextSwipeId = entry.swipeId - 1;
+          shifted.push({
+            ...entry,
+            swipeId: nextSwipeId,
+            latestFallback: null,
+            key: this.makeKey(entry.chatId, entry.messageId, nextSwipeId),
+            revision: ++this.nextRevision
+          });
         }
       }
       for (const entry of shifted) {
@@ -912,12 +2141,43 @@ class PillMetricsController {
       this.enqueueFlush(key);
     }
   }
+  onChatDeleted(chatId) {
+    if (this.destroyed || !chatId || this.pending.size === 0)
+      return;
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.chatId !== chatId)
+        continue;
+      this.pending.delete(key);
+      this.scheduledKeys.delete(key);
+      this.clearRetryTimer(key);
+    }
+  }
+  onMessageDeleted(rawPayload) {
+    if (this.destroyed || this.pending.size === 0)
+      return;
+    const payload = isRecord2(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord2(payload.message) ? payload.message : null;
+    const messageId = typeof msg?.id === "string" ? msg.id : typeof payload?.messageId === "string" ? payload.messageId : typeof payload?.id === "string" ? payload.id : null;
+    if (!messageId)
+      return;
+    const chatId = typeof payload?.chatId === "string" ? payload.chatId : typeof payload?.chat_id === "string" ? payload.chat_id : typeof msg?.chat_id === "string" ? msg.chat_id : null;
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.messageId !== messageId)
+        continue;
+      if (chatId && entry.chatId !== chatId)
+        continue;
+      this.pending.delete(key);
+      this.scheduledKeys.delete(key);
+      this.clearRetryTimer(key);
+    }
+  }
   destroy() {
     if (this.destroyed)
       return;
     this.destroyed = true;
     this.pending.clear();
     this.scheduledKeys.clear();
+    this.inFlightByMessage.clear();
     for (const timer of this.retryTimers.values()) {
       clearTimeout(timer);
     }
@@ -956,9 +2216,10 @@ class PillMetricsController {
   async flushKey(key, eventFallback) {
     if (this.destroyed)
       return;
-    const snapshot = this.pending.get(key);
-    if (!snapshot)
+    const current = this.pending.get(key);
+    if (!current)
       return;
+    const snapshot = { ...current };
     const resolvedFallback = snapshot.latestFallback ?? eventFallback;
     const updateMessage = this.resolveUpdateMessage();
     if (!updateMessage) {
@@ -985,16 +2246,54 @@ class PillMetricsController {
       const messages = extractMessageList(page);
       target = messages.find((m) => m.id === snapshot.messageId) ?? null;
       if (!target) {
-        if (resolvedFallback && resolvedFallback.id === snapshot.messageId && messages.length >= MESSAGE_READ_LIMIT) {
-          target = resolvedFallback;
-        } else {
+        const truncated = isPageTruncated(page, messages.length, MESSAGE_READ_LIMIT);
+        if (!truncated) {
           this.deleteIfSameRevision(key, snapshot.revision);
+          return;
+        }
+        const getSingleMessage = this.resolveGetSingleMessage();
+        if (getSingleMessage) {
+          try {
+            const single = await getSingleMessage(snapshot.messageId);
+            if (this.destroyed)
+              return;
+            if (isRecord2(single) && typeof single.id === "string" && single.id === snapshot.messageId && (typeof single.chat_id !== "string" || single.chat_id === snapshot.chatId)) {
+              target = single;
+            }
+          } catch {}
+        }
+        if (!target && truncated) {
+          try {
+            const widerPage = await getMessages(snapshot.chatId, {
+              limit: WIDER_MESSAGE_READ_LIMIT,
+              tail: true
+            });
+            if (this.destroyed)
+              return;
+            const widerMessages = extractMessageList(widerPage);
+            target = widerMessages.find((m) => m.id === snapshot.messageId) ?? null;
+            if (!target && !isPageTruncated(widerPage, widerMessages.length, WIDER_MESSAGE_READ_LIMIT)) {
+              this.deleteIfSameRevision(key, snapshot.revision);
+              return;
+            }
+          } catch (error) {
+            if (this.destroyed)
+              return;
+            this.handleFlushFailure(key, snapshot, error);
+            return;
+          }
+        }
+        if (!target) {
           return;
         }
       }
     } else if (resolvedFallback && resolvedFallback.id === snapshot.messageId) {
       target = resolvedFallback;
     } else {
+      return;
+    }
+    const latestBeforeWrite = this.pending.get(key);
+    if (!latestBeforeWrite || latestBeforeWrite.revision !== snapshot.revision) {
       return;
     }
     if (typeof target.swipe_id !== "number") {
@@ -1004,7 +2303,7 @@ class PillMetricsController {
       return;
     }
     const nextExtra = {
-      ...isRecord(target.extra) ? target.extra : {}
+      ...isRecord2(target.extra) ? target.extra : {}
     };
     if (snapshot.tokenCount !== undefined) {
       nextExtra.tokenCount = snapshot.tokenCount;
@@ -1031,12 +2330,13 @@ class PillMetricsController {
     if (!current || current.revision !== snapshot.revision) {
       return;
     }
-    if (isPermanentError(error) || snapshot.attempts >= 1) {
+    if (isPermanentError(error) || snapshot.attempts >= RETRY_DELAYS_MS.length) {
       this.pending.delete(key);
       return;
     }
+    const delayMs = RETRY_DELAYS_MS[snapshot.attempts] ?? 150;
     current.attempts = snapshot.attempts + 1;
-    this.scheduleRetry(key);
+    this.scheduleRetry(key, delayMs);
   }
   deleteIfSameRevision(key, revision) {
     const current = this.pending.get(key);
@@ -1044,7 +2344,7 @@ class PillMetricsController {
       this.pending.delete(key);
     }
   }
-  scheduleRetry(key) {
+  scheduleRetry(key, delayMs) {
     if (this.destroyed || this.retryTimers.has(key))
       return;
     const timer = setTimeout(() => {
@@ -1052,7 +2352,7 @@ class PillMetricsController {
       if (this.destroyed)
         return;
       this.enqueueFlush(key);
-    }, 0);
+    }, delayMs);
     this.retryTimers.set(key, timer);
   }
   clearRetryTimer(key) {
@@ -1075,6 +2375,15 @@ class PillMetricsController {
     } catch {}
     return null;
   }
+  resolveGetSingleMessage() {
+    try {
+      const messagesApi = this.ctx.messages;
+      if (typeof messagesApi?.get === "function") {
+        return messagesApi.get.bind(messagesApi);
+      }
+    } catch {}
+    return null;
+  }
   resolveUpdateMessage() {
     try {
       const chats = this.ctx.chats;
@@ -1093,23 +2402,6 @@ class PillMetricsController {
   }
 }
 
-// src/frontend/recovery-store.ts
-function formatRecoverySnippet(text, maxLength = 68) {
-  const safeMax = Number.isFinite(maxLength) ? Math.max(4, Math.floor(maxLength)) : 60;
-  const singleLine = text.replace(/\s+/g, " ").trim();
-  if (singleLine.length <= safeMax)
-    return singleLine;
-  return `${singleLine.slice(0, safeMax - 1)}…`;
-}
-function pickRecoveryEntry(entries, preferredId) {
-  if (entries.length === 0)
-    return null;
-  if (preferredId) {
-    return entries.find((item) => item.id === preferredId) ?? entries[0] ?? null;
-  }
-  return entries[0] ?? null;
-}
-
 // src/frontend/settings-drawer.ts
 class SettingsDrawerController {
   ctx;
@@ -1126,10 +2418,17 @@ class SettingsDrawerController {
   recoveryUi = null;
   pendingView = null;
   pendingFocusRestore = null;
+  pendingGeneralFocusRestore = null;
+  pointerActiveInDrawer = false;
+  pointerReleaseCleanup = null;
+  pointerFallbackTimer = null;
+  pendingViewFlushTimer = null;
   noticeText = "";
   noticeKind = "info";
+  recoveryBusy = false;
   destroyed = false;
   onFocusOut;
+  onPointerDownInDrawer;
   constructor(ctx, handlers) {
     this.ctx = ctx;
     this.handlers = handlers;
@@ -1150,27 +2449,99 @@ class SettingsDrawerController {
       ],
       iconSvg: DRAWER_TAB_ICON_SVG
     });
+    const clearPointerTracking = () => {
+      if (this.pointerFallbackTimer !== null) {
+        clearTimeout(this.pointerFallbackTimer);
+        this.pointerFallbackTimer = null;
+      }
+      if (this.pointerReleaseCleanup) {
+        const cleanup = this.pointerReleaseCleanup;
+        this.pointerReleaseCleanup = null;
+        cleanup();
+      }
+    };
+    this.onPointerDownInDrawer = () => {
+      if (this.destroyed || this.pointerActiveInDrawer)
+        return;
+      this.pointerActiveInDrawer = true;
+      clearPointerTracking();
+      if (typeof document === "undefined") {
+        this.pointerActiveInDrawer = false;
+        return;
+      }
+      const win = typeof window !== "undefined" ? window : document.defaultView;
+      const finishPointer = () => {
+        clearPointerTracking();
+        if (this.pendingViewFlushTimer !== null) {
+          clearTimeout(this.pendingViewFlushTimer);
+        }
+        this.pendingViewFlushTimer = setTimeout(() => {
+          this.pendingViewFlushTimer = null;
+          this.pointerActiveInDrawer = false;
+          this.flushPendingViewIfIdle();
+        }, 0);
+      };
+      const onWindowBlur = () => {
+        clearPointerTracking();
+        this.pointerActiveInDrawer = false;
+        this.flushPendingViewIfIdle();
+      };
+      document.addEventListener("pointerup", finishPointer, true);
+      document.addEventListener("pointercancel", finishPointer, true);
+      document.addEventListener("mouseup", finishPointer, true);
+      win?.addEventListener("blur", onWindowBlur);
+      this.pointerReleaseCleanup = () => {
+        document.removeEventListener("pointerup", finishPointer, true);
+        document.removeEventListener("pointercancel", finishPointer, true);
+        document.removeEventListener("mouseup", finishPointer, true);
+        win?.removeEventListener("blur", onWindowBlur);
+      };
+      this.pointerFallbackTimer = setTimeout(() => {
+        clearPointerTracking();
+        this.pointerActiveInDrawer = false;
+        this.flushPendingViewIfIdle();
+      }, 3000);
+    };
     this.onFocusOut = (event) => {
       if (this.destroyed)
         return;
       const nextTarget = event.relatedTarget;
+      if (this.debounceTimers.size > 0 && nextTarget !== event.target) {
+        this.flushPendingSaves();
+      }
       const stillInsideEditable = isElementNode(nextTarget) && this.tab.root.contains(nextTarget) && isEditableElement(nextTarget);
-      if (!stillInsideEditable) {
-        if (this.debounceTimers.size > 0) {
-          this.flushPendingSaves();
-        }
-        queueMicrotask(() => {
-          if (this.destroyed)
-            return;
-          if (this.pendingView && !this.isEditingDrawerInput()) {
-            const next = this.currentSettings ? { ...this.pendingView, settings: this.currentSettings } : this.pendingView;
-            this.pendingView = null;
-            this.render(next, { force: true });
+      if (!stillInsideEditable && this.pendingView) {
+        if (this.pointerActiveInDrawer || isClickableInside(this.tab.root, nextTarget)) {
+          if (!this.pointerActiveInDrawer) {
+            this.scheduleDeferredPendingViewFlush();
           }
-        });
+        } else {
+          queueMicrotask(() => {
+            this.flushPendingViewIfIdle();
+          });
+        }
       }
     };
+    this.tab.root.addEventListener("pointerdown", this.onPointerDownInDrawer);
+    this.tab.root.addEventListener("mousedown", this.onPointerDownInDrawer);
     this.tab.root.addEventListener("focusout", this.onFocusOut);
+  }
+  scheduleDeferredPendingViewFlush() {
+    if (this.destroyed || this.pendingViewFlushTimer !== null)
+      return;
+    this.pendingViewFlushTimer = setTimeout(() => {
+      this.pendingViewFlushTimer = null;
+      this.flushPendingViewIfIdle();
+    }, 0);
+  }
+  flushPendingViewIfIdle() {
+    if (this.destroyed || this.pointerActiveInDrawer)
+      return;
+    if (this.pendingView && !this.isEditingDrawerInput()) {
+      const next = this.currentSettings ? { ...this.pendingView, settings: this.currentSettings } : this.pendingView;
+      this.pendingView = null;
+      this.render(next, { force: true });
+    }
   }
   onActivate(handler) {
     return this.tab.onActivate(handler);
@@ -1202,15 +2573,36 @@ class SettingsDrawerController {
     }
     this.noticeEl.textContent = this.noticeText;
   }
+  setRecoveryBusy(busy) {
+    if (this.destroyed)
+      return;
+    this.recoveryBusy = busy;
+    if (!this.recoveryUi)
+      return;
+    this.recoveryUi.clearBtn.disabled = busy || this.recoveryUi.recoveryCount === 0;
+    if (this.recoveryUi.listEl) {
+      for (const btn of this.recoveryUi.listEl.querySelectorAll("button")) {
+        btn.disabled = busy;
+      }
+    }
+  }
   updateRecovery(recovery, settings) {
-    if (this.destroyed || !this.recoveryUi)
+    if (this.destroyed)
+      return;
+    if (this.pendingView) {
+      this.pendingView = {
+        ...this.pendingView,
+        recovery: [...recovery]
+      };
+    }
+    if (!this.recoveryUi)
       return;
     const maxEntries = settings?.inputRecovery.maxEntries ?? this.currentSettings?.inputRecovery.maxEntries ?? 10;
     this.recoveryUi.maxEntries = maxEntries;
     this.recoveryUi.recoveryCount = recovery.length;
     this.recoveryUi.setBadge(recovery.length > 0 ? String(recovery.length) : "", recovery.length === 0);
     this.recoveryUi.countLabel.textContent = recovery.length > 0 ? `Saved inputs (${recovery.length}/${maxEntries}):` : "No saved inputs yet.";
-    this.recoveryUi.clearBtn.disabled = recovery.length === 0;
+    this.recoveryUi.clearBtn.disabled = this.recoveryBusy || recovery.length === 0;
     this.syncRecoveryList(recovery);
   }
   isEditingDrawerInput() {
@@ -1220,20 +2612,32 @@ class SettingsDrawerController {
     return Boolean(isElementNode(active) && this.tab.root.contains(active) && isEditableElement(active));
   }
   captureOrderButtonFocus() {
-    if (this.pendingFocusRestore)
-      return;
     const active = typeof document !== "undefined" ? document.activeElement : null;
-    if (!isElementNode(active) || active.tagName !== "BUTTON" || !this.tab.root.contains(active)) {
+    if (!isElementNode(active) || !this.tab.root.contains(active)) {
       return;
     }
-    const btn = active;
-    const moveDir = btn.dataset.ggMove;
-    if (moveDir !== "up" && moveDir !== "down")
-      return;
-    const row = btn.closest("[data-gg-order-id]");
-    const optionId = row?.getAttribute("data-gg-order-id");
-    if (optionId) {
-      this.pendingFocusRestore = { optionId, button: moveDir };
+    if (!this.pendingFocusRestore && active.tagName === "BUTTON") {
+      const btn = active;
+      const moveDir = btn.dataset.ggMove;
+      if (moveDir === "up" || moveDir === "down") {
+        const row = btn.closest("[data-gg-order-id]");
+        const optionId = row?.getAttribute("data-gg-order-id");
+        if (optionId) {
+          this.pendingFocusRestore = { optionId, button: moveDir };
+          return;
+        }
+      }
+    }
+    if (!this.pendingFocusRestore && !this.pendingGeneralFocusRestore) {
+      const focusKey = active.getAttribute("data-gg-focus-key") ?? undefined;
+      const ariaLabel = active.getAttribute("aria-label") ?? undefined;
+      if (focusKey || ariaLabel) {
+        this.pendingGeneralFocusRestore = {
+          focusKey,
+          tagName: active.tagName,
+          ariaLabel
+        };
+      }
     }
   }
   render(view, options) {
@@ -1247,13 +2651,25 @@ class SettingsDrawerController {
       return;
     }
     this.pendingView = null;
+    if (this.pendingViewFlushTimer !== null) {
+      clearTimeout(this.pendingViewFlushTimer);
+      this.pendingViewFlushTimer = null;
+    }
     this.captureOrderButtonFocus();
-    this.cancelPendingSaves();
+    let effectiveView = view;
+    if (options?.force && this.debounceTimers.size > 0) {
+      this.flushPendingSaves();
+      if (effectiveView && this.currentSettings) {
+        effectiveView = { ...effectiveView, settings: this.currentSettings };
+      }
+    } else {
+      this.cancelPendingSaves();
+    }
     this.clearComponentHandles();
     this.orderStateTags.clear();
     this.recoveryUi = null;
     this.noticeEl = null;
-    this.currentSettings = view?.settings ?? null;
+    this.currentSettings = effectiveView?.settings ?? null;
     const root = document.createElement("div");
     root.className = "gg-drawer";
     this.rootEl = root;
@@ -1271,6 +2687,7 @@ class SettingsDrawerController {
     const refreshBtn = document.createElement("button");
     refreshBtn.type = "button";
     refreshBtn.className = "gg-btn-sm";
+    refreshBtn.dataset.ggFocusKey = "refresh";
     refreshBtn.textContent = "Refresh";
     refreshBtn.addEventListener("click", () => {
       this.flushPendingSaves();
@@ -1279,21 +2696,22 @@ class SettingsDrawerController {
     header.append(titleWrap, refreshBtn);
     root.append(header);
     this.syncNoticeElement();
-    if (!view) {
+    if (!effectiveView) {
       const loading = document.createElement("p");
       loading.className = "gg-muted";
       loading.textContent = "Loading Guided Generations settings…";
       root.append(loading);
+      this.restoreCapturedFocus(root);
       return;
     }
     const missingPerms = [];
-    if (!view.permissions.generation)
+    if (!effectiveView.permissions.generation)
       missingPerms.push("generation");
-    if (!view.permissions.chats)
+    if (!effectiveView.permissions.chats)
       missingPerms.push("chats");
-    if (!view.permissions.chat_mutation)
+    if (!effectiveView.permissions.chat_mutation)
       missingPerms.push("chat_mutation");
-    if (!view.permissions.presets)
+    if (!effectiveView.permissions.presets)
       missingPerms.push("presets");
     if (missingPerms.length > 0) {
       const warn = document.createElement("div");
@@ -1305,11 +2723,11 @@ class SettingsDrawerController {
     }
     const missingFeaturePerms = [];
     const degradedNotes = [];
-    if (view.permissions.interceptor === false) {
+    if (effectiveView.permissions.interceptor === false) {
       missingFeaturePerms.push("interceptor");
       degradedNotes.push("preset-aware guidance placement (pre-history, in-history, before/after post-history) and swipe turn matching fall back to basic heuristic placement");
     }
-    if (view.permissions.regex_scripts === false) {
+    if (effectiveView.permissions.regex_scripts === false) {
       missingFeaturePerms.push("regex_scripts");
       degradedNotes.push("Lumiverse regex scripts are skipped on guidance prompts and generated/impersonated outputs");
     }
@@ -1321,34 +2739,53 @@ class SettingsDrawerController {
       featureWarn.textContent = `Optional permissions not granted (${missingFeaturePerms.join(", ")}): ${degradedNotes.join("; ")}. Grant them in Extension Manager for full functionality.`;
       root.append(featureWarn);
     }
-    if (view.catalogWarnings && view.catalogWarnings.length > 0) {
+    if (effectiveView.catalogWarnings && effectiveView.catalogWarnings.length > 0) {
       const catalogWarn = document.createElement("div");
       catalogWarn.className = "gg-notice is-warn";
       catalogWarn.setAttribute("role", "alert");
       catalogWarn.setAttribute("aria-live", "assertive");
-      catalogWarn.textContent = view.catalogWarnings.join(" ");
+      catalogWarn.textContent = effectiveView.catalogWarnings.join(" ");
       root.append(catalogWarn);
     }
-    const connectionOptions = buildConnectionOptions(view.connections);
-    const presetOptions = buildPresetOptions(view.presets);
+    const connectionOptions = buildConnectionOptions(effectiveView.connections);
+    const presetOptions = buildPresetOptions(effectiveView.presets);
     const roleOptions = [
       { value: "system", label: "System" },
       { value: "user", label: "User" },
       { value: "assistant", label: "Assistant" }
     ];
-    this.renderToolbarLayoutSection(root, view.settings);
+    this.renderToolbarLayoutSection(root, effectiveView.settings);
     for (const actionId of GUIDED_ACTION_ORDER) {
-      this.renderActionSection(root, view.settings, actionId, view.connections, connectionOptions, presetOptions, roleOptions);
+      this.renderActionSection(root, effectiveView.settings, actionId, effectiveView.connections, connectionOptions, presetOptions, roleOptions);
     }
-    this.renderRecoverySection(root, view.settings, view.recovery);
+    this.renderRecoverySection(root, effectiveView.settings, effectiveView.recovery);
+    this.restoreCapturedFocus(root);
+  }
+  restoreCapturedFocus(root) {
     if (this.pendingFocusRestore) {
       const restore = this.pendingFocusRestore;
       this.pendingFocusRestore = null;
+      this.pendingGeneralFocusRestore = null;
       const targetRow = root.querySelector(`[data-gg-order-id="${restore.optionId}"]`);
       const preferred = targetRow?.querySelector(`button[data-gg-move="${restore.button}"]`);
       const fallback = targetRow?.querySelector(`button[data-gg-move="${restore.button === "up" ? "down" : "up"}"]`);
       const targetBtn = preferred && !preferred.disabled ? preferred : fallback && !fallback.disabled ? fallback : null;
       targetBtn?.focus();
+      return;
+    }
+    if (this.pendingGeneralFocusRestore) {
+      const restore = this.pendingGeneralFocusRestore;
+      this.pendingGeneralFocusRestore = null;
+      let target = null;
+      if (restore.focusKey) {
+        target = findElementByAttribute(root, "data-gg-focus-key", restore.focusKey);
+      }
+      if (!target && restore.ariaLabel) {
+        target = findElementByAttribute(root, "aria-label", restore.ariaLabel, restore.tagName);
+      }
+      if (target && !target.disabled) {
+        target.focus();
+      }
     }
   }
   createCollapsibleCard(parent, sectionId, title, badgeText, badgeMuted = false) {
@@ -1360,6 +2797,7 @@ class SettingsDrawerController {
     const headerBtn = document.createElement("button");
     headerBtn.type = "button";
     headerBtn.className = "gg-card-header";
+    headerBtn.dataset.ggFocusKey = `card-header:${sectionId}`;
     headerBtn.setAttribute("aria-expanded", String(this.expandedSections.has(sectionId)));
     const left = document.createElement("span");
     left.className = "gg-card-header-left";
@@ -1513,6 +2951,7 @@ class SettingsDrawerController {
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
     resetBtn.className = "gg-btn-sm";
+    resetBtn.dataset.ggFocusKey = "reset-layout";
     resetBtn.textContent = "Reset layout";
     resetBtn.addEventListener("click", () => {
       this.flushPendingSaves();
@@ -1628,14 +3067,7 @@ class SettingsDrawerController {
           });
         }
       });
-      const comboboxInput = modelField.slot.querySelector("input");
-      if (comboboxInput) {
-        if (!comboboxInput.id)
-          comboboxInput.id = modelFieldId;
-        if (!comboboxInput.getAttribute("aria-label")) {
-          comboboxInput.setAttribute("aria-label", `${meta.label} Model`);
-        }
-      }
+      this.attachSlotInputAttributes(modelField.slot, modelFieldId, `${meta.label} Model`);
       this.handles.push(modelHandle);
     }
     const presetField = createFieldContainer("Preset");
@@ -1718,13 +3150,20 @@ class SettingsDrawerController {
       return Math.max(options.min, Math.min(options.max, Math.floor(options.defaultValue)));
     };
     let currentValue = clamp(options.initialValue);
+    let hasEmptyDraft = false;
     let syncingUi = false;
     let handle = null;
     let fallbackInput = null;
     const commitInput = (rawNumber) => {
       if (syncingUi)
         return;
-      const normalized = clamp(rawNumber === null ? options.defaultValue : rawNumber);
+      if (rawNumber === null) {
+        hasEmptyDraft = true;
+        this.cancelPendingSaveKey(options.debounceKey);
+        return;
+      }
+      hasEmptyDraft = false;
+      const normalized = clamp(rawNumber);
       currentValue = normalized;
       this.scheduleDebouncedSave(options.debounceKey, () => {
         options.onCommit(normalized);
@@ -1743,16 +3182,22 @@ class SettingsDrawerController {
         ariaLabel: options.ariaLabel,
         onChange: commitInput
       });
-      const mountedInput = options.slot.querySelector("input");
-      if (mountedInput) {
-        if (!mountedInput.id)
-          mountedInput.id = options.fieldId;
-        if (!mountedInput.getAttribute("aria-label")) {
-          mountedInput.setAttribute("aria-label", options.ariaLabel);
+      this.attachSlotInputAttributes(options.slot, options.fieldId, options.ariaLabel);
+      options.slot.addEventListener("focusout", (event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget && options.slot.contains(nextTarget)) {
+          return;
         }
-      }
-      options.slot.addEventListener("focusout", () => {
-        this.flushPendingSaveKey(options.debounceKey);
+        if (hasEmptyDraft || handle?.getValue() === null) {
+          hasEmptyDraft = false;
+          const fallbackVal = clamp(options.defaultValue);
+          if (fallbackVal !== currentValue) {
+            currentValue = fallbackVal;
+            options.onCommit(fallbackVal);
+          }
+        } else {
+          this.flushPendingSaveKey(options.debounceKey);
+        }
         if (handle && handle.getValue() !== currentValue) {
           syncingUi = true;
           try {
@@ -1781,7 +3226,16 @@ class SettingsDrawerController {
         commitInput(parsed !== null && Number.isFinite(parsed) ? parsed : null);
       });
       input.addEventListener("blur", () => {
-        this.flushPendingSaveKey(options.debounceKey);
+        if (hasEmptyDraft || input.value.trim() === "") {
+          hasEmptyDraft = false;
+          const fallbackVal = clamp(options.defaultValue);
+          if (fallbackVal !== currentValue) {
+            currentValue = fallbackVal;
+            options.onCommit(fallbackVal);
+          }
+        } else {
+          this.flushPendingSaveKey(options.debounceKey);
+        }
         input.value = String(currentValue);
       });
       fallbackInput = input;
@@ -1874,8 +3328,9 @@ class SettingsDrawerController {
     const clearBtn = document.createElement("button");
     clearBtn.type = "button";
     clearBtn.className = "gg-btn-sm";
+    clearBtn.dataset.ggFocusKey = "clear-recovery";
     clearBtn.textContent = "Clear History";
-    clearBtn.disabled = recovery.length === 0;
+    clearBtn.disabled = this.recoveryBusy || recovery.length === 0;
     clearBtn.addEventListener("click", () => {
       this.handlers.onClearRecovery();
     });
@@ -1921,6 +3376,7 @@ class SettingsDrawerController {
       restoreBtn.type = "button";
       restoreBtn.className = "gg-btn-sm";
       restoreBtn.textContent = "Restore";
+      restoreBtn.disabled = this.recoveryBusy;
       restoreBtn.setAttribute("aria-label", `Restore ${actionLabel} draft: ${formatRecoverySnippet(entry.text, 40)}`);
       restoreBtn.addEventListener("click", () => this.handlers.onRestoreEntry(entry));
       row.append(meta, restoreBtn);
@@ -1928,6 +3384,30 @@ class SettingsDrawerController {
     }
     this.recoveryUi.listEl = list;
     this.recoveryUi.body.append(list);
+  }
+  attachSlotInputAttributes(slot, fieldId, ariaLabel) {
+    const apply = () => {
+      const input = slot.querySelector("input");
+      if (!input)
+        return false;
+      if (!input.id)
+        input.id = fieldId;
+      if (!input.getAttribute("aria-label")) {
+        input.setAttribute("aria-label", ariaLabel);
+      }
+      return true;
+    };
+    if (apply() || typeof MutationObserver !== "function")
+      return;
+    const observer = new MutationObserver(() => {
+      if (apply()) {
+        observer.disconnect();
+      }
+    });
+    observer.observe(slot, { childList: true, subtree: true });
+    this.handles.push({
+      destroy: () => observer.disconnect()
+    });
   }
   scheduleDebouncedSave(key, fn, delayMs = 250) {
     const prev = this.debounceTimers.get(key);
@@ -1941,11 +3421,7 @@ class SettingsDrawerController {
     const timer = setTimeout(() => {
       this.debounceTimers.delete(key);
       flush();
-      if (this.pendingView && !this.isEditingDrawerInput()) {
-        const next = this.currentSettings ? { ...this.pendingView, settings: this.currentSettings } : this.pendingView;
-        this.pendingView = null;
-        this.render(next, { force: true });
-      }
+      this.flushPendingViewIfIdle();
     }, delayMs);
     this.debounceTimers.set(key, { timer, flush });
   }
@@ -1969,6 +3445,13 @@ class SettingsDrawerController {
     clearTimeout(entry.timer);
     entry.flush();
   }
+  cancelPendingSaveKey(key) {
+    const entry = this.debounceTimers.get(key);
+    if (!entry)
+      return;
+    this.debounceTimers.delete(key);
+    clearTimeout(entry.timer);
+  }
   cancelPendingSaves() {
     for (const entry of this.debounceTimers.values()) {
       clearTimeout(entry.timer);
@@ -1986,11 +3469,28 @@ class SettingsDrawerController {
     this.destroyed = true;
     this.pendingView = null;
     this.pendingFocusRestore = null;
+    this.pendingGeneralFocusRestore = null;
+    this.pointerActiveInDrawer = false;
+    if (this.pointerFallbackTimer !== null) {
+      clearTimeout(this.pointerFallbackTimer);
+      this.pointerFallbackTimer = null;
+    }
+    if (this.pendingViewFlushTimer !== null) {
+      clearTimeout(this.pendingViewFlushTimer);
+      this.pendingViewFlushTimer = null;
+    }
+    if (this.pointerReleaseCleanup) {
+      const cleanup = this.pointerReleaseCleanup;
+      this.pointerReleaseCleanup = null;
+      cleanup();
+    }
     this.rootEl = null;
     this.headerEl = null;
     this.noticeEl = null;
     this.recoveryUi = null;
     this.orderStateTags.clear();
+    this.tab.root.removeEventListener("pointerdown", this.onPointerDownInDrawer);
+    this.tab.root.removeEventListener("mousedown", this.onPointerDownInDrawer);
     this.tab.root.removeEventListener("focusout", this.onFocusOut);
     this.cancelPendingSaves();
     this.clearComponentHandles();
@@ -2004,6 +3504,20 @@ function isElementNode(value) {
 function isEditableElement(el) {
   const tag = el.tagName;
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
+function isClickableInside(root, node) {
+  if (!isElementNode(node) || !root.contains(node))
+    return false;
+  return Boolean(node.closest('button, [role="button"], [role="switch"], [role="menuitem"], [role="option"], summary, a[href]'));
+}
+function findElementByAttribute(root, attrName, attrValue, tagName) {
+  const selector = tagName ? tagName.toLowerCase() : "*";
+  for (const el of root.querySelectorAll(selector)) {
+    if (el.getAttribute(attrName) === attrValue) {
+      return el;
+    }
+  }
+  return null;
 }
 function getActiveConnectionId(ctx) {
   const conns = ctx.connections;
@@ -2069,13 +3583,15 @@ var INDICATOR_ACTIONS = new Set([
 var INDICATOR_HTML_BEFORE = '<div class="gg-streaming-indicator" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
 var INDICATOR_HTML_AFTER = '<div class="gg-streaming-indicator gg-streaming-indicator--after" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
 var MAX_RAF_RETRIES = 30;
-function isRecord2(value) {
+var MAX_RUN_STATE_CACHE = 32;
+function isRecord3(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 class StreamingIndicatorController {
   ctx;
   disposers = [];
+  runStateById = new Map;
   currentRun = null;
   viewedSwipeId = undefined;
   swipeInitialized = false;
@@ -2091,26 +3607,40 @@ class StreamingIndicatorController {
   constructor(ctx) {
     this.ctx = ctx;
     if (typeof this.ctx.events?.on === "function") {
-      const handleMessageEvent = (rawPayload) => {
-        this.onMessageEvent(rawPayload);
-      };
       const handleChatEvent = () => {
         if (!this.destroyed) {
+          this.rafRetries = 0;
           this.syncCurrent();
         }
       };
-      this.disposers.push(this.ctx.events.on("MESSAGE_SWIPED", handleMessageEvent), this.ctx.events.on("MESSAGE_EDITED", handleMessageEvent), this.ctx.events.on("MESSAGE_SENT", handleMessageEvent), this.ctx.events.on("CHAT_CHANGED", handleChatEvent), this.ctx.events.on("CHAT_SWITCHED", handleChatEvent));
+      this.disposers.push(this.ctx.events.on("MESSAGE_SWIPED", (rawPayload) => {
+        this.onMessageEvent(rawPayload, "MESSAGE_SWIPED");
+      }), this.ctx.events.on("MESSAGE_EDITED", (rawPayload) => {
+        this.onMessageEvent(rawPayload, "MESSAGE_EDITED");
+      }), this.ctx.events.on("MESSAGE_SENT", (rawPayload) => {
+        this.onMessageEvent(rawPayload, "MESSAGE_SENT");
+      }), this.ctx.events.on("CHAT_CHANGED", handleChatEvent), this.ctx.events.on("CHAT_SWITCHED", handleChatEvent));
     }
   }
   sync(run) {
     if (this.destroyed)
       return;
     const prevRun = this.currentRun;
+    if (prevRun) {
+      this.saveRunState(prevRun.runId);
+    }
     const runIdentityChanged = prevRun?.runId !== run?.runId || prevRun?.messageId !== run?.messageId || prevRun?.actionId !== run?.actionId;
     if (prevRun?.runId !== run?.runId) {
-      this.contentSeen = false;
-      this.viewedSwipeId = undefined;
-      this.swipeInitialized = false;
+      const cached = run ? this.runStateById.get(run.runId) : undefined;
+      if (cached) {
+        this.contentSeen = cached.contentSeen;
+        this.viewedSwipeId = cached.viewedSwipeId;
+        this.swipeInitialized = cached.swipeInitialized;
+      } else {
+        this.contentSeen = false;
+        this.viewedSwipeId = undefined;
+        this.swipeInitialized = false;
+      }
       this.resetRetry();
     } else if (prevRun?.messageId !== run?.messageId) {
       this.resetRetry();
@@ -2119,6 +3649,9 @@ class StreamingIndicatorController {
     if (run && !this.swipeInitialized && run.swipeId !== undefined) {
       this.viewedSwipeId = run.backgroundSwipe ? undefined : run.swipeId;
       this.swipeInitialized = true;
+    }
+    if (run) {
+      this.saveRunState(run.runId);
     }
     if (runIdentityChanged) {
       this.unmount();
@@ -2132,6 +3665,7 @@ class StreamingIndicatorController {
     this.resetRetry();
     this.unmount();
     this.currentRun = null;
+    this.runStateById.clear();
     for (const dispose of this.disposers) {
       try {
         dispose();
@@ -2139,11 +3673,29 @@ class StreamingIndicatorController {
     }
     this.disposers.length = 0;
   }
-  onMessageEvent(rawPayload) {
+  saveRunState(runId) {
+    if (!runId)
+      return;
+    if (this.runStateById.has(runId)) {
+      this.runStateById.delete(runId);
+    }
+    this.runStateById.set(runId, {
+      viewedSwipeId: this.viewedSwipeId,
+      swipeInitialized: this.swipeInitialized,
+      contentSeen: this.contentSeen
+    });
+    if (this.runStateById.size > MAX_RUN_STATE_CACHE) {
+      const oldestKey = this.runStateById.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.runStateById.delete(oldestKey);
+      }
+    }
+  }
+  onMessageEvent(rawPayload, eventType) {
     if (this.destroyed || !this.currentRun?.messageId)
       return;
-    const payload = isRecord2(rawPayload) ? rawPayload : null;
-    const msg = payload && isRecord2(payload.message) ? payload.message : null;
+    const payload = isRecord3(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord3(payload.message) ? payload.message : null;
     const eventMessageId = typeof msg?.id === "string" ? msg.id : typeof payload?.messageId === "string" ? payload.messageId : undefined;
     if (eventMessageId === this.currentRun.messageId) {
       const nextSwipeId = typeof msg?.swipe_id === "number" ? msg.swipe_id : typeof payload?.swipeId === "number" ? payload.swipeId : undefined;
@@ -2155,7 +3707,8 @@ class StreamingIndicatorController {
       if (hasText && (this.currentRun.swipeId == null || this.viewedSwipeId === this.currentRun.swipeId || this.viewedSwipeId === undefined)) {
         this.contentSeen = true;
       }
-      if (this.mountedEl === null) {
+      this.saveRunState(this.currentRun.runId);
+      if (eventType === "MESSAGE_SWIPED" || this.retryMode === "content") {
         this.rafRetries = 0;
       }
     }
@@ -2898,6 +4451,82 @@ var GUIDED_GENERATIONS_CSS = `
   color: var(--lumiverse-primary, var(--accent-primary, currentColor));
 }
 
+.gg-dropup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 6px 6px;
+  border-bottom: 1px solid var(--lumiverse-border, var(--border-color, rgba(255, 255, 255, 0.1)));
+  margin-bottom: 2px;
+}
+
+.gg-dropup-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: none;
+  border-radius: var(--lcs-radius-xs, 6px);
+  background: transparent;
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.75)));
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.gg-dropup-back:hover {
+  background: var(--lumiverse-fill, var(--bg-hover, rgba(255, 255, 255, 0.08)));
+  color: var(--lumiverse-text, var(--text-primary, #e5e7eb));
+}
+
+.gg-dropup-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.6)));
+  padding-right: 4px;
+}
+
+.gg-dropup-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.gg-dropup-history-item {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 220px;
+  max-width: 300px;
+}
+
+.gg-dropup-history-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.6)));
+}
+
+.gg-dropup-history-snippet {
+  font-size: 12.5px;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gg-dropup-empty {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--lumiverse-text-dim, var(--text-secondary, rgba(229, 231, 235, 0.65)));
+  text-align: center;
+}
+
+
 /* Streaming Indicator */
 .gg-streaming-indicator {
   display: inline-flex;
@@ -2936,40 +4565,265 @@ var GUIDED_GENERATIONS_CSS = `
     opacity: 1;
   }
 }
+
+/* Floating Chat Heads */
+.gg-chat-heads-root {
+  position: fixed;
+  z-index: 10950;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  scrollbar-width: none;
+  transform: translate(-50%, -50%);
+  user-select: none;
+  touch-action: none;
+}
+
+.gg-chat-heads-root::-webkit-scrollbar {
+  display: none;
+}
+
+.gg-chat-head-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.gg-chat-head-dismiss {
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.25));
+  background: var(--lumiverse-bg-deep, #18181f);
+  color: var(--lumiverse-text, #e5e7eb);
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.85);
+  transition: opacity 140ms ease, transform 140ms ease, background 140ms ease;
+  z-index: 1;
+}
+
+.gg-chat-head-item:hover .gg-chat-head-dismiss,
+.gg-chat-head-item:focus-within .gg-chat-head-dismiss {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.gg-chat-head-dismiss:hover {
+  background: var(--lumiverse-danger, #ef4444);
+  border-color: rgba(255, 255, 255, 0.4);
+  color: #fff;
+}
+
+.gg-chat-head {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid var(--lumiverse-border, rgba(255, 255, 255, 0.22));
+  background: var(--lumiverse-bg-deep, var(--bg-secondary, #18181f));
+  color: var(--lumiverse-text, var(--text-primary, #e5e7eb));
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+  transition:
+    transform 140ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.gg-chat-head:hover {
+  transform: scale(1.06);
+}
+
+.gg-chat-head:active {
+  transform: scale(0.96);
+}
+
+.gg-chat-head.is-running {
+  border-color: var(--lumiverse-warning, #f59e0b);
+  box-shadow:
+    0 0 0 3px rgba(245, 158, 11, 0.24),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+  animation: gg-chat-head-pulse 1.5s ease-in-out infinite;
+}
+
+.gg-chat-head.is-streaming {
+  border-color: var(--lumiverse-primary, #8b5cf6);
+  box-shadow:
+    0 0 0 3px rgba(139, 92, 246, 0.28),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.gg-chat-head.is-completed {
+  border-color: var(--lumiverse-success, #22c55e);
+  box-shadow:
+    0 0 0 3px rgba(34, 197, 94, 0.3),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.gg-chat-head-avatar {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  pointer-events: none;
+  display: block;
+}
+
+.gg-chat-head-initials {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--lumiverse-text, #e5e7eb);
+  pointer-events: none;
+}
+
+.gg-chat-head-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--lumiverse-bg-deep, #18181f);
+  background: var(--lumiverse-warning, #f59e0b);
+  pointer-events: none;
+}
+
+.gg-chat-head.is-streaming .gg-chat-head-badge {
+  background: var(--lumiverse-primary, #8b5cf6);
+}
+
+.gg-chat-head.is-completed .gg-chat-head-badge {
+  background: var(--lumiverse-success, #22c55e);
+}
+
+.gg-chat-head-pip {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--lumiverse-bg-deep, #18181f);
+  background: var(--lumiverse-danger, #ef4444);
+  pointer-events: none;
+}
+
+@keyframes gg-chat-head-pulse {
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px rgba(139, 92, 246, 0.22),
+      0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(139, 92, 246, 0.08),
+      0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+}
 `;
 
 // src/frontend.ts
-function isRecord3(value) {
+function isRecord4(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+function areJsonValuesEqual(a, b) {
+  if (Object.is(a, b))
+    return true;
+  if (typeof a !== typeof b || a === null || b === null)
+    return false;
+  if (typeof a !== "object")
+    return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0;i < a.length; i += 1) {
+      if (!areJsonValuesEqual(a[i], b[i]))
+        return false;
+    }
+    return true;
+  }
+  const recA = a;
+  const recB = b;
+  const keysA = Object.keys(recA);
+  const keysB = Object.keys(recB);
+  if (keysA.length !== keysB.length)
+    return false;
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(recB, key))
+      return false;
+    if (!areJsonValuesEqual(recA[key], recB[key]))
+      return false;
+  }
+  return true;
+}
 function extractChatIdFromPayload(rawPayload) {
-  if (!isRecord3(rawPayload))
+  if (!isRecord4(rawPayload))
     return null;
   if (typeof rawPayload.chatId === "string" && rawPayload.chatId) {
     return rawPayload.chatId;
   }
-  if (isRecord3(rawPayload.chat) && typeof rawPayload.chat.id === "string") {
+  if (isRecord4(rawPayload.chat) && typeof rawPayload.chat.id === "string") {
     return rawPayload.chat.id;
   }
   return null;
 }
-function withFrontendConnectionFallback(next, ctx) {
+function extractDeletedChatIdFromPayload(rawPayload) {
+  const fromChat = extractChatIdFromPayload(rawPayload);
+  if (fromChat)
+    return fromChat;
+  if (isRecord4(rawPayload) && typeof rawPayload.id === "string" && rawPayload.id) {
+    return rawPayload.id;
+  }
+  return null;
+}
+function mapConnectionProfiles(next, profiles) {
+  if (!Array.isArray(profiles) || profiles.length === 0)
+    return next;
+  return {
+    ...next,
+    connections: profiles.map((c) => ({
+      id: c.id,
+      name: c.name,
+      provider: c.provider ?? "",
+      model: c.model ?? "",
+      isDefault: Boolean(c.is_default)
+    }))
+  };
+}
+async function withFrontendConnectionFallback(next, ctx) {
   if (next.connections.length > 0 || !ctx.connections?.list)
     return next;
   try {
-    const profiles = ctx.connections.list();
-    if (!Array.isArray(profiles) || profiles.length === 0)
-      return next;
-    return {
-      ...next,
-      connections: profiles.map((c) => ({
-        id: c.id,
-        name: c.name,
-        provider: c.provider ?? "",
-        model: c.model ?? "",
-        isDefault: Boolean(c.is_default)
-      }))
-    };
+    const raw = ctx.connections.list();
+    if (raw && typeof raw.then === "function") {
+      const profiles = await raw;
+      return mapConnectionProfiles(next, profiles);
+    }
+    return mapConnectionProfiles(next, raw);
   } catch {
     return next;
   }
@@ -2983,15 +4837,111 @@ function setup(rawCtx) {
   let bootstrapSeq = 0;
   let settingsRevision = 0;
   let statusSeq = 0;
-  let isLaunching = false;
+  let globalClearSeq = 0;
+  let isPreChatLaunching = false;
+  const launchingChats = new Set;
   let view = null;
   let activeRun = null;
+  const activeRunsByChat = new Map;
+  const chatStatusSeq = new Map;
+  const pendingImpersonateDrafts = new Map;
+  const IMPERSONATE_DRAFT_RETRY_DELAYS_MS = [0, 20, 50, 100, 200];
+  let impersonateDraftRetryTimer;
+  let impersonateDraftRetryChatId = null;
+  let impersonateDraftRetryAttempt = 0;
   let noticeTimer;
   let composerAlertMount = null;
   try {
     composerAlertMount = ctx.ui.mount("chat_composer_above");
   } catch {
     composerAlertMount = null;
+  }
+  function getActiveRunForChat(chatId) {
+    if (!chatId)
+      return null;
+    return activeRunsByChat.get(chatId) ?? (activeRun?.chatId === chatId ? activeRun : null);
+  }
+  function isChatBusy(chatId) {
+    if (!chatId)
+      return false;
+    return Boolean(getActiveRunForChat(chatId)) || launchingChats.has(chatId);
+  }
+  function syncPrimaryActiveRun() {
+    const currentChatId = ctx.getActiveChat().chatId;
+    if (currentChatId && activeRunsByChat.has(currentChatId)) {
+      activeRun = activeRunsByChat.get(currentChatId);
+      return;
+    }
+    let latest = null;
+    for (const run of activeRunsByChat.values()) {
+      if (!latest || run.startedAt >= latest.startedAt) {
+        latest = run;
+      }
+    }
+    activeRun = latest;
+  }
+  function clearImpersonateDraftRetry() {
+    if (impersonateDraftRetryTimer !== undefined) {
+      clearTimeout(impersonateDraftRetryTimer);
+      impersonateDraftRetryTimer = undefined;
+    }
+    impersonateDraftRetryChatId = null;
+    impersonateDraftRetryAttempt = 0;
+  }
+  function scheduleImpersonateDraftRetry(chatId) {
+    if (destroyed)
+      return;
+    if (impersonateDraftRetryChatId !== chatId) {
+      clearImpersonateDraftRetry();
+      impersonateDraftRetryChatId = chatId;
+      impersonateDraftRetryAttempt = 0;
+    }
+    if (impersonateDraftRetryTimer !== undefined)
+      return;
+    const delayMs = IMPERSONATE_DRAFT_RETRY_DELAYS_MS[impersonateDraftRetryAttempt];
+    if (delayMs === undefined)
+      return;
+    impersonateDraftRetryAttempt += 1;
+    impersonateDraftRetryTimer = setTimeout(() => {
+      impersonateDraftRetryTimer = undefined;
+      if (destroyed)
+        return;
+      applyPendingImpersonateDraft(chatId, { fromRetry: true });
+    }, delayMs);
+  }
+  function applyPendingImpersonateDraft(chatId, options = {}) {
+    if (destroyed || !chatId)
+      return;
+    const draft = pendingImpersonateDrafts.get(chatId);
+    if (draft === undefined) {
+      if (impersonateDraftRetryChatId === chatId) {
+        clearImpersonateDraftRetry();
+      }
+      return;
+    }
+    const state = safeGetComposerState();
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (activeChatId !== chatId) {
+      if (impersonateDraftRetryChatId === chatId) {
+        clearImpersonateDraftRetry();
+      }
+      return;
+    }
+    if (!isComposerAvailable(state) || state.chatId !== chatId) {
+      if (!options.fromRetry) {
+        clearImpersonateDraftRetry();
+      }
+      scheduleImpersonateDraftRetry(chatId);
+      return;
+    }
+    clearImpersonateDraftRetry();
+    if (state.text.trim().length > 0) {
+      return;
+    }
+    if (safeSetComposerText(draft)) {
+      pendingImpersonateDrafts.delete(chatId);
+      safeFocusComposer();
+    }
   }
   function safeGetComposerState() {
     if (destroyed)
@@ -3100,16 +5050,23 @@ function setup(rawCtx) {
     drawer.setNotice("", "info");
     composerAlertMount?.replaceChildren();
   }
+  function syncRecoveryBusy() {
+    if (destroyed)
+      return;
+    const { chatId } = ctx.getActiveChat();
+    drawer.setRecoveryBusy(isChatBusy(chatId));
+  }
   function renderToolbar() {
     if (destroyed || !view)
       return;
     const { chatId } = ctx.getActiveChat();
     toolbar.render({
       settings: view.settings,
-      activeRun,
+      activeRun: getActiveRunForChat(chatId),
       recovery: view.recovery,
       hasActiveChat: Boolean(chatId)
     });
+    syncRecoveryBusy();
   }
   async function refresh(options = {}) {
     if (destroyed)
@@ -3121,9 +5078,46 @@ function setup(rawCtx) {
       const rawNext = await rpc("get_bootstrap");
       if (destroyed || myBootstrapSeq !== bootstrapSeq)
         return;
-      const next = withFrontendConnectionFallback(rawNext, ctx);
+      const next = await withFrontendConnectionFallback(rawNext, ctx);
+      if (destroyed || myBootstrapSeq !== bootstrapSeq)
+        return;
       const resolvedSettings = view && settingsRevision !== startSettingsRevision ? view.settings : next.settings;
-      const resolvedActiveRun = statusSeq !== startStatusSeq ? activeRun : next.activeRun;
+      const bootstrapRunsByChat = new Map;
+      const bootstrapRuns = next.activeRuns;
+      if (Array.isArray(bootstrapRuns)) {
+        for (const r of bootstrapRuns) {
+          if (r && typeof r.chatId === "string" && r.chatId.length > 0) {
+            bootstrapRunsByChat.set(r.chatId, r);
+          }
+        }
+      }
+      if (next.activeRun && typeof next.activeRun.chatId === "string" && next.activeRun.chatId.length > 0) {
+        bootstrapRunsByChat.set(next.activeRun.chatId, next.activeRun);
+      }
+      if (statusSeq === startStatusSeq) {
+        activeRunsByChat.clear();
+        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+          activeRunsByChat.set(chatId, run);
+        }
+      } else if (globalClearSeq <= startStatusSeq) {
+        for (const chatId of [...activeRunsByChat.keys()]) {
+          if ((chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq) {
+            const refreshedRun = bootstrapRunsByChat.get(chatId);
+            if (refreshedRun) {
+              activeRunsByChat.set(chatId, refreshedRun);
+            } else {
+              activeRunsByChat.delete(chatId);
+            }
+          }
+        }
+        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+          if (!activeRunsByChat.has(chatId) && (chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq) {
+            activeRunsByChat.set(chatId, run);
+          }
+        }
+      }
+      syncPrimaryActiveRun();
+      const resolvedActiveRun = activeRun;
       const mergedNext = {
         ...next,
         settings: resolvedSettings,
@@ -3145,7 +5139,9 @@ function setup(rawCtx) {
       const recoveryUnchanged = Boolean(options.onlyIfChanged) && view !== null && JSON.stringify(view.recovery) === JSON.stringify(mergedNext.recovery);
       view = mergedNext;
       activeRun = resolvedActiveRun;
-      indicator.sync(activeRun);
+      const currentChatId = ctx.getActiveChat().chatId;
+      indicator.sync(getActiveRunForChat(currentChatId));
+      chatHeads.syncRuns(activeRunsByChat.values(), currentChatId);
       if (!coreUnchanged) {
         drawer.render(view);
       } else if (!recoveryUnchanged) {
@@ -3160,19 +5156,41 @@ function setup(rawCtx) {
     }
   }
   async function triggerAction(actionId, options) {
-    if (destroyed || activeRun || isLaunching)
+    if (destroyed || isPreChatLaunching)
       return;
-    isLaunching = true;
+    const preChatId = ctx.getActiveChat().chatId;
+    if (preChatId && (getActiveRunForChat(preChatId) || launchingChats.has(preChatId))) {
+      return;
+    }
+    isPreChatLaunching = true;
+    let lockedChatId = preChatId;
+    if (lockedChatId) {
+      launchingChats.add(lockedChatId);
+      syncRecoveryBusy();
+    }
     try {
       if (!view)
         await refresh();
-      if (destroyed || !view || activeRun)
+      isPreChatLaunching = false;
+      if (destroyed || !view)
         return;
       const { chatId } = ctx.getActiveChat();
       if (!chatId) {
         showBanner("Open a chat before triggering a guided action.", "warn");
         return;
       }
+      if (lockedChatId !== chatId) {
+        if (lockedChatId) {
+          launchingChats.delete(lockedChatId);
+        }
+        if (launchingChats.has(chatId))
+          return;
+        lockedChatId = chatId;
+        launchingChats.add(lockedChatId);
+        syncRecoveryBusy();
+      }
+      if (getActiveRunForChat(chatId))
+        return;
       const state = safeGetComposerState();
       if (!isComposerAvailable(state)) {
         showBanner("Composer is unavailable right now. Open the message input bar and try again.", "warn");
@@ -3190,6 +5208,7 @@ function setup(rawCtx) {
         return;
       }
       clearBanner();
+      pendingImpersonateDrafts.delete(chatId);
       const shouldClear = Boolean(inputText.trim()) && (config.clearInputOnRun || actionId === "guided_impersonate");
       if (shouldClear && !safeSetComposerText("")) {
         showBanner("Composer is unavailable right now.", "warn");
@@ -3210,7 +5229,7 @@ function setup(rawCtx) {
       } catch (error) {
         if (destroyed)
           return;
-        if (shouldClear && !activeRun) {
+        if (shouldClear && !getActiveRunForChat(chatId)) {
           const currentComposer = safeGetComposerState();
           const activeChatId = ctx.getActiveChat().chatId;
           if (isComposerAvailable(currentComposer) && currentComposer.chatId === chatId && activeChatId === chatId && !currentComposer.text) {
@@ -3221,15 +5240,28 @@ function setup(rawCtx) {
         showBanner(msg, "error", 7000);
       }
     } finally {
-      isLaunching = false;
+      isPreChatLaunching = false;
+      if (lockedChatId) {
+        launchingChats.delete(lockedChatId);
+      }
+      syncRecoveryBusy();
     }
   }
   function restoreRecoveryEntry(entry) {
-    if (destroyed)
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed || !view)
       return;
+    if (isChatBusy(activeChatId)) {
+      showBanner("Wait for the active guided generation to finish before restoring input.", "warn");
+      return;
+    }
     const state = safeGetComposerState();
     if (!isComposerAvailable(state)) {
       showBanner("Composer is unavailable right now — cannot restore input.", "warn");
+      return;
+    }
+    if (state.chatId !== null && state.chatId !== activeChatId) {
+      showBanner("Active chat changed; please try again.", "warn");
       return;
     }
     if (!safeSetComposerText(entry.text)) {
@@ -3240,13 +5272,19 @@ function setup(rawCtx) {
     clearBanner();
   }
   function clearCurrentInput() {
-    if (destroyed || !view || activeRun)
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed || !view || isChatBusy(activeChatId)) {
       return;
+    }
     if (!view.settings.inputRecovery.enabled)
       return;
     const state = safeGetComposerState();
     if (!isComposerAvailable(state)) {
       showBanner("Composer is unavailable right now — cannot clear input.", "warn");
+      return;
+    }
+    if (state.chatId !== null && state.chatId !== activeChatId) {
+      showBanner("Active chat changed; please try again.", "warn");
       return;
     }
     if (!state.text) {
@@ -3262,15 +5300,19 @@ function setup(rawCtx) {
     clearBanner();
   }
   async function removeLastContinue() {
-    if (destroyed || activeRun || isLaunching)
+    if (destroyed || isPreChatLaunching)
       return;
-    isLaunching = true;
+    const { chatId } = ctx.getActiveChat();
+    if (!chatId) {
+      showBanner("Open a chat before removing the last continue.", "warn");
+      return;
+    }
+    if (isChatBusy(chatId))
+      return;
+    launchingChats.add(chatId);
+    syncRecoveryBusy();
+    pendingImpersonateDrafts.delete(chatId);
     try {
-      const { chatId } = ctx.getActiveChat();
-      if (!chatId) {
-        showBanner("Open a chat before removing the last continue.", "warn");
-        return;
-      }
       clearBanner();
       await rpc("remove_last_continue", { chatId });
     } catch (error) {
@@ -3279,19 +5321,24 @@ function setup(rawCtx) {
       const msg = error instanceof Error ? error.message : String(error);
       showBanner(msg, "warn", 7000);
     } finally {
-      isLaunching = false;
+      launchingChats.delete(chatId);
+      syncRecoveryBusy();
     }
   }
   async function regenerateLastContinue() {
-    if (destroyed || activeRun || isLaunching)
+    if (destroyed || isPreChatLaunching)
       return;
-    isLaunching = true;
+    const { chatId } = ctx.getActiveChat();
+    if (!chatId) {
+      showBanner("Open a chat before regenerating the last continue.", "warn");
+      return;
+    }
+    if (isChatBusy(chatId))
+      return;
+    launchingChats.add(chatId);
+    syncRecoveryBusy();
+    pendingImpersonateDrafts.delete(chatId);
     try {
-      const { chatId } = ctx.getActiveChat();
-      if (!chatId) {
-        showBanner("Open a chat before regenerating the last continue.", "warn");
-        return;
-      }
       clearBanner();
       const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
       const payload = {
@@ -3305,10 +5352,35 @@ function setup(rawCtx) {
       const msg = error instanceof Error ? error.message : String(error);
       showBanner(msg, "error", 7000);
     } finally {
-      isLaunching = false;
+      launchingChats.delete(chatId);
+      syncRecoveryBusy();
+    }
+  }
+  async function clearRecoveryHistory() {
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed)
+      return;
+    if (isChatBusy(activeChatId)) {
+      showBanner("Wait for the active guided generation to finish before clearing input recovery history.", "warn");
+      return;
+    }
+    try {
+      const recovery = await rpc("clear_recovery");
+      if (destroyed)
+        return;
+      if (view) {
+        view = { ...view, recovery };
+        renderToolbar();
+        drawer.updateRecovery(view.recovery, view.settings);
+      }
+    } catch (error) {
+      if (destroyed)
+        return;
+      showBanner(error instanceof Error ? error.message : String(error), "error");
     }
   }
   const indicator = new StreamingIndicatorController(ctx);
+  const chatHeads = new ChatHeadController(ctx);
   const pillMetrics = new PillMetricsController(ctx);
   const toolbar = new InputToolbarController(ctx, {
     onTriggerAction: (actionId, options) => {
@@ -3322,14 +5394,22 @@ function setup(rawCtx) {
       });
     },
     onRestoreLatest: () => {
-      if (destroyed || !view || activeRun)
+      const activeChatId = ctx.getActiveChat().chatId;
+      if (destroyed || !view || isChatBusy(activeChatId)) {
         return;
+      }
       const latest = pickRecoveryEntry(view.recovery);
       if (latest) {
         restoreRecoveryEntry(latest);
       } else {
         clearCurrentInput();
       }
+    },
+    onRestoreEntry: (entry) => {
+      restoreRecoveryEntry(entry);
+    },
+    onClearRecovery: () => {
+      clearRecoveryHistory();
     },
     onRemoveLastContinue: () => {
       removeLastContinue();
@@ -3357,10 +5437,13 @@ function setup(rawCtx) {
         const saved = await rpc("save_settings", nextSettings);
         if (destroyed || !view || rev !== settingsRevision)
           return;
+        const settingsUnchanged = areJsonValuesEqual(saved, view.settings);
         view = { ...view, settings: saved };
-        renderToolbar();
-        if (options?.rebuildDrawer)
-          drawer.render(view, { force: true });
+        if (!settingsUnchanged) {
+          renderToolbar();
+          if (options?.rebuildDrawer)
+            drawer.render(view);
+        }
       } catch (error) {
         if (destroyed)
           return;
@@ -3371,25 +5454,20 @@ function setup(rawCtx) {
       }
     },
     onRestoreEntry: (entry) => restoreRecoveryEntry(entry),
-    onClearRecovery: async () => {
-      if (destroyed)
-        return;
-      try {
-        const recovery = await rpc("clear_recovery");
-        if (destroyed)
-          return;
-        if (view) {
-          view = { ...view, recovery };
-          renderToolbar();
-          drawer.updateRecovery(view.recovery, view.settings);
-        }
-      } catch (error) {
-        if (destroyed)
-          return;
-        showBanner(error instanceof Error ? error.message : String(error), "error");
-      }
-    }
+    onClearRecovery: () => clearRecoveryHistory()
   });
+  function handleActiveChatChanged(metricsChatId) {
+    if (destroyed)
+      return;
+    const activeChatId = ctx.getActiveChat().chatId;
+    clearImpersonateDraftRetry();
+    syncPrimaryActiveRun();
+    indicator.sync(getActiveRunForChat(activeChatId));
+    chatHeads.onChatChanged(activeChatId);
+    renderToolbar();
+    applyPendingImpersonateDraft(activeChatId);
+    pillMetrics.onChatChanged(metricsChatId !== undefined ? metricsChatId : activeChatId);
+  }
   disposers.push(drawer.onActivate(() => {
     if (!destroyed)
       refresh({ onlyIfChanged: true });
@@ -3397,7 +5475,7 @@ function setup(rawCtx) {
   disposers.push(ctx.onBackendMessage((rawPayload) => {
     if (destroyed)
       return;
-    const msg = isRecord3(rawPayload) ? rawPayload : {};
+    const msg = isRecord4(rawPayload) ? rawPayload : {};
     if (msg.type === "gg:reply" && typeof msg.requestId === "string") {
       const waiter = pending.get(msg.requestId);
       if (!waiter)
@@ -3415,10 +5493,54 @@ function setup(rawCtx) {
     switch (event.type) {
       case "gg:status": {
         statusSeq += 1;
-        activeRun = event.run ?? null;
-        if (view)
-          view = { ...view, activeRun };
-        indicator.sync(activeRun);
+        const eventChatId = typeof event.chatId === "string" && event.chatId.length > 0 ? event.chatId : undefined;
+        const hasTerminalSignal = Boolean(event.done) || Boolean(event.aborted) || Boolean(event.error);
+        const prevEventChatRun = eventChatId ? activeRunsByChat.get(eventChatId) : undefined;
+        const prevRunChatRun = event.run ? activeRunsByChat.get(event.run.chatId) : undefined;
+        if (event.run) {
+          if (eventChatId && event.run.chatId !== eventChatId && hasTerminalSignal) {
+            activeRunsByChat.delete(eventChatId);
+            chatStatusSeq.set(eventChatId, statusSeq);
+            if (prevEventChatRun !== undefined && prevEventChatRun.actionId !== "guided_impersonate" || event.aborted || event.error) {
+              pendingImpersonateDrafts.delete(eventChatId);
+            }
+          }
+          if (!hasTerminalSignal || eventChatId !== undefined && event.run.chatId !== eventChatId) {
+            if (prevRunChatRun?.runId !== event.run.runId) {
+              pendingImpersonateDrafts.delete(event.run.chatId);
+            }
+            activeRunsByChat.set(event.run.chatId, event.run);
+            chatStatusSeq.set(event.run.chatId, statusSeq);
+          } else {
+            activeRunsByChat.delete(event.run.chatId);
+            chatStatusSeq.set(event.run.chatId, statusSeq);
+            if (event.run.actionId !== "guided_impersonate" || event.aborted || event.error) {
+              pendingImpersonateDrafts.delete(event.run.chatId);
+            }
+          }
+        } else if (eventChatId) {
+          activeRunsByChat.delete(eventChatId);
+          chatStatusSeq.set(eventChatId, statusSeq);
+          if (prevEventChatRun !== undefined && prevEventChatRun.actionId !== "guided_impersonate" || event.aborted || event.error) {
+            pendingImpersonateDrafts.delete(eventChatId);
+          }
+        } else {
+          activeRunsByChat.clear();
+          globalClearSeq = statusSeq;
+          if (hasTerminalSignal) {
+            pendingImpersonateDrafts.clear();
+          }
+        }
+        syncPrimaryActiveRun();
+        if (view) {
+          view = {
+            ...view,
+            activeRun
+          };
+        }
+        const activeChatId = ctx.getActiveChat().chatId;
+        indicator.sync(getActiveRunForChat(activeChatId));
+        chatHeads.handleStatusEvent(event, activeChatId);
         renderToolbar();
         if (event.error) {
           showBanner(event.error, "error", 7000);
@@ -3429,14 +5551,31 @@ function setup(rawCtx) {
         if (typeof event.text === "string") {
           const rawChatId = event.chatId;
           const chunkChatId = typeof rawChatId === "string" ? rawChatId : null;
-          const expectedChatId = chunkChatId ?? activeRun?.chatId ?? null;
+          const expectedChatId = chunkChatId ?? (activeRunsByChat.size === 1 ? Array.from(activeRunsByChat.values())[0].chatId : activeRun?.chatId ?? null);
           const state = safeGetComposerState();
           const activeChatId = ctx.getActiveChat().chatId;
-          if (!isComposerAvailable(state) || !activeChatId || state.chatId !== activeChatId || expectedChatId !== null && expectedChatId !== activeChatId) {
+          if (expectedChatId !== null && expectedChatId !== activeChatId) {
+            if (event.done && !event.aborted && event.text.length > 0) {
+              pendingImpersonateDrafts.set(expectedChatId, event.text);
+            }
             return;
           }
-          if (safeSetComposerText(event.text) && event.done) {
-            safeFocusComposer();
+          if (!isComposerAvailable(state) || !activeChatId || state.chatId !== activeChatId) {
+            if (event.done && !event.aborted && event.text.length > 0 && expectedChatId) {
+              pendingImpersonateDrafts.set(expectedChatId, event.text);
+              if (expectedChatId === activeChatId) {
+                applyPendingImpersonateDraft(activeChatId);
+              }
+            }
+            return;
+          }
+          if (safeSetComposerText(event.text)) {
+            pendingImpersonateDrafts.delete(activeChatId);
+            if (event.done) {
+              safeFocusComposer();
+            }
+          } else if (event.done && !event.aborted && event.text.length > 0) {
+            pendingImpersonateDrafts.set(activeChatId, event.text);
           }
         }
         return;
@@ -3462,16 +5601,31 @@ function setup(rawCtx) {
     }
   }));
   disposers.push(ctx.events.on("CHAT_SWITCHED", (payload) => {
-    if (destroyed)
-      return;
-    renderToolbar();
-    pillMetrics.onChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
+    handleActiveChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
   }));
   disposers.push(ctx.events.on("CHAT_CHANGED", (payload) => {
+    handleActiveChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
+  }));
+  disposers.push(ctx.events.on("CHAT_DELETED", (payload) => {
     if (destroyed)
       return;
+    const deletedChatId = extractDeletedChatIdFromPayload(payload);
+    if (!deletedChatId)
+      return;
+    statusSeq += 1;
+    chatStatusSeq.set(deletedChatId, statusSeq);
+    activeRunsByChat.delete(deletedChatId);
+    pendingImpersonateDrafts.delete(deletedChatId);
+    if (impersonateDraftRetryChatId === deletedChatId) {
+      clearImpersonateDraftRetry();
+    }
+    launchingChats.delete(deletedChatId);
+    syncPrimaryActiveRun();
+    const activeChatId = ctx.getActiveChat().chatId;
+    indicator.sync(getActiveRunForChat(activeChatId));
+    chatHeads.onChatDeleted(deletedChatId);
+    pillMetrics.onChatDeleted(deletedChatId);
     renderToolbar();
-    pillMetrics.onChatChanged(extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId);
   }));
   disposers.push(ctx.events.on("MESSAGE_SWIPED", (payload) => {
     if (!destroyed)
@@ -3480,6 +5634,10 @@ function setup(rawCtx) {
   disposers.push(ctx.events.on("MESSAGE_EDITED", (payload) => {
     if (!destroyed)
       pillMetrics.onMessageEvent(payload);
+  }));
+  disposers.push(ctx.events.on("MESSAGE_DELETED", (payload) => {
+    if (!destroyed)
+      pillMetrics.onMessageDeleted(payload);
   }));
   if (ctx.connections?.subscribe) {
     disposers.push(ctx.connections.subscribe(() => {
@@ -3491,10 +5649,7 @@ function setup(rawCtx) {
   try {
     if (ctx.state) {
       disposers.push(ctx.state.subscribe("chat.active", () => {
-        if (!destroyed) {
-          indicator.sync(activeRun);
-          renderToolbar();
-        }
+        handleActiveChatChanged();
       }));
       stateSubscribed = true;
     }
@@ -3507,8 +5662,7 @@ function setup(rawCtx) {
       const nextChatId = ctx.getActiveChat().chatId;
       if (nextChatId !== lastChatId) {
         lastChatId = nextChatId;
-        indicator.sync(activeRun);
-        renderToolbar();
+        handleActiveChatChanged(nextChatId);
       }
     }, 600);
     disposers.push(() => clearInterval(poll));
@@ -3516,25 +5670,51 @@ function setup(rawCtx) {
   ctx.ready();
   refresh();
   return () => {
-    drawer.flushPendingSaves();
+    try {
+      drawer.flushPendingSaves();
+    } catch {}
     destroyed = true;
+    clearImpersonateDraftRetry();
     if (noticeTimer) {
       clearTimeout(noticeTimer);
       noticeTimer = undefined;
     }
-    for (const dispose of disposers)
-      dispose();
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch {}
+    }
+    disposers.length = 0;
     for (const waiter of pending.values()) {
       clearTimeout(waiter.timer);
       waiter.reject(new Error("Guided Generations unloaded."));
     }
     pending.clear();
-    pillMetrics.destroy();
-    indicator.destroy();
-    toolbar.destroy();
-    drawer.destroy();
-    composerAlertMount?.replaceChildren();
-    removeStyle();
+    launchingChats.clear();
+    activeRunsByChat.clear();
+    chatStatusSeq.clear();
+    pendingImpersonateDrafts.clear();
+    try {
+      pillMetrics.destroy();
+    } catch {}
+    try {
+      chatHeads.destroy();
+    } catch {}
+    try {
+      indicator.destroy();
+    } catch {}
+    try {
+      toolbar.destroy();
+    } catch {}
+    try {
+      drawer.destroy();
+    } catch {}
+    try {
+      composerAlertMount?.replaceChildren();
+    } catch {}
+    try {
+      removeStyle();
+    } catch {}
   };
 }
 export {

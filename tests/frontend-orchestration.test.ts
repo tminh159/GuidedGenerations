@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { JSDOM } from "jsdom";
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import { setup } from "../src/frontend";
+import { ChatHeadController } from "../src/frontend/chat-head";
 import { InputToolbarController } from "../src/frontend/input-toolbar";
 import { PillMetricsController } from "../src/frontend/pill-metrics";
 import { SettingsDrawerController } from "../src/frontend/settings-drawer";
@@ -3231,5 +3232,881 @@ describe("frontend orchestration and safety", () => {
     const saveRpcs = h.sentRpcs.filter((r) => r.action === "save_settings");
     expect(saveRpcs).toHaveLength(1);
     expect((saveRpcs[0]!.input as GuidedGenerationsSettings).inputRecovery.maxEntries).toBe(27);
+  });
+
+  test("background chat generation unlocks other chats' toolbars, renders floating Chat Head indicator, turns green on completion, and navigates on click", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Steer chat-a response",
+    });
+
+    const invokedRoutes: Array<{ ref: { kind: string; id: string }; params: { chatId: string } }> =
+      [];
+    (
+      h.ctx as unknown as {
+        host: {
+          surfaces: {
+            invoke: (ref: { kind: string; id: string }, params: { chatId: string }) => void;
+          };
+        };
+      }
+    ).host = {
+      surfaces: {
+        invoke: (ref, params) => {
+          invokedRoutes.push({ ref, params });
+        },
+      },
+    };
+
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+    await flushMicrotasks();
+
+    // 1. Trigger Guided Response in chat-a
+    const responseBtnA = h.actionsMount.querySelector<HTMLButtonElement>(
+      '[data-gg-action="guided_response"]',
+    )!;
+    expect(responseBtnA).not.toBeNull();
+    expect(responseBtnA.disabled).toBe(false);
+    responseBtnA.click();
+    await flushMicrotasks();
+
+    const runActionRpcsA = h.sentRpcs.filter((r) => r.action === "run_action");
+    expect(runActionRpcsA).toHaveLength(1);
+    expect((runActionRpcsA[0]!.input as { chatId: string }).chatId).toBe("chat-a");
+
+    // Backend emits active run status for chat-a (running, then streaming)
+    const runA = {
+      runId: "run-chat-a",
+      actionId: "guided_response" as const,
+      chatId: "chat-a",
+      startedAt: 1000,
+      messageId: "msg-a1",
+      swipeId: 0,
+      hasContentOutput: false,
+      characterId: "char-alpha",
+      characterName: "Alpha Hero",
+      avatarUrl: "/api/v1/characters/char-alpha/avatar?thumb=1",
+    };
+    h.emitFromBackend({
+      type: "gg:status",
+      chatId: "chat-a",
+      run: runA,
+    });
+
+    // While viewing chat-a: Stop button is shown on toolbar, and no floating Chat Head is shown for chat-a
+    expect(h.actionsMount.querySelector(".gg-btn.is-running")).not.toBeNull();
+    expect(
+      h.actionsMount
+        .querySelector('[data-gg-action="guided_response"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("Stop Guided Response");
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-a"]')).toBeNull();
+
+    // 2. Switch to chat-b while chat-a continues running in background
+    h.setChat("chat-b", { mounted: true, text: "Steer chat-b response" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+    await flushMicrotasks();
+
+    // In chat-b: toolbar is NOT locked by chat-a's run (no Stop button; action buttons are enabled)
+    expect(h.actionsMount.querySelector(".gg-btn.is-running")).toBeNull();
+    const responseBtnB = h.actionsMount.querySelector<HTMLButtonElement>(
+      '[data-gg-action="guided_response"]',
+    )!;
+    expect(responseBtnB).not.toBeNull();
+    expect(responseBtnB.disabled).toBe(false);
+    expect(responseBtnB.getAttribute("aria-label")).toBe("Guided Response");
+
+    // Floating Chat Head for chat-a appears in document.body in running state
+    let headA = document.body.querySelector<HTMLButtonElement>(
+      '.gg-chat-head[data-chat-id="chat-a"]',
+    );
+    expect(headA).not.toBeNull();
+    expect(headA?.classList.contains("is-running")).toBe(true);
+    expect(headA?.classList.contains("is-streaming")).toBe(false);
+    expect(headA?.getAttribute("aria-label")).toContain("Alpha Hero");
+
+    // chat-a transitions to streaming (hasContentOutput: true)
+    h.emitFromBackend({
+      type: "gg:status",
+      chatId: "chat-a",
+      run: { ...runA, hasContentOutput: true },
+    });
+    headA = document.body.querySelector<HTMLButtonElement>(
+      '.gg-chat-head[data-chat-id="chat-a"]',
+    );
+    expect(headA).not.toBeNull();
+    expect(headA?.classList.contains("is-running")).toBe(true);
+    expect(headA?.classList.contains("is-streaming")).toBe(true);
+
+    // 3. Can trigger a guided action in chat-b while chat-a is still streaming in the background
+    responseBtnB.click();
+    await flushMicrotasks();
+    const allRunRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
+    expect(allRunRpcs).toHaveLength(2);
+    expect((allRunRpcs[1]!.input as { chatId: string }).chatId).toBe("chat-b");
+    h.resolveLastRpc(
+      { runId: "run-chat-b", actionId: "guided_response", chatId: "chat-b", aborted: false },
+      "run_action",
+    );
+    await flushMicrotasks();
+
+    // 4. Switching back to chat-a while chat-a is still streaming hides chat-a's Chat Head and shows chat-a's Stop button
+    h.setChat("chat-a", { mounted: true, text: "" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+    await flushMicrotasks();
+
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-a"]')).toBeNull();
+    expect(h.actionsMount.querySelector(".gg-btn.is-running")).not.toBeNull();
+
+    // Switch back to chat-b again while chat-a is still streaming
+    h.setChat("chat-b", { mounted: true, text: "" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+    await flushMicrotasks();
+
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-a"]')).not.toBeNull();
+    expect(h.actionsMount.querySelector(".gg-btn.is-running")).toBeNull();
+
+    // 5. chat-a completes while viewing chat-b -> Chat Head turns green (.is-completed) with notification pip
+    h.emitFromBackend({
+      type: "gg:status",
+      chatId: "chat-a",
+      run: null,
+      done: true,
+      aborted: false,
+    });
+    h.emitFromBackend({
+      type: "gg:reply",
+      requestId: runActionRpcsA[0]!.requestId,
+      result: { runId: "run-chat-a", actionId: "guided_response", chatId: "chat-a", aborted: false },
+    });
+    await flushMicrotasks();
+
+    headA = document.body.querySelector<HTMLButtonElement>(
+      '.gg-chat-head[data-chat-id="chat-a"]',
+    );
+    expect(headA).not.toBeNull();
+    expect(headA?.classList.contains("is-completed")).toBe(true);
+    expect(headA?.classList.contains("is-running")).toBe(false);
+    expect(headA?.querySelector(".gg-chat-head-pip")).not.toBeNull();
+
+    // 6. Clicking the completed Chat Head invokes route navigation to chat-a and dismisses the completed indicator
+    headA!.click();
+    expect(invokedRoutes).toEqual([
+      {
+        ref: { kind: "route", id: "/chat/:chatId" },
+        params: { chatId: "chat-a" },
+      },
+    ]);
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-a"]')).toBeNull();
+    expect(document.body.querySelector(".gg-chat-heads-root")).toBeNull();
+
+    // 7. Background impersonate final draft arriving while viewing chat-b is buffered and applied when switching back to chat-a
+    h.emitFromBackend({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-a",
+      text: "Buffered impersonation draft for chat-a",
+      done: true,
+      aborted: false,
+    });
+    expect(h.getComposerText()).toBe("");
+
+    h.setChat("chat-a", { mounted: true, text: "" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+    await flushMicrotasks();
+    expect(h.getComposerText()).toBe("Buffered impersonation draft for chat-a");
+
+    teardown();
+  });
+
+  test("audit regressions: background CHAT_CHANGED preserves head, refresh statusSeq preserves concurrent runs, pendingImpersonateDrafts survives failed setText, and ChatHeadController handles sidebar/surfaces/img errors", async () => {
+    // 1. CHAT_CHANGED on background chat-b does NOT hide/dismiss chat-b's active background head while viewing chat-a;
+    //    refresh() statusSeq race preserves concurrent runs updated via gg:status while get_bootstrap is in flight;
+    //    pendingImpersonateDrafts is NOT deleted when setText throws, and applies on subsequent CHAT_SWITCHED.
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+    await flushMicrotasks();
+
+    // Start background run in chat-b while viewing chat-a
+    const runB = {
+      runId: "run-b-1",
+      actionId: "guided_response" as const,
+      chatId: "chat-b",
+      startedAt: 2000,
+      messageId: "msg-b1",
+      swipeId: 0,
+      hasContentOutput: false,
+    };
+    h.emitFromBackend({ type: "gg:status", chatId: "chat-b", run: runB });
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+    // StreamingIndicator must NOT mount onto chat-a for chat-b's run
+    expect(h.getInjectCounts().injectCalls).toBe(0);
+
+    // Emit CHAT_CHANGED referencing background chat-b while active chat remains chat-a
+    h.emitEvent("CHAT_CHANGED", { chatId: "chat-b" });
+    await flushMicrotasks();
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+    // Complete chat-b in background -> completed head appears; CHAT_CHANGED for chat-b still does not dismiss it
+    h.emitFromBackend({
+      type: "gg:status",
+      chatId: "chat-b",
+      run: null,
+      done: true,
+      aborted: false,
+    });
+    h.emitEvent("CHAT_CHANGED", { chatId: "chat-b" });
+    await flushMicrotasks();
+    const completedHeadB = document.body.querySelector<HTMLButtonElement>(
+      '.gg-chat-head[data-chat-id="chat-b"]',
+    );
+    expect(completedHeadB?.classList.contains("is-completed")).toBe(true);
+
+    // Trigger refresh(), then emit a new gg:status for chat-c BEFORE get_bootstrap resolves
+    h.emitFromBackend({ type: "gg:changed", reason: "permissions" });
+    const pendingBootstrap = h.sentRpcs.filter((r) => r.action === "get_bootstrap").at(-1)!;
+    const runC = {
+      runId: "run-c-1",
+      actionId: "guided_response" as const,
+      chatId: "chat-c",
+      startedAt: 3000,
+      hasContentOutput: true,
+    };
+    h.emitFromBackend({ type: "gg:status", chatId: "chat-c", run: runC });
+    // Resolve stale get_bootstrap with activeRuns: [] -> newer chat-c run must survive!
+    h.emitFromBackend({
+      type: "gg:reply",
+      requestId: pendingBootstrap.requestId,
+      result: makeBootstrapView({ activeRun: null, activeRuns: [] }),
+    });
+    await flushMicrotasks();
+    expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-c"]')).not.toBeNull();
+
+    // pendingImpersonateDrafts: failing setText while viewing chat-a must NOT delete the buffered draft
+    h.setComposerState({ throwOnWrite: true });
+    h.emitFromBackend({
+      type: "gg:impersonate-chunk",
+      chatId: "chat-a",
+      text: "Draft kept after setText error",
+      done: true,
+      aborted: false,
+    });
+    expect(h.getComposerText()).toBe("");
+
+    // Switch away and back with working composer -> buffered draft is applied!
+    h.setChat("chat-b", { mounted: true, text: "" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+    h.setComposerState({ throwOnWrite: false });
+    h.setChat("chat-a", { mounted: true, text: "" });
+    h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+    await flushMicrotasks();
+    expect(h.getComposerText()).toBe("Draft kept after setText error");
+
+    teardown();
+
+    // 2. ChatHeadController unit regressions:
+    //    - sidebar [data-chat-id] does NOT trigger hasNativeChatHead false positive
+    //    - img error swaps to initials in-place without rebuilding rootEl or sibling heads
+    //    - surfaces.invoke async rejection falls back to history.pushState + popstate and dismisses completed head
+    const sidebarItem = document.createElement("div");
+    sidebarItem.setAttribute("data-chat-id", "chat-bg-1");
+    document.body.append(sidebarItem);
+
+    const nativeHeadHost = document.createElement("div");
+    const nativeHead = document.createElement("button");
+    nativeHead.setAttribute("data-head-idx", "0");
+    nativeHead.setAttribute("data-chat-id", "chat-native");
+    nativeHeadHost.append(nativeHead);
+    document.body.append(nativeHeadHost);
+
+    const win = document.defaultView!;
+    const popstateEvents: string[] = [];
+    const origPushState = win.history.pushState.bind(win.history);
+    const pushStateCalls: string[] = [];
+    win.history.pushState = ((_data: unknown, _unused: string, url?: string | URL | null) => {
+      pushStateCalls.push(String(url ?? ""));
+    }) as typeof win.history.pushState;
+    const onPopState = () => popstateEvents.push(win.location.pathname);
+    win.addEventListener("popstate", onPopState);
+
+    const headCtx = {
+      getActiveChat: () => ({ chatId: "chat-active" }),
+      events: { on: () => () => {} },
+      host: {
+        surfaces: {
+          invoke: () => Promise.reject(new Error("surface unavailable")),
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const controller = new ChatHeadController(headCtx);
+    try {
+      controller.syncRuns(
+        [
+          {
+            runId: "r-bg-1",
+            actionId: "guided_response",
+            chatId: "chat-bg-1",
+            startedAt: 100,
+            characterName: "Aria Vance",
+            avatarUrl: "/api/v1/characters/c1/avatar",
+          },
+          {
+            runId: "r-bg-2",
+            actionId: "guided_response",
+            chatId: "chat-bg-2",
+            startedAt: 101,
+            characterName: "Kai Thorne",
+            avatarUrl: "/api/v1/characters/c2/avatar",
+          },
+          {
+            runId: "r-native",
+            actionId: "guided_response",
+            chatId: "chat-native",
+            startedAt: 102,
+          },
+        ],
+        "chat-active",
+      );
+
+      // Sidebar [data-chat-id] did NOT hide chat-bg-1; real native [data-head-idx][data-chat-id] DID hide chat-native
+      const head1 = document.body.querySelector<HTMLButtonElement>('.gg-chat-head[data-chat-id="chat-bg-1"]');
+      const head2 = document.body.querySelector<HTMLButtonElement>('.gg-chat-head[data-chat-id="chat-bg-2"]');
+      expect(head1).not.toBeNull();
+      expect(head2).not.toBeNull();
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-native"]')).toBeNull();
+
+      // img error on head1 replaces just that <img> with initials in-place without rebuilding rootEl or head2
+      const rootBefore = document.body.querySelector(".gg-chat-heads-root");
+      const img1 = head1!.querySelector("img.gg-chat-head-avatar")!;
+      img1.dispatchEvent(new (document.defaultView!.Event)("error"));
+      expect(document.body.querySelector(".gg-chat-heads-root")).toBe(rootBefore);
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-bg-2"]')).toBe(head2);
+      expect(head1!.querySelector("img.gg-chat-head-avatar")).toBeNull();
+      expect(head1!.querySelector(".gg-chat-head-initials")?.textContent).toBe("AV");
+
+      // Complete chat-bg-1, click it -> surfaces.invoke rejects -> falls back to history.pushState + popstate -> dismisses completed head
+      controller.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-bg-1", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+      const completed1 = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-bg-1"]',
+      )!;
+      expect(completed1.classList.contains("is-completed")).toBe(true);
+      completed1.click();
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(pushStateCalls).toEqual(["/chat/chat-bg-1"]);
+      expect(popstateEvents).toHaveLength(1);
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-bg-1"]')).toBeNull();
+    } finally {
+      controller.destroy();
+      win.removeEventListener("popstate", onPopState);
+      win.history.pushState = origPushState;
+      sidebarItem.remove();
+      nativeHeadHost.remove();
+    }
+  });
+
+  test("post-audit polish: ChatHeadController deferred setPointerCapture, drag persistence, collision bounds, dismissal, resize clamp, custom avatarUrl + negative cache", async () => {
+    const win = document.defaultView!;
+    const origInnerWidth = win.innerWidth;
+    const origInnerHeight = win.innerHeight;
+    const origLocalStorage = (globalThis as unknown as { localStorage?: Storage }).localStorage;
+
+    const storeMap = new Map<string, string>();
+    const fakeStorage = {
+      getItem: (k: string) => storeMap.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        storeMap.set(k, v);
+      },
+      removeItem: (k: string) => {
+        storeMap.delete(k);
+      },
+      clear: () => storeMap.clear(),
+      key: (i: number) => Array.from(storeMap.keys())[i] ?? null,
+      get length() {
+        return storeMap.size;
+      },
+    } as Storage;
+    (globalThis as unknown as { localStorage: Storage }).localStorage = fakeStorage;
+
+    Object.defineProperty(win, "innerWidth", { value: 1000, configurable: true });
+    Object.defineProperty(win, "innerHeight", { value: 800, configurable: true });
+
+    const navCalls: string[] = [];
+    const charGetCalls: string[] = [];
+    const headCtx = {
+      getActiveChat: () => ({ chatId: "chat-active" }),
+      events: { on: () => () => {} },
+      characters: {
+        get: async (id: string) => {
+          charGetCalls.push(id);
+          if (id === "char-custom") {
+            return { id, name: "Custom Avatar", avatarUrl: "https://cdn.example/custom.png" };
+          }
+          if (id === "char-empty") {
+            return null;
+          }
+          return { id, name: "Fallback" };
+        },
+      },
+      host: {
+        surfaces: {
+          invoke: (_ref: unknown, params: { chatId: string }) => {
+            navCalls.push(params.chatId);
+            return Promise.resolve();
+          },
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const controller = new ChatHeadController(headCtx);
+    try {
+      // 1. Custom avatarUrl override + negative caching on char-empty
+      controller.syncRuns(
+        [
+          {
+            runId: "r-custom",
+            actionId: "guided_response",
+            chatId: "chat-custom",
+            startedAt: 10,
+            characterId: "char-custom",
+            avatarUrl: "/api/v1/characters/char-custom/avatar?thumb=1",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+          {
+            runId: "r-empty",
+            actionId: "guided_response",
+            chatId: "chat-empty",
+            startedAt: 11,
+            characterId: "char-empty",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+        ],
+        "chat-active",
+      );
+      await flushMicrotasks();
+
+      const customImg = document.body.querySelector<HTMLImageElement>(
+        '.gg-chat-head[data-chat-id="chat-custom"] img.gg-chat-head-avatar',
+      )!;
+      expect(customImg.src).toBe("https://cdn.example/custom.png");
+
+      // Repeated syncRuns for char-empty must NOT re-query characters.get (negative cached)
+      expect(charGetCalls.filter((id) => id === "char-empty")).toHaveLength(1);
+      controller.syncRuns(
+        [
+          {
+            runId: "r-custom",
+            actionId: "guided_response",
+            chatId: "chat-custom",
+            startedAt: 10,
+            characterId: "char-custom",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+          {
+            runId: "r-empty",
+            actionId: "guided_response",
+            chatId: "chat-empty",
+            startedAt: 11,
+            characterId: "char-empty",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+        ],
+        "chat-active",
+      );
+      await flushMicrotasks();
+      expect(charGetCalls.filter((id) => id === "char-empty")).toHaveLength(1);
+
+      // 2. Deferred setPointerCapture: NOT called on pointerdown or <=6px move, click navigates
+      const rootEl = document.body.querySelector<HTMLDivElement>(".gg-chat-heads-root")!;
+      const captureCalls: number[] = [];
+      const releaseCalls: number[] = [];
+      let capturedId: number | null = null;
+      rootEl.setPointerCapture = (id: number) => {
+        capturedId = id;
+        captureCalls.push(id);
+      };
+      rootEl.hasPointerCapture = (id: number) => capturedId === id;
+      rootEl.releasePointerCapture = (id: number) => {
+        if (capturedId === id) capturedId = null;
+        releaseCalls.push(id);
+      };
+
+      const PointerEvt = win.PointerEvent;
+      const customBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-custom"]',
+      )!;
+
+      customBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 7,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 900,
+          clientY: 200,
+        }),
+      );
+      // Small move <= 6px
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 7,
+          pointerType: "mouse",
+          clientX: 903,
+          clientY: 204,
+        }),
+      );
+      expect(captureCalls).toEqual([]);
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 7,
+          pointerType: "mouse",
+          clientX: 903,
+          clientY: 204,
+        }),
+      );
+      customBtn.click();
+      await flushMicrotasks();
+      expect(navCalls).toEqual(["chat-custom"]);
+
+      // 3. Drag >6px calls setPointerCapture, suppresses click, and persists gg:chatHeadsPos
+      customBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 9,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 900,
+          clientY: 200,
+        }),
+      );
+      expect(captureCalls).toEqual([]);
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 9,
+          pointerType: "mouse",
+          clientX: 800,
+          clientY: 240,
+        }),
+      );
+      expect(captureCalls).toEqual([9]);
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 9,
+          pointerType: "mouse",
+          clientX: 800,
+          clientY: 240,
+        }),
+      );
+      expect(releaseCalls).toEqual([9]);
+      customBtn.click();
+      await flushMicrotasks();
+      expect(navCalls).toEqual(["chat-custom"]);
+      const savedPos = JSON.parse(storeMap.get("gg:chatHeadsPos") ?? "null");
+      expect(savedPos).toEqual({
+        xPct: expect.any(Number),
+        yPct: expect.any(Number),
+      });
+      expect(savedPos.xPct).toBeLessThan(94);
+
+      // 4. Resize clamps root position within viewport bounds
+      Object.defineProperty(win, "innerWidth", { value: 180, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: 160, configurable: true });
+      win.dispatchEvent(new win.Event("resize"));
+      const leftPct = parseFloat(rootEl.style.left);
+      const topPct = parseFloat(rootEl.style.top);
+      expect(leftPct).toBeGreaterThanOrEqual(0);
+      expect(leftPct).toBeLessThanOrEqual(100);
+      expect(topPct).toBeGreaterThanOrEqual(0);
+      expect(topPct).toBeLessThanOrEqual(100);
+
+      // 5. Native chat head collision avoidance respects min/max bounds
+      Object.defineProperty(win, "innerWidth", { value: 1000, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: 800, configurable: true });
+      const nativeContainer = document.createElement("div");
+      const nativeBtn = document.createElement("button");
+      nativeBtn.setAttribute("data-head-idx", "0");
+      nativeBtn.setAttribute("data-chat-id", "chat-native-other");
+      nativeContainer.append(nativeBtn);
+      nativeContainer.getBoundingClientRect = () =>
+        ({
+          left: 800,
+          top: 160,
+          right: 880,
+          bottom: 780, // belowCy would exceed maxY -> must pick aboveCy or leftCx!
+          width: 80,
+          height: 620,
+          x: 800,
+          y: 160,
+          toJSON: () => ({}),
+        }) as DOMRect;
+      document.body.append(nativeContainer);
+      // Re-position near nativeContainer (84% x 25%) and verify avoidance keeps it inside bounds
+      storeMap.set("gg:chatHeadsPos", JSON.stringify({ xPct: 84, yPct: 25 }));
+      const collisionController = new ChatHeadController(headCtx);
+      collisionController.syncRuns(
+        [
+          {
+            runId: "r-col",
+            actionId: "guided_response",
+            chatId: "chat-col",
+            startedAt: 1,
+          },
+        ],
+        "chat-active",
+      );
+      const colRoot = document.body.querySelectorAll<HTMLDivElement>(".gg-chat-heads-root")[1]!;
+      const colTopPx = (parseFloat(colRoot.style.top) / 100) * 800;
+      const colLeftPx = (parseFloat(colRoot.style.left) / 100) * 1000;
+      // Either nudged above native (top <= 160) or left of native (left <= 800), and still in viewport
+      expect(colTopPx < 160 || colLeftPx < 800).toBe(true);
+      expect(colTopPx).toBeGreaterThanOrEqual(12);
+      expect(colLeftPx).toBeGreaterThanOrEqual(12);
+      collisionController.destroy();
+      nativeContainer.remove();
+
+      // 6. × dismiss button & contextmenu dismiss completed heads
+      controller.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-custom", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+      controller.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-empty", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+      const dismissBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head-item:has([data-chat-id="chat-custom"]) [data-gg-chat-head-dismiss]',
+      ) ?? document.body.querySelector<HTMLButtonElement>('[data-gg-chat-head-dismiss]')!;
+      dismissBtn.click();
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-custom"]')).toBeNull();
+
+      const emptyCompletedBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-empty"]',
+      )!;
+      emptyCompletedBtn.dispatchEvent(new win.MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-empty"]')).toBeNull();
+    } finally {
+      controller.destroy();
+      Object.defineProperty(win, "innerWidth", { value: origInnerWidth, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: origInnerHeight, configurable: true });
+      if (origLocalStorage === undefined) {
+        delete (globalThis as unknown as { localStorage?: Storage }).localStorage;
+      } else {
+        (globalThis as unknown as { localStorage: Storage }).localStorage = origLocalStorage;
+      }
+    }
+  });
+
+  test("post-audit polish: CHAT_DELETED and MESSAGE_DELETED cleanup across frontend, ChatHeadController, and PillMetricsController, plus truncated tail wider read", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // Background run + queued impersonate draft in chat-b, plus active run in chat-a
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-b",
+        run: {
+          runId: "r-b",
+          actionId: "guided_response",
+          chatId: "chat-b",
+          startedAt: 100,
+          hasContentOutput: true,
+        },
+      });
+      h.emitFromBackend({
+        type: "gg:impersonate-chunk",
+        chatId: "chat-b",
+        text: "Draft for deleted chat",
+        done: true,
+        aborted: false,
+      });
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+      // Queue PillMetrics for chat-b msg-b1 (not in active tail yet) and chat-a msg-a1
+      h.setCustomGetMessages(async (chatId, opts) => {
+        if (chatId === "chat-b") {
+          return { data: [], total: 10 }; // truncated page (total > data.length even when data.length < 50!)
+        }
+        return {
+          data:
+            opts?.limit === 200
+              ? [{ id: "msg-a-old", chat_id: "chat-a", swipe_id: 0, extra: {} }]
+              : [{ id: "msg-a-recent", chat_id: "chat-a", swipe_id: 0, extra: {} }],
+          total: 10, // total=10 > data.length=1 => isPageTruncated true even though length < 50
+        };
+      });
+
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-b",
+        messageId: "msg-b1",
+        swipeId: 0,
+        tokenCount: 42,
+      });
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-a-old",
+        swipeId: 0,
+        tokenCount: 99,
+      });
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      // msg-a-old was found via wider tail read (limit: 200) even though initial page had < 50 items
+      expect(h.getGetMessagesCalls().some((c) => c.chatId === "chat-a" && c.options?.limit === 200)).toBe(true);
+      expect(h.getUpdateMessageCalls().some((u) => u.messageId === "msg-a-old")).toBe(true);
+
+      // Now queue another metrics entry for chat-a msg-a-del while on swipe 1 (currently swipe 0), then emit MESSAGE_DELETED
+      h.setCustomGetMessages(async () => ({
+        data: [{ id: "msg-a-del", chat_id: "chat-a", swipe_id: 0, extra: {} }],
+        total: 1,
+      }));
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-a",
+        messageId: "msg-a-del",
+        swipeId: 1,
+        tokenCount: 55,
+      });
+      await flushMicrotasks();
+      const updatesBeforeMsgDel = h.getUpdateMessageCalls().length;
+      h.emitEvent("MESSAGE_DELETED", { chatId: "chat-a", messageId: "msg-a-del" });
+      // Even if a MESSAGE_SWIPED arrives afterwards, queued metrics were dropped on MESSAGE_DELETED
+      h.emitEvent("MESSAGE_SWIPED", { chatId: "chat-a", message: { id: "msg-a-del", swipe_id: 1 } });
+      await flushMicrotasks();
+      expect(h.getUpdateMessageCalls().length).toBe(updatesBeforeMsgDel);
+
+      // CHAT_DELETED clears chat-b's head, pending impersonate draft, and pending metrics
+      h.emitEvent("CHAT_DELETED", { chatId: "chat-b" });
+      await flushMicrotasks();
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).toBeNull();
+
+      // Switching to chat-b must NOT populate the deleted chat's impersonate draft
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      await flushMicrotasks();
+      expect(h.getComposerText()).toBe("");
+    } finally {
+      teardown();
+    }
+  });
+
+  test("post-audit polish: pendingImpersonateDrafts retries when composer chatId lags behind CHAT_SWITCHED and survives interleaved refresh()", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-b",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 1. Impersonate completes for chat-a while viewing chat-b
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: {
+          runId: "imp-a",
+          actionId: "guided_impersonate",
+          chatId: "chat-a",
+          startedAt: 100,
+        },
+      });
+      h.emitFromBackend({
+        type: "gg:impersonate-chunk",
+        chatId: "chat-a",
+        text: "Retried draft for chat-a",
+        done: true,
+        aborted: false,
+      });
+
+      // 2. Interleaved refresh() clears activeRunsByChat before terminal gg:status(run: null) arrives
+      h.emitFromBackend({ type: "gg:changed", reason: "settings" });
+      h.resolveLastRpc(makeBootstrapView({ activeRun: null, activeRuns: [] }), "get_bootstrap");
+      await flushMicrotasks();
+
+      // Terminal gg:status with run: null (prevEventChatRun is undefined) must NOT drop chat-a's buffered draft
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: null,
+        done: true,
+        aborted: false,
+      });
+
+      // 3. Switch to chat-a while composer.getState().chatId lags behind at "chat-b"
+      h.setChat("chat-a", { mounted: true, text: "" });
+      h.setComposerState({ chatId: "chat-b" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      expect(h.getComposerText()).toBe("");
+
+      // Composer catches up to "chat-a" before retry timer fires -> retry applies the buffered draft!
+      h.setComposerState({ chatId: "chat-a" });
+      await new Promise((r) => setTimeout(r, 35));
+      expect(h.getComposerText()).toBe("Retried draft for chat-a");
+    } finally {
+      teardown();
+    }
+  });
+
+  test("post-audit polish: rebuildDrawer: true does not tear down drawer twice when saved settings match optimistic settings", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+    });
+    const teardown = setup(h.ctx);
+    try {
+      const initialView = makeBootstrapView();
+      h.resolveLastRpc(initialView, "get_bootstrap");
+      await flushMicrotasks();
+
+      const tabRoot = h.tabRoot;
+      const beforeCounts = h.getDestroyCounts();
+
+      // Trigger a rebuildDrawer: true save via "Move down" button in buttonOrder
+      const moveDownBtn = tabRoot.querySelector<HTMLButtonElement>(
+        '.gg-order-item button[aria-label^="Move "][aria-label$=" down"]',
+      )!;
+      expect(moveDownBtn).not.toBeNull();
+      moveDownBtn.click();
+
+      // Optimistic rebuild tore down components once
+      const afterOptimistic = h.getDestroyCounts();
+      expect(afterOptimistic.textArea).toBeGreaterThan(beforeCounts.textArea);
+      expect(afterOptimistic.combobox).toBeGreaterThan(beforeCounts.combobox);
+
+      // Resolve save_settings with the exact optimistic settings payload
+      const saveReq = h.sentRpcs.filter((r) => r.action === "save_settings").at(-1)!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: saveReq.requestId,
+        result: saveReq.input,
+      });
+      await flushMicrotasks();
+
+      // Drawer must NOT tear down a second time when saved equals view.settings!
+      expect(h.getDestroyCounts()).toEqual(afterOptimistic);
+    } finally {
+      teardown();
+    }
   });
 });

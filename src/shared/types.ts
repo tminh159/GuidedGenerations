@@ -90,6 +90,9 @@ export interface ActiveRunState {
   swipeId?: number;
   backgroundSwipe?: boolean;
   hasContentOutput?: boolean;
+  characterId?: string;
+  characterName?: string;
+  avatarUrl?: string;
 }
 
 export interface ExtensionBootstrapView {
@@ -98,10 +101,12 @@ export interface ExtensionBootstrapView {
   presets: PresetOptionSummary[];
   recovery: RecoveryEntry[];
   activeRun: ActiveRunState | null;
+  activeRuns?: ActiveRunState[];
   permissions: {
     generation: boolean;
     chats: boolean;
     chat_mutation: boolean;
+    characters?: boolean;
     presets: boolean;
     regex_scripts: boolean;
     interceptor: boolean;
@@ -175,26 +180,33 @@ export interface NativeGenerationMetrics {
   presetName?: string;
 }
 
+interface StandardBackendPushEvent<
+  T extends
+    | "gg:changed"
+    | "gg:status"
+    | "gg:impersonate-chunk"
+    | "gg:recovery-updated",
+> {
+  type: T;
+  reason?: string;
+  run?: ActiveRunState | null;
+  chatId?: string;
+  text?: string;
+  done?: boolean;
+  aborted?: boolean;
+  error?: string;
+  recovery?: RecoveryEntry[];
+  messageId?: string;
+  swipeId?: number;
+  tokenCount?: number | null;
+  generationMetrics?: NativeGenerationMetrics | null;
+}
+
 export type BackendPushEvent =
-  | {
-      type:
-        | "gg:changed"
-        | "gg:status"
-        | "gg:impersonate-chunk"
-        | "gg:recovery-updated";
-      reason?: string;
-      run?: ActiveRunState | null;
-      chatId?: string;
-      text?: string;
-      done?: boolean;
-      aborted?: boolean;
-      error?: string;
-      recovery?: RecoveryEntry[];
-      messageId?: string;
-      swipeId?: number;
-      tokenCount?: number | null;
-      generationMetrics?: NativeGenerationMetrics | null;
-    }
+  | StandardBackendPushEvent<"gg:changed">
+  | StandardBackendPushEvent<"gg:status">
+  | StandardBackendPushEvent<"gg:impersonate-chunk">
+  | StandardBackendPushEvent<"gg:recovery-updated">
   | {
       type: "gg:generation_metrics";
       chatId: string;

@@ -57,6 +57,7 @@ export function registerBackend(api: SpindleAPI) {
   }
 
   const runner = new GuidedGenerationRunner(api, store, emitFrontend);
+  runner.syncInterceptorRegistration();
 
   async function buildBootstrapView(userId?: string): Promise<ExtensionBootstrapView> {
     const [settings, catalogs, recovery] = await Promise.all([
@@ -71,10 +72,12 @@ export function registerBackend(api: SpindleAPI) {
       presets: catalogs.presets,
       recovery,
       activeRun: runner.getActiveRun(userId),
+      activeRuns: runner.getActiveRuns(userId),
       permissions: {
         generation: api.permissions.has("generation"),
         chats: api.permissions.has("chats"),
         chat_mutation: api.permissions.has("chat_mutation"),
+        characters: api.permissions.has("characters"),
         presets: api.permissions.has("presets"),
         regex_scripts: api.permissions.has("regex_scripts"),
         interceptor: api.permissions.has("interceptor"),
@@ -100,6 +103,9 @@ export function registerBackend(api: SpindleAPI) {
           return;
         }
         case "save_settings": {
+          if (!isRecord(req.input)) {
+            throw new Error("Invalid settings payload: expected an object.");
+          }
           const { settings, recoveryPruned, recovery } = await store.saveSettingsWithMeta(
             req.input,
             userId,
@@ -118,10 +124,15 @@ export function registerBackend(api: SpindleAPI) {
         }
         case "abort_action": {
           const record = isRecord(req.input) ? req.input : {};
-          const aborted = runner.abortCurrent(
-            userId,
-            typeof record.runId === "string" ? record.runId : undefined,
-          );
+          const runId =
+            typeof record.runId === "string" && record.runId.trim().length > 0
+              ? record.runId.trim()
+              : undefined;
+          const chatId =
+            typeof record.chatId === "string" && record.chatId.trim().length > 0
+              ? record.chatId.trim()
+              : undefined;
+          const aborted = runner.abortCurrent(userId, runId, chatId);
           reply({ aborted });
           return;
         }
@@ -140,11 +151,12 @@ export function registerBackend(api: SpindleAPI) {
             reply(await store.getRecovery(userId));
             return;
           }
+          const rawChatId = typeof record.chatId === "string" ? record.chatId.trim() : "";
           const recovery = await store.pushRecovery(
             {
               text,
               actionId,
-              chatId: typeof record.chatId === "string" ? record.chatId : null,
+              chatId: rawChatId.length > 0 ? rawChatId : null,
             },
             userId,
           );
@@ -201,6 +213,7 @@ export function registerBackend(api: SpindleAPI) {
 
   disposers.push(
     api.permissions.onChanged((arg1?: unknown, arg2?: unknown) => {
+      runner.syncInterceptorRegistration();
       const userId =
         typeof arg1 === "string" && arg1.length > 0
           ? arg1

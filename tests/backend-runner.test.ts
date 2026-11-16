@@ -58,7 +58,13 @@ function makeMessage(
 interface HarnessOptions {
   permissions?: Partial<
     Record<
-      "generation" | "chats" | "chat_mutation" | "presets" | "regex_scripts" | "interceptor",
+      | "generation"
+      | "chats"
+      | "chat_mutation"
+      | "characters"
+      | "presets"
+      | "regex_scripts"
+      | "interceptor",
       boolean
     >
   >;
@@ -109,6 +115,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     generation: true,
     chats: true,
     chat_mutation: true,
+    characters: true,
     presets: true,
     regex_scripts: true,
     interceptor: true,
@@ -390,7 +397,23 @@ function createSpindleHarness(options: HarnessOptions = {}) {
           } else if (patch.swipes || typeof patch.swipe_id === "number") {
             target.content = target.swipes[target.swipe_id] ?? "";
           }
-          if (patch.swipe_reasoning) {
+          if (patch.swipe_reasoning !== undefined) {
+            if (patch.reasoning !== undefined) {
+              throw new Error("Supply reasoning or swipe_reasoning, not both");
+            }
+            for (const slot of patch.swipe_reasoning) {
+              if (
+                slot !== null &&
+                slot.duration != null &&
+                (typeof slot.duration !== "number" ||
+                  !Number.isFinite(slot.duration) ||
+                  slot.duration < 0)
+              ) {
+                throw new Error(
+                  "Each swipe_reasoning entry must be null or contain text and an optional non-negative duration in milliseconds",
+                );
+              }
+            }
             const reasoningBySwipe = patch.swipe_reasoning.map((slot) => slot?.text ?? null);
             const reasoningDurationBySwipe = patch.swipe_reasoning.map(
               (slot) => slot?.duration ?? null,
@@ -403,6 +426,14 @@ function createSpindleHarness(options: HarnessOptions = {}) {
               reasoning_duration: reasoningDurationBySwipe[target.swipe_id] ?? null,
             };
           } else if (patch.reasoning) {
+            if (
+              patch.reasoning.duration != null &&
+              (typeof patch.reasoning.duration !== "number" ||
+                !Number.isFinite(patch.reasoning.duration) ||
+                patch.reasoning.duration < 0)
+            ) {
+              throw new Error("reasoning duration must be a finite non-negative number");
+            }
             const nextExtra: Record<string, unknown> = {
               ...target.extra,
               ...(patch.reasoning.text !== undefined ? { reasoning: patch.reasoning.text } : {}),
@@ -615,10 +646,11 @@ describe("SettingsStore operator isolation, write queue, and guards", () => {
 });
 
 describe("GuidedGenerationRunner actions, safety, and operator isolation", () => {
-  test("guided_response creates blank slot before dryRun, strips createdMessageId from prompt, sets preset_contexts once, and keeps space on 0-token error/abort", async () => {
+  test("guided_response defers blank slot creation until after dryRun, sets preset_contexts once, and keeps space on 0-token error/abort", async () => {
     let streamMode: "normal" | "pre-token-error" | "pre-token-abort" = "normal";
     let runnerRef: GuidedGenerationRunner;
     let sawBlankBeforeDryRun = false;
+    let sawBlankBeforeStream = false;
 
     const harness = createSpindleHarness({
       activePresetId: "p-active",
@@ -628,17 +660,11 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
       dryRunImpl: async () => {
         const msgs = harness.chatMessages.get("chat-1")!;
         const last = msgs[msgs.length - 1];
-        sawBlankBeforeDryRun =
-          msgs.length >= 2 &&
-          last?.role === "assistant" &&
-          last?.content === "" &&
-          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
-            ?.preset_id === "p-active";
+        sawBlankBeforeDryRun = msgs.length >= 2 && last?.role === "assistant" && last?.content === "";
         return {
           messages: [{ role: "user", content: "Flattened display" }],
           request_messages: [
             { role: "user", content: [{ type: "text", text: "Rich prompt" }], sourceMessageId: "m1" },
-            ...(last ? [{ role: "assistant" as const, content: "", sourceMessageId: last.id }] : []),
           ],
           parameters: { temperature: 0.7 },
           model: "gpt-4o",
@@ -646,6 +672,14 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
         };
       },
       rawStreamImpl: async function* ({ signal }) {
+        const msgs = harness.chatMessages.get("chat-1")!;
+        const last = msgs[msgs.length - 1];
+        sawBlankBeforeStream =
+          msgs.length >= 2 &&
+          last?.role === "assistant" &&
+          last?.content === "" &&
+          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
+            ?.preset_id === "p-active";
         if (streamMode === "pre-token-error") {
           throw new Error("Upstream 502");
         }
@@ -673,8 +707,9 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     await expect(
       runnerRef.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Be warm" }, "u1"),
     ).rejects.toThrow("Upstream 502");
-    expect(sawBlankBeforeDryRun).toBe(true);
-    // Blank space was eagerly created and kept on 0-token error.
+    expect(sawBlankBeforeDryRun).toBe(false);
+    expect(sawBlankBeforeStream).toBe(true);
+    // Blank space was created after dryRun and kept on 0-token error.
     expect(harness.chatMessages.get("chat-1")?.length).toBe(2);
     expect(harness.chatMessages.get("chat-1")![1]?.content).toBe("");
 
@@ -704,7 +739,7 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     expect(harness.chatMessages.get("chat-1")?.length).toBe(2);
     expect(harness.dryRunCalls[0]?.input.includeRequestMessages).toBe(true);
     const sentMessages = harness.rawStreamCalls[2]?.messages as LlmMessageDTO[];
-    // Stripped eager blank assistant message before injecting guidance!
+    // Clean prompt without phantom blank assistant message, plus injected guidance.
     expect(sentMessages.some((m) => m.role === "assistant")).toBe(false);
     expect(sentMessages[0]?.content).toEqual([{ type: "text", text: "Rich prompt" }]);
 
@@ -789,9 +824,11 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     expect(afterStreamFail[1]?.swipes).toEqual(["Original swipe 1", "Original swipe 2"]);
   });
 
-  test("guided_swipe creates slot before dryRun, strips rejected turn from prompt, and keeps slot on 0-token failure", async () => {
+  test("guided_swipe defers slot creation until after dryRun, strips rejected turn from prompt, and keeps slot on 0-token failure", async () => {
     let emitTokens = false;
     let sawEagerSlotBeforeDryRun = false;
+    let sawSlotBeforeStream = false;
+    let targetContentAtDryRun = "";
     const harness = createSpindleHarness({
       activePresetId: "p-swipe",
       chats: {
@@ -808,6 +845,7 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
       },
       dryRunImpl: async () => {
         const target = harness.chatMessages.get("chat-1")![1]!;
+        targetContentAtDryRun = target.content;
         sawEagerSlotBeforeDryRun =
           target.swipes.length === 2 &&
           target.swipes[1] === "" &&
@@ -816,11 +854,11 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
         return {
           messages: [
             { role: "user", content: "Knock knock" },
-            { role: "assistant", content: "" },
+            { role: "assistant", content: target.content },
           ],
           request_messages: [
             { role: "user", content: "Knock knock", sourceMessageId: "m1" },
-            { role: "assistant", content: "", sourceMessageId: "m2" },
+            { role: "assistant", content: target.content, sourceMessageId: "m2" },
           ],
           parameters: {},
           model: "gpt-4o",
@@ -828,6 +866,11 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
         };
       },
       rawStreamImpl: async function* () {
+        const target = harness.chatMessages.get("chat-1")![1]!;
+        sawSlotBeforeStream =
+          target.swipes.length >= 2 &&
+          target.swipes[target.swipe_id] === "" &&
+          target.content === "";
         if (!emitTokens) {
           throw new Error("0-token failure");
         }
@@ -839,11 +882,13 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     const store = new SettingsStore(harness.api);
     const runner = new GuidedGenerationRunner(harness.api, store, () => {});
 
-    // 0-token failure keeps the eagerly created swipe slot & swipe_id.
+    // 0-token failure keeps the post-dryRun created swipe slot & swipe_id.
     await expect(
       runner.run({ actionId: "guided_swipe", chatId: "chat-1", inputText: "Be mysterious" }, "u1"),
     ).rejects.toThrow("0-token failure");
-    expect(sawEagerSlotBeforeDryRun).toBe(true);
+    expect(sawEagerSlotBeforeDryRun).toBe(false);
+    expect(targetContentAtDryRun).toBe("Rejected old swipe");
+    expect(sawSlotBeforeStream).toBe(true);
     const afterFailure = harness.chatMessages.get("chat-1")![1]!;
     expect(afterFailure.swipes).toEqual(["Rejected old swipe", ""]);
     expect(afterFailure.swipe_id).toBe(1);
@@ -856,7 +901,7 @@ describe("GuidedGenerationRunner actions, safety, and operator isolation", () =>
     expect(failedPrompt.some((m) => m.role === "assistant")).toBe(false);
     expect(failedPrompt.map((m) => m.role)).toEqual(["user", "system"]);
 
-    // Successful swipe appends next slot before dryRun and streams into it without duplicate slots.
+    // Successful swipe appends next slot after dryRun and streams into it without duplicate slots.
     emitTokens = true;
     const res = await runner.run(
       { actionId: "guided_swipe", chatId: "chat-1", inputText: "Be mysterious" },
@@ -1188,6 +1233,7 @@ describe("backend handleRpc orchestration", () => {
         generation: true,
         chats: true,
         chat_mutation: true,
+        characters: true,
         presets: true,
         regex_scripts: true,
         interceptor: false,
@@ -1922,9 +1968,11 @@ describe("backend handleRpc orchestration", () => {
     expect(harness.getEventHandlerCount("MESSAGE_SWIPED")).toBe(0);
   });
 
-  test("guided_regenerate eagerly replaces trailing assistant before dryRun, strips blank slot, and restores cleanly without duplicate on 0-token abort/failure", async () => {
+  test("guided_regenerate deletes trailing assistant before dryRun, creates blank slot after dryRun, and restores cleanly without duplicate on 0-token abort/failure", async () => {
     let streamBehavior: "abort_zero" | "fail_zero" | "succeed" = "abort_zero";
     let sawBlankCreatedBeforeDryRun = false;
+    let sawDeletedAtDryRun = false;
+    let sawBlankCreatedBeforeStream = false;
     let runnerRef: GuidedGenerationRunner;
 
     const harness = createSpindleHarness({
@@ -1947,18 +1995,16 @@ describe("backend handleRpc orchestration", () => {
       dryRunImpl: async () => {
         const msgs = harness.chatMessages.get("chat-1")!;
         const last = msgs[msgs.length - 1];
+        sawDeletedAtDryRun = msgs.length === 1 && last?.id === "m1";
         sawBlankCreatedBeforeDryRun =
           msgs.length === 2 &&
           last?.id !== "m2" &&
           last?.role === "assistant" &&
-          last?.content === "" &&
-          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
-            ?.preset_id === "p-regen";
+          last?.content === "";
         return {
           messages: [],
           request_messages: [
             { role: "user", content: "Question", sourceMessageId: "m1" },
-            ...(last ? [{ role: "assistant" as const, content: "", sourceMessageId: last.id }] : []),
           ],
           parameters: {},
           model: "gpt-4o",
@@ -1966,6 +2012,15 @@ describe("backend handleRpc orchestration", () => {
         };
       },
       rawStreamImpl: async function* () {
+        const msgs = harness.chatMessages.get("chat-1")!;
+        const last = msgs[msgs.length - 1];
+        sawBlankCreatedBeforeStream =
+          msgs.length === 2 &&
+          last?.id !== "m2" &&
+          last?.role === "assistant" &&
+          last?.content === "" &&
+          (last?.metadata?.preset_contexts as Array<{ preset_id?: string }> | undefined)?.[0]
+            ?.preset_id === "p-regen";
         if (streamBehavior === "abort_zero") {
           runnerRef.abortCurrent("u1");
           const err = new Error("Aborted");
@@ -1988,7 +2043,7 @@ describe("backend handleRpc orchestration", () => {
     await store.saveSettings(settings, "u1");
     runnerRef = new GuidedGenerationRunner(harness.api, store, () => {});
 
-    // 1. 0-token abort deletes empty pre-created slot and restores snapshot without duplicate
+    // 1. 0-token abort deletes post-dryRun blank slot and restores snapshot without duplicate
     streamBehavior = "abort_zero";
     const aborted = await runnerRef.run(
       { actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try better" },
@@ -1996,7 +2051,9 @@ describe("backend handleRpc orchestration", () => {
     );
     expect(aborted.aborted).toBe(true);
     expect(aborted.messageId).toBeUndefined();
-    expect(sawBlankCreatedBeforeDryRun).toBe(true);
+    expect(sawDeletedAtDryRun).toBe(true);
+    expect(sawBlankCreatedBeforeDryRun).toBe(false);
+    expect(sawBlankCreatedBeforeStream).toBe(true);
     const afterAbort = harness.chatMessages.get("chat-1")!;
     expect(afterAbort).toHaveLength(2);
     expect(afterAbort[1]?.content).toBe("Original swipe 2");
@@ -2765,6 +2822,8 @@ describe("backend handleRpc orchestration", () => {
     for (const actionId of ["guided_response", "guided_regenerate"] as const) {
       let runAtDryRun = null as ActiveRunState | null;
       let statusAtDryRun: Array<ActiveRunState | null> = [];
+      let runAtStreamStart = null as ActiveRunState | null;
+      let statusAtStreamStart: Array<ActiveRunState | null> = [];
       let runAfterReasoning = null as ActiveRunState | null;
       let statusCountAfterReasoning = 0;
       let runAfterEmptyToken = null as ActiveRunState | null;
@@ -2795,6 +2854,11 @@ describe("backend handleRpc orchestration", () => {
           };
         },
         rawStreamImpl: async function* () {
+          runAtStreamStart = runner.getActiveRun("u1");
+          statusAtStreamStart = harness.sentFrontend
+            .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+            .map((e) => (e.payload as BackendPushEvent).run ?? null);
+
           yield { type: "reasoning", token: "Thinking..." };
           runAfterReasoning = runner.getActiveRun("u1");
           statusCountAfterReasoning = harness.sentFrontend.filter(
@@ -2829,13 +2893,17 @@ describe("backend handleRpc orchestration", () => {
       );
 
       expect(res.messageId).toBeDefined();
-      expect(statusAtDryRun).toHaveLength(2);
+      expect(statusAtDryRun).toHaveLength(1);
       expect(statusAtDryRun[0]?.messageId).toBeUndefined();
-      expect(statusAtDryRun[1]?.messageId).toBe(res.messageId);
-      expect(statusAtDryRun[1]?.swipeId).toBe(0);
-      expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
-      expect(runAtDryRun?.messageId).toBe(res.messageId);
-      expect(runAtDryRun?.swipeId).toBe(0);
+      expect(runAtDryRun?.messageId).toBeUndefined();
+
+      expect(statusAtStreamStart).toHaveLength(2);
+      expect(statusAtStreamStart[0]?.messageId).toBeUndefined();
+      expect(statusAtStreamStart[1]?.messageId).toBe(res.messageId);
+      expect(statusAtStreamStart[1]?.swipeId).toBe(0);
+      expect(statusAtStreamStart[1]?.hasContentOutput).toBeFalsy();
+      expect(runAtStreamStart?.messageId).toBe(res.messageId);
+      expect(runAtStreamStart?.swipeId).toBe(0);
 
       // Reasoning-only and empty token chunks keep hasContentOutput falsy and do not emit extra gg:status.
       expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
@@ -2859,6 +2927,7 @@ describe("backend handleRpc orchestration", () => {
   test("gg:status emits messageId, swipeId, backgroundSwipe, and hasContentOutput on done-only stream for guided_swipe", async () => {
     for (const backgroundSwipe of [false, true] as const) {
       let statusAtDryRun: Array<ActiveRunState | null> = [];
+      let statusAtStreamStart: Array<ActiveRunState | null> = [];
       let runAfterReasoning = null as ActiveRunState | null;
       let statusCountAfterReasoning = 0;
 
@@ -2887,6 +2956,9 @@ describe("backend handleRpc orchestration", () => {
           };
         },
         rawStreamImpl: async function* () {
+          statusAtStreamStart = harness.sentFrontend
+            .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
+            .map((e) => (e.payload as BackendPushEvent).run ?? null);
           yield { type: "reasoning", token: "Pondering swipe..." };
           runAfterReasoning = runner.getActiveRun("u1");
           statusCountAfterReasoning = harness.sentFrontend.filter(
@@ -2905,11 +2977,14 @@ describe("backend handleRpc orchestration", () => {
 
       expect(res.messageId).toBe("m2");
       expect(res.swipeId).toBe(1);
-      expect(statusAtDryRun).toHaveLength(2);
-      expect(statusAtDryRun[1]?.messageId).toBe("m2");
-      expect(statusAtDryRun[1]?.swipeId).toBe(1);
-      expect(statusAtDryRun[1]?.backgroundSwipe).toBe(backgroundSwipe);
-      expect(statusAtDryRun[1]?.hasContentOutput).toBeFalsy();
+      expect(statusAtDryRun).toHaveLength(1);
+      expect(statusAtDryRun[0]?.messageId).toBeUndefined();
+
+      expect(statusAtStreamStart).toHaveLength(2);
+      expect(statusAtStreamStart[1]?.messageId).toBe("m2");
+      expect(statusAtStreamStart[1]?.swipeId).toBe(1);
+      expect(statusAtStreamStart[1]?.backgroundSwipe).toBe(backgroundSwipe);
+      expect(statusAtStreamStart[1]?.hasContentOutput).toBeFalsy();
 
       expect(runAfterReasoning?.hasContentOutput).toBeFalsy();
       expect(statusCountAfterReasoning).toBe(2);
@@ -3149,7 +3224,7 @@ describe("backend handleRpc orchestration", () => {
     expect(allStatusRuns[3]).toBeNull();
   });
 
-  test("guided_regenerate clears activeRun via gg:status run:null when dryRun fails after eager slot creation", async () => {
+  test("guided_regenerate clears activeRun via gg:status run:null and restores trailing assistant when dryRun fails", async () => {
     const harness = createSpindleHarness({
       chats: {
         "chat-1": [
@@ -3170,8 +3245,9 @@ describe("backend handleRpc orchestration", () => {
     const statusPayloads = harness.sentFrontend
       .filter((e) => (e.payload as BackendPushEvent).type === "gg:status")
       .map((e) => e.payload as BackendPushEvent);
-    expect(statusPayloads[1]?.run?.messageId).toBeDefined();
-    expect(statusPayloads[1]?.run?.swipeId).toBe(0);
+    expect(statusPayloads).toHaveLength(2);
+    expect(statusPayloads[0]?.run?.actionId).toBe("guided_regenerate");
+    expect(statusPayloads[0]?.run?.messageId).toBeUndefined();
     expect(statusPayloads[statusPayloads.length - 1]?.run).toBeNull();
     expect(runner.getActiveRun("u1")).toBeNull();
     expect(harness.chatMessages.get("chat-1")![1]!.content).toBe("Keep me");
@@ -3975,5 +4051,2465 @@ describe("Step 1 audit regression tests", () => {
       done: true,
       aborted: true,
     });
+  });
+
+  test("allows concurrent runs across different chats for the same user while blocking a duplicate run on the same chat and resolving character metadata", async () => {
+    let releaseChatA!: () => void;
+    const chatAGate = new Promise<void>((resolve) => {
+      releaseChatA = resolve;
+    });
+    let notifyChatAStreaming!: () => void;
+    const chatAStreaming = new Promise<void>((resolve) => {
+      notifyChatAStreaming = resolve;
+    });
+
+    let releaseChatB!: () => void;
+    const chatBGate = new Promise<void>((resolve) => {
+      releaseChatB = resolve;
+    });
+    let notifyChatBStreaming!: () => void;
+    const chatBStreaming = new Promise<void>((resolve) => {
+      notifyChatBStreaming = resolve;
+    });
+
+    let streamCallIndex = 0;
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-a": [makeMessage({ id: "ma-1", chat_id: "chat-a", role: "user", content: "Hello A" })],
+        "chat-b": [makeMessage({ id: "mb-1", chat_id: "chat-b", role: "user", content: "Hello B" })],
+      },
+      chatCharacterIds: {
+        "chat-a": "char-alpha",
+        "chat-b": "char-beta",
+      },
+      rawStreamImpl: async function* () {
+        streamCallIndex += 1;
+        if (streamCallIndex === 1) {
+          yield { type: "token", token: "Alpha streaming..." };
+          notifyChatAStreaming();
+          await chatAGate;
+          yield { type: "token", token: " done." };
+          yield { type: "done", content: "Alpha streaming... done.", finish_reason: "stop" };
+        } else {
+          yield { type: "token", token: "Beta streaming..." };
+          notifyChatBStreaming();
+          await chatBGate;
+          yield { type: "token", token: " finished." };
+          yield { type: "done", content: "Beta streaming... finished.", finish_reason: "stop" };
+        }
+      },
+    });
+    (harness.api as unknown as {
+      characters: { get: (id: string) => Promise<{ id: string; name: string } | null> };
+    }).characters = {
+      get: async (id: string) => {
+        if (id === "char-alpha") return { id, name: "Alpha Hero" };
+        if (id === "char-beta") return { id, name: "Beta Companion" };
+        return null;
+      },
+    };
+
+    const { runner, buildBootstrapView, handleRpc } = registerBackend(harness.api);
+
+    // 1. Start guided_response in chat-a
+    const runAPromise = runner.run(
+      { actionId: "guided_response", chatId: "chat-a", inputText: "Guide A" },
+      "u1",
+    );
+    await chatAStreaming;
+
+    const activeA = runner.getActiveRun("u1", "chat-a");
+    expect(activeA).not.toBeNull();
+    expect(activeA?.chatId).toBe("chat-a");
+    expect(activeA?.characterId).toBe("char-alpha");
+    expect(activeA?.characterName).toBe("Alpha Hero");
+    expect(activeA?.avatarUrl).toBe("/api/v1/characters/char-alpha/avatar?thumb=1");
+    expect(activeA?.hasContentOutput).toBe(true);
+    expect(runner.getActiveRun("u1", "chat-b")).toBeNull();
+
+    // 2. Starting a second action in chat-a while chat-a is running is rejected
+    await expect(
+      runner.run({ actionId: "guided_response", chatId: "chat-a", inputText: "Duplicate A" }, "u1"),
+    ).rejects.toThrow(
+      "A Guided Generations action is already running. Stop it before starting another.",
+    );
+
+    // 3. Starting a concurrent action in chat-b for the same user succeeds
+    const runBPromise = runner.run(
+      { actionId: "guided_response", chatId: "chat-b", inputText: "Guide B" },
+      "u1",
+    );
+    await chatBStreaming;
+
+    const allActive = runner.getActiveRuns("u1");
+    expect(allActive).toHaveLength(2);
+    expect(allActive.map((r) => r.chatId).sort()).toEqual(["chat-a", "chat-b"]);
+
+    const bootstrap = await buildBootstrapView("u1");
+    expect(bootstrap.activeRuns).toHaveLength(2);
+    expect(bootstrap.activeRuns?.find((r) => r.chatId === "chat-b")?.characterName).toBe(
+      "Beta Companion",
+    );
+
+    // 4. Finish chat-a while chat-b continues running
+    releaseChatA();
+    const resA = await runAPromise;
+    expect(resA.chatId).toBe("chat-a");
+    expect(resA.aborted).toBe(false);
+    expect(resA.text).toBe("Alpha streaming... done.");
+    expect(harness.chatMessages.get("chat-a")?.at(-1)?.content).toBe("Alpha streaming... done.");
+
+    expect(runner.getActiveRun("u1", "chat-a")).toBeNull();
+    expect(runner.getActiveRun("u1", "chat-b")?.chatId).toBe("chat-b");
+
+    // Check terminal gg:status for chat-a carries chatId: "chat-a", done: true, and remaining run for chat-b
+    const statusEvents = harness.sentFrontend
+      .map((e) => e.payload as BackendPushEvent)
+      .filter((e) => e.type === "gg:status");
+    const chatATerminal = statusEvents.find(
+      (e) => e.chatId === "chat-a" && e.done === true && e.aborted === false,
+    );
+    expect(chatATerminal).toBeDefined();
+    expect(chatATerminal?.run?.chatId).toBe("chat-b");
+
+    // 5. Abort chat-b specifically by runId via abort_action RPC
+    const activeB = runner.getActiveRun("u1", "chat-b")!;
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "abort-b",
+        action: "abort_action",
+        input: { runId: activeB.runId },
+      },
+      "u1",
+    );
+    releaseChatB();
+    const resB = await runBPromise;
+    expect(resB.chatId).toBe("chat-b");
+    expect(resB.aborted).toBe(true);
+    expect(runner.getActiveRuns("u1")).toHaveLength(0);
+  });
+});
+
+describe("audit regression tests (backend)", () => {
+  test("restoreTrailingAssistant never sends both reasoning and swipe_reasoning and filters invalid durations", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Swipe 1 content",
+            swipes: ["Swipe 0 content", "Swipe 1 content"],
+            swipe_id: 1,
+            swipe_dates: [1700000000, 1700000010],
+            extra: {
+              reasoningBySwipe: ["Thought 0", "Thought 1"],
+              reasoningDurationBySwipe: [150, Number.NaN],
+              reasoning: "Thought 1",
+              reasoningDuration: Number.NaN,
+            },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "done", content: "", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    const res = await runner.run({ actionId: "guided_regenerate", chatId: "chat-1", inputText: "" }, "u1");
+    expect(res.text).toBe("");
+
+    // Every updateMessage call must satisfy host invariant (never both reasoning & swipe_reasoning)
+    for (const call of harness.updateMessageCalls) {
+      expect(
+        call.patch.reasoning !== undefined && call.patch.swipe_reasoning !== undefined,
+      ).toBe(false);
+    }
+
+    const restored = harness.chatMessages.get("chat-1")?.at(-1);
+    expect(restored?.swipes).toEqual(["Swipe 0 content", "Swipe 1 content"]);
+    expect(restored?.swipe_id).toBe(1);
+    expect(restored?.extra?.reasoningBySwipe).toEqual(["Thought 0", "Thought 1"]);
+    expect(restored?.extra?.reasoningDurationBySwipe).toEqual([150, null]);
+  });
+
+  test("characters permission=false skips spindle.characters.get and reports permission false", async () => {
+    let charactersGetCalls = 0;
+    const harness = createSpindleHarness({
+      permissions: { characters: false },
+      chatCharacterIds: { "chat-1": "char-1" },
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hi" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Hello" };
+        yield { type: "done", content: "Hello", finish_reason: "stop" };
+      },
+    });
+    (harness.api as unknown as { characters: { get: (id: string) => Promise<unknown> } }).characters = {
+      get: async () => {
+        charactersGetCalls += 1;
+        return { id: "char-1", name: "Should Not Be Fetched" };
+      },
+    };
+
+    const { runner, buildBootstrapView } = registerBackend(harness.api);
+    const view = await buildBootstrapView("u1");
+    expect(view.permissions.characters).toBe(false);
+
+    await runner.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Steer" }, "u1");
+    expect(charactersGetCalls).toBe(0);
+    const statusEvents = harness.sentFrontend
+      .map((e) => e.payload as BackendPushEvent)
+      .filter((e) => e.type === "gg:status" && e.run);
+    expect(statusEvents[0]?.run?.characterName).toBeUndefined();
+  });
+
+  test("guided_continue streamIntoMessage preserves base reasoning/duration when continuation emits no reasoning and updates duration when new reasoning arrives", async () => {
+    // Case A: continuation has no reasoning -> base reasoning & base duration preserved
+    const harnessNoReasoning = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base text",
+            swipes: ["Base text"],
+            swipe_id: 0,
+            extra: { reasoning: "Base thought", reasoningDuration: 420 },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: " continued." };
+        yield { type: "done", content: " continued.", finish_reason: "stop" };
+      },
+    });
+
+    const { runner: runnerA } = registerBackend(harnessNoReasoning.api);
+    await runnerA.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "" }, "u1");
+    const msgA = harnessNoReasoning.chatMessages.get("chat-1")?.at(-1);
+    expect(msgA?.extra?.reasoning).toBe("Base thought");
+    expect(msgA?.extra?.reasoningDuration).toBe(420);
+
+    // Case B: continuation produces new reasoning -> reasoningDuration updated (not stale 420)
+    const harnessWithReasoning = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base text",
+            swipes: ["Base text"],
+            swipe_id: 0,
+            extra: { reasoning: "Base thought", reasoning_duration: 99999 },
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "reasoning", token: "New thought" };
+        yield { type: "token", token: " continued." };
+        yield { type: "done", content: " continued.", finish_reason: "stop" };
+      },
+    });
+
+    const { runner: runnerB } = registerBackend(harnessWithReasoning.api);
+    await runnerB.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "" }, "u1");
+    const msgB = harnessWithReasoning.chatMessages.get("chat-1")?.at(-1);
+    expect(msgB?.extra?.reasoning).toBe("New thought");
+    expect(typeof msgB?.extra?.reasoning_duration).toBe("number");
+    expect((msgB?.extra?.reasoning_duration as number)).toBeLessThan(99999);
+  });
+
+  test("regenerateLastContinue runs ensureTarget (restorePreRegenMessage) before onFirstOutput and aborted flush error does not corrupt continue-history", async () => {
+    const callOrder: string[] = [];
+    let failFinalFlush = false;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base text old continuation",
+            swipes: ["Base text old continuation"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      updateMessageImpl: async (_chatId, _messageId, patch, defaultUpdate) => {
+        if (patch.content === "Base text") {
+          callOrder.push("restorePreRegen");
+        } else if (typeof patch.content === "string" && patch.content.includes("partial")) {
+          callOrder.push("flushStream");
+          if (failFinalFlush && patch.skipChunkRebuild === false) {
+            throw new Error("Simulated final flush failure");
+          }
+        }
+        await defaultUpdate();
+      },
+      rawStreamImpl: async function* ({ signal }) {
+        callOrder.push("streamStart");
+        yield { type: "token", token: " partial" };
+        if (signal?.aborted) {
+          throw new Error("AbortError");
+        }
+        yield { type: "done", content: " partial", finish_reason: "stop" };
+      },
+    });
+
+    const { runner, store } = registerBackend(harness.api);
+    await store.pushContinueEntry(
+      {
+        chatId: "chat-1",
+        messageId: "m2",
+        swipeIndex: 0,
+        baseText: "Base text",
+        resultText: "Base text old continuation",
+        baseReasoning: null,
+        baseReasoningDuration: null,
+        inputText: "keep going",
+      },
+      "u1",
+    );
+
+    // 1. Normal regenerateLastContinue ensures restorePreRegen happens before first stream flush
+    await runner.regenerateLastContinue({ chatId: "chat-1" }, "u1");
+    expect(callOrder.indexOf("restorePreRegen")).toBeGreaterThan(-1);
+    expect(callOrder.indexOf("flushStream")).toBeGreaterThan(callOrder.indexOf("restorePreRegen"));
+
+    // 2. Final flush failure on abort throws and preserves prior continue-history entry (never writes unpersisted text)
+    failFinalFlush = true;
+    const beforeHistory = await store.getContinueHistory("u1");
+    const harnessAbort = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hi" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Base text",
+            swipes: ["Base text"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      updateMessageImpl: async (_chatId, _messageId, patch, defaultUpdate) => {
+        if (patch.skipChunkRebuild === false) {
+          throw new Error("Final flush persistence failed");
+        }
+        await defaultUpdate();
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: " unpersisted" };
+        runnerAbort.abortCurrent("u1");
+        yield { type: "done", content: " unpersisted", finish_reason: "stop" };
+      },
+    });
+    const { runner: runnerAbort, store: storeAbort } = registerBackend(harnessAbort.api);
+    await expect(
+      runnerAbort.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "" }, "u1"),
+    ).rejects.toThrow("Final flush persistence failed");
+    expect(await storeAbort.getContinueHistory("u1")).toEqual([]);
+    expect(beforeHistory).toHaveLength(1);
+  });
+
+  test("promptPostProcessing='single' strips rejected/trailing history from capturedMessages before collapsing to single role", async () => {
+    // 1. guided_response with promptPostProcessing='single' (system) collapses captured messages + guidance
+    let capturedPrompt: Array<{ role: string; content: unknown }> = [];
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Hi there" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main", __chatHistorySource: false },
+          { role: "user", content: "Hello", __chatHistorySource: true, __sourceMessageId: "m1" },
+          { role: "assistant", content: "Hi there", __chatHistorySource: true, __sourceMessageId: "m2" },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      dryRunImpl: async () => ({
+        request_messages: [
+          { role: "system", content: "Collapsed Single System Prompt" },
+        ],
+        parameters: { model: "gpt-4" },
+      }),
+      rawStreamImpl: async function* (input) {
+        capturedPrompt = (input.messages as Array<{ role: string; content: unknown }>) ?? [];
+        yield { type: "token", token: "Done" };
+        yield { type: "done", content: "Done", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Guide single" },
+      "u1",
+    );
+
+    expect(capturedPrompt).toHaveLength(1);
+    expect(capturedPrompt[0]?.role).toBe("system");
+    expect(capturedPrompt[0]?.content).toBe(
+      "Main\n\nHello\n\nHi there\n\n[OOC Guidance for the next response: Guide single]",
+    );
+
+    // 2. guided_swipe with promptPostProcessing='single' strips rejected turn & unshifts depth=1 before collapsing
+    let swipeSinglePrompt: Array<{ role: string; content: unknown }> = [];
+    const swipeSingleHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main", __chatHistorySource: false },
+          { role: "user", content: "Hello", __chatHistorySource: true, __sourceMessageId: "m1" },
+          { role: "system", content: "Depth 1", __chatHistorySource: false },
+          { role: "assistant", content: "Rejected swipe", __chatHistorySource: true, __sourceMessageId: "m2" },
+          { role: "assistant", content: "Post assistant", __chatHistorySource: false },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      dryRunImpl: async () => ({
+        request_messages: [{ role: "system", content: "Collapsed Single System Prompt" }],
+        parameters: { model: "gpt-4" },
+      }),
+      rawStreamImpl: async function* (input) {
+        swipeSinglePrompt = (input.messages as Array<{ role: string; content: unknown }>) ?? [];
+        yield { type: "token", token: "Fresh" };
+        yield { type: "done", content: "Fresh", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeSingleRunner } = registerBackend(swipeSingleHarness.api);
+    await swipeSingleRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(swipeSinglePrompt).toHaveLength(1);
+    expect(swipeSinglePrompt[0]?.role).toBe("system");
+    expect(swipeSinglePrompt[0]?.content).toBe("Main\n\nDepth 1\n\nHello\n\nPost assistant");
+
+    // 3. collapseMessages=true (role: "user") also collapses stripped messages into a single user message
+    let swipeCollapseUserPrompt: Array<{ role: string; content: unknown }> = [];
+    const swipeUserHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main", __chatHistorySource: false },
+          { role: "user", content: "Hello", __chatHistorySource: true, __sourceMessageId: "m1" },
+          { role: "system", content: "Depth 1", __chatHistorySource: false },
+          { role: "assistant", content: "Rejected swipe", __chatHistorySource: true, __sourceMessageId: "m2" },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      dryRunImpl: async () => ({
+        request_messages: [{ role: "user", content: "Collapsed Single User Prompt" }],
+        parameters: { model: "gpt-4" },
+      }),
+      rawStreamImpl: async function* (input) {
+        swipeCollapseUserPrompt = (input.messages as Array<{ role: string; content: unknown }>) ?? [];
+        yield { type: "token", token: "Fresh" };
+        yield { type: "done", content: "Fresh", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeUserRunner } = registerBackend(swipeUserHarness.api);
+    await swipeUserRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Keep calm" },
+      "u1",
+    );
+    expect(swipeCollapseUserPrompt).toHaveLength(1);
+    expect(swipeCollapseUserPrompt[0]?.role).toBe("user");
+    expect(swipeCollapseUserPrompt[0]?.content).toBe(
+      "Main\n\nDepth 1\n\nHello\n\n[OOC Guidance for this alternative response: Keep calm]",
+    );
+  });
+
+  test("guided_swipe with empty inputText unshifts in_history depth=1 system prompt before latest user with post_history assistant-user-system", async () => {
+    let sentMessages: Array<Record<string, unknown>> = [];
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({
+            id: "m4",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main Prompt", __chatHistorySource: false },
+          {
+            role: "user",
+            content: "Earlier user",
+            __chatHistorySource: true,
+            __sourceMessageId: "m1",
+          },
+          {
+            role: "assistant",
+            content: "Earlier assistant",
+            __chatHistorySource: true,
+            __sourceMessageId: "m2",
+          },
+          {
+            role: "user",
+            content: "Latest user",
+            __chatHistorySource: true,
+            __sourceMessageId: "m3",
+          },
+          { role: "system", content: "Depth 1 System", __chatHistorySource: false },
+          {
+            role: "assistant",
+            content: "",
+            __chatHistorySource: true,
+            __sourceMessageId: "m4",
+          },
+          { role: "assistant", content: "Post assistant", __chatHistorySource: false },
+          { role: "user", content: "Post user", __chatHistorySource: false },
+          { role: "system", content: "Post system", __chatHistorySource: false },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      dryRunImpl: async () => ({
+        messages: [],
+        request_messages: [
+          { role: "system", content: "Main Prompt" },
+          { role: "user", content: "Earlier user" },
+          { role: "assistant", content: "Earlier assistant" },
+          { role: "user", content: "Latest user" },
+          { role: "system", content: "Depth 1 System" },
+          { role: "assistant", content: "" },
+          { role: "assistant", content: "Post assistant" },
+          { role: "user", content: "Post user" },
+          { role: "system", content: "Post system" },
+        ],
+        parameters: { temperature: 0.7 },
+      }),
+      rawStreamImpl: async function* (input) {
+        sentMessages = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Replacement" };
+        yield { type: "done", content: "Replacement", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    const res = await runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(res.text).toBe("Replacement");
+    expect(sentMessages.map((m) => `${m.role}:${m.content}`)).toEqual([
+      "system:Main Prompt",
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "assistant:Post assistant",
+      "user:Post user",
+      "system:Post system",
+    ]);
+    for (const msg of sentMessages) {
+      expect("__chatHistorySource" in msg).toBe(false);
+      expect("__sourceMessageId" in msg).toBe(false);
+    }
+  });
+
+  test("guided_swipe unshifts multi-depth blocks while preserving WI after h0 and depth=0/post_history, guided_response/guided_regenerate run dryRun cleanly without blank slot, and guided_continue does not unshift", async () => {
+    const buildCleanMultiDepth = () =>
+      [
+        { role: "system", content: "Main", __chatHistorySource: false },
+        { role: "system", content: "Depth 3", __chatHistorySource: false },
+        { role: "user", content: "h0", __chatHistorySource: true, __sourceMessageId: "m1" },
+        {
+          role: "system",
+          content: "WI anAfter",
+          __chatHistorySource: false,
+          __worldInfoSource: true,
+        },
+        { role: "system", content: "Depth 2", __chatHistorySource: false },
+        { role: "assistant", content: "h1", __chatHistorySource: true, __sourceMessageId: "m2" },
+        { role: "system", content: "Depth 1", __chatHistorySource: false },
+        { role: "user", content: "h2", __chatHistorySource: true, __sourceMessageId: "m3" },
+        { role: "system", content: "Depth 0", __chatHistorySource: false },
+        { role: "system", content: "Post-History", __chatHistorySource: false },
+      ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+
+    const buildMultiDepthWithSwipeTarget = (targetId: string) =>
+      [
+        { role: "system", content: "Main", __chatHistorySource: false },
+        { role: "user", content: "h0", __chatHistorySource: true, __sourceMessageId: "m1" },
+        {
+          role: "system",
+          content: "WI anAfter",
+          __chatHistorySource: false,
+          __worldInfoSource: true,
+        },
+        { role: "system", content: "Depth 3", __chatHistorySource: false },
+        { role: "assistant", content: "h1", __chatHistorySource: true, __sourceMessageId: "m2" },
+        { role: "system", content: "Depth 2", __chatHistorySource: false },
+        { role: "user", content: "h2", __chatHistorySource: true, __sourceMessageId: "m3" },
+        { role: "system", content: "Depth 1", __chatHistorySource: false },
+        { role: "assistant", content: "Old swipe", __chatHistorySource: true, __sourceMessageId: targetId },
+        { role: "system", content: "Depth 0", __chatHistorySource: false },
+        { role: "system", content: "Post-History", __chatHistorySource: false },
+      ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+
+    const expectedUnshifted = [
+      "system:Main",
+      "system:Depth 3",
+      "user:h0",
+      "system:WI anAfter",
+      "system:Depth 2",
+      "assistant:h1",
+      "system:Depth 1",
+      "user:h2",
+      "system:Depth 0",
+      "system:Post-History",
+    ];
+
+    // 1. guided_response (requires non-empty guidance) runs dryRun without a blank turn and injects guidance before post-history
+    let responseSent: Array<Record<string, unknown>> = [];
+    let responseDryRunChatLen = 0;
+    const responseHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "h0" }),
+          makeMessage({ id: "m2", role: "assistant", content: "h1" }),
+          makeMessage({ id: "m3", role: "user", content: "h2" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": buildCleanMultiDepth(),
+      },
+      dryRunImpl: async () => {
+        responseDryRunChatLen = responseHarness.chatMessages.get("chat-1")!.length;
+        return {
+          messages: [],
+          request_messages: buildCleanMultiDepth().map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          parameters: {},
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        responseSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Resp" };
+        yield { type: "done", content: "Resp", finish_reason: "stop" };
+      },
+    });
+    const { runner: responseRunner } = registerBackend(responseHarness.api);
+    await responseRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Be dramatic" },
+      "u1",
+    );
+    expect(responseDryRunChatLen).toBe(3);
+    expect(responseSent.map((m) => `${m.role}:${m.content}`)).toEqual([
+      "system:Main",
+      "system:Depth 3",
+      "user:h0",
+      "system:WI anAfter",
+      "system:Depth 2",
+      "assistant:h1",
+      "system:Depth 1",
+      "user:h2",
+      "system:[OOC Guidance for the next response: Be dramatic]",
+      "system:Depth 0",
+      "system:Post-History",
+    ]);
+
+    // 2. guided_regenerate with inputText: "" deletes m4 and runs dryRun cleanly without blank slot
+    let regenSent: Array<Record<string, unknown>> = [];
+    let regenDryRunChatLen = 0;
+    const regenHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "h0" }),
+          makeMessage({ id: "m2", role: "assistant", content: "h1" }),
+          makeMessage({ id: "m3", role: "user", content: "h2" }),
+          makeMessage({ id: "m4", role: "assistant", content: "Old reply" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": buildCleanMultiDepth(),
+      },
+      dryRunImpl: async () => {
+        regenDryRunChatLen = regenHarness.chatMessages.get("chat-1")!.length;
+        return {
+          messages: [],
+          request_messages: buildCleanMultiDepth().map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          parameters: {},
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        regenSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Regen" };
+        yield { type: "done", content: "Regen", finish_reason: "stop" };
+      },
+    });
+    const { runner: regenRunner } = registerBackend(regenHarness.api);
+    await regenRunner.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(regenDryRunChatLen).toBe(3);
+    expect(regenSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedUnshifted);
+
+    // 2b. guided_swipe with m4 in dryRun unshifts multi-depth blocks while preserving WI after h0 and depth=0/post_history
+    let swipeSent: Array<Record<string, unknown>> = [];
+    const swipeHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "h0" }),
+          makeMessage({ id: "m2", role: "assistant", content: "h1" }),
+          makeMessage({ id: "m3", role: "user", content: "h2" }),
+          makeMessage({ id: "m4", role: "assistant", content: "Old swipe", swipes: ["Old swipe"], swipe_id: 0 }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": buildMultiDepthWithSwipeTarget("m4"),
+      },
+      dryRunImpl: async () => ({
+        messages: [],
+        request_messages: buildMultiDepthWithSwipeTarget("m4").map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        parameters: {},
+      }),
+      rawStreamImpl: async function* (input) {
+        swipeSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Swiped" };
+        yield { type: "done", content: "Swiped", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeRunner } = registerBackend(swipeHarness.api);
+    await swipeRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(swipeSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedUnshifted);
+
+    // 3. guided_continue does NOT unshift (finalizeContinuePrompt places depth=1 relative to continued turn)
+    let continueSent: Array<Record<string, unknown>> = [];
+    const continueHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "h0" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Continued start" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main", __chatHistorySource: false },
+          { role: "user", content: "h0", __chatHistorySource: true, __sourceMessageId: "m1" },
+          { role: "system", content: "Depth 1", __chatHistorySource: false },
+          {
+            role: "assistant",
+            content: "Continued start",
+            __chatHistorySource: false,
+            __sourceMessageId: "m2",
+          },
+          { role: "system", content: "[Continue Nudge]", __chatHistorySource: false },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      dryRunImpl: async () => ({
+        messages: [],
+        request_messages: [
+          { role: "system", content: "Main" },
+          { role: "user", content: "h0" },
+          { role: "system", content: "Depth 1" },
+          { role: "assistant", content: "Continued start" },
+          { role: "system", content: "[Continue Nudge]" },
+        ],
+        parameters: {},
+      }),
+      rawStreamImpl: async function* (input) {
+        continueSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "more." };
+        yield { type: "done", content: "more.", finish_reason: "stop" };
+      },
+    });
+    const { runner: continueRunner } = registerBackend(continueHarness.api);
+    await continueRunner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(continueSent.map((m) => `${m.role}:${m.content}`)).toEqual([
+      "system:Main",
+      "user:h0",
+      "system:Depth 1",
+      "assistant:Continued start",
+      "system:[Continue Nudge]",
+    ]);
+  });
+
+  test("promptPostProcessing='merge' uses unmerged capturedMessages to strip h_k before assistantPrefill/post-history, unshifts depth, and re-merges consecutive same-role messages", async () => {
+    let sentMessages: Array<Record<string, unknown>> = [];
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Latest user" }),
+          makeMessage({
+            id: "m2",
+            role: "assistant",
+            content: "Old swipe",
+            swipes: ["Old swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Main Prompt", __chatHistorySource: false },
+          {
+            role: "user",
+            content: "Latest user",
+            __chatHistorySource: true,
+            __sourceMessageId: "m1",
+          },
+          { role: "system", content: "Depth 1 System", __chatHistorySource: false },
+          {
+            role: "assistant",
+            content: "",
+            __chatHistorySource: true,
+            __sourceMessageId: "m2",
+          },
+          {
+            role: "assistant",
+            content: "Post-history assistant",
+            __chatHistorySource: false,
+          },
+          {
+            role: "assistant",
+            content: "Prefill...",
+            partial: true,
+            __chatHistorySource: false,
+          },
+        ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>,
+      },
+      // Simulate host applyPostProcessing('merge') having merged h_k (''), post-history assistant, and prefill:
+      dryRunImpl: async () => ({
+        messages: [],
+        request_messages: [
+          { role: "system", content: "Main Prompt" },
+          { role: "user", content: "Latest user" },
+          { role: "system", content: "Depth 1 System" },
+          {
+            role: "assistant",
+            content: "\n\nPost-history assistant\n\nPrefill...",
+            partial: true,
+          },
+        ],
+        parameters: {},
+      }),
+      rawStreamImpl: async function* (input) {
+        sentMessages = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Merged reply" };
+        yield { type: "done", content: "Merged reply", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    await runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+
+    expect(sentMessages).toEqual([
+      { role: "system", content: "Main Prompt\n\nDepth 1 System" },
+      { role: "user", content: "Latest user" },
+      {
+        role: "assistant",
+        content: "Post-history assistant\n\nPrefill...",
+        partial: true,
+      },
+    ]);
+  });
+
+  test("SettingsStore prevents cold-read cache clobbering on concurrent write and preserves full recovery across maxEntries expansion", async () => {
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const files = new Map<string, string>([
+      [
+        "settings.json",
+        JSON.stringify({
+          toolbarPlacement: "inline",
+          inputRecovery: { enabled: true, maxEntries: 2 },
+        }),
+      ],
+      [
+        "recovery.json",
+        JSON.stringify([
+          { id: "r1", text: "Draft 1", actionId: "guided_response", chatId: "c1", createdAt: 4 },
+          { id: "r2", text: "Draft 2", actionId: "guided_response", chatId: "c1", createdAt: 3 },
+          { id: "r3", text: "Draft 3", actionId: "guided_response", chatId: "c1", createdAt: 2 },
+          { id: "r4", text: "Draft 4", actionId: "guided_response", chatId: "c1", createdAt: 1 },
+        ]),
+      ],
+    ]);
+
+    let delayFirstSettingsRead = true;
+    const mockApi = {
+      permissions: { has: () => false, onChanged: () => () => {} },
+      log: { warn: () => {}, info: () => {}, error: () => {}, debug: () => {} },
+      userStorage: {
+        exists: async (path: string) => files.has(path),
+        read: async (path: string) => {
+          if (path === "settings.json" && delayFirstSettingsRead) {
+            delayFirstSettingsRead = false;
+            await readGate;
+          }
+          return files.get(path) ?? "";
+        },
+        write: async (path: string, content: string) => {
+          files.set(path, content);
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const store = new SettingsStore(mockApi);
+
+    // 1. Start cold read (which stalls before completing), then write newer settings concurrently
+    const coldReadPromise = store.getSettings("u1");
+    await Promise.resolve();
+
+    const updated = createDefaultSettings();
+    updated.toolbarPlacement = "below_bar";
+    updated.inputRecovery.maxEntries = 2;
+    await store.saveSettings(updated, "u1");
+
+    releaseRead();
+    const resolvedCold = await coldReadPromise;
+    expect(resolvedCold.toolbarPlacement).toBe("below_bar");
+    expect((await store.getSettings("u1")).toolbarPlacement).toBe("below_bar");
+
+    // 2. Reading recovery with maxEntries=2 on disk then expanding maxEntries=5 does not lose r3/r4
+    const filesForRecovery = new Map<string, string>([
+      [
+        "settings.json",
+        JSON.stringify({
+          toolbarPlacement: "inline",
+          inputRecovery: { enabled: true, maxEntries: 2 },
+        }),
+      ],
+      [
+        "recovery.json",
+        JSON.stringify([
+          { id: "r1", text: "Draft 1", actionId: "guided_response", chatId: "c1", createdAt: 4 },
+          { id: "r2", text: "Draft 2", actionId: "guided_response", chatId: "c1", createdAt: 3 },
+          { id: "r3", text: "Draft 3", actionId: "guided_response", chatId: "c1", createdAt: 2 },
+          { id: "r4", text: "Draft 4", actionId: "guided_response", chatId: "c1", createdAt: 1 },
+        ]),
+      ],
+    ]);
+    const recoveryApi = {
+      permissions: { has: () => false, onChanged: () => () => {} },
+      log: { warn: () => {}, info: () => {}, error: () => {}, debug: () => {} },
+      userStorage: {
+        exists: async (path: string) => filesForRecovery.has(path),
+        read: async (path: string) => filesForRecovery.get(path) ?? "",
+        write: async (path: string, content: string) => {
+          filesForRecovery.set(path, content);
+        },
+      },
+    } as unknown as SpindleAPI;
+    const recoveryStore = new SettingsStore(recoveryApi);
+
+    const twoEntries = await recoveryStore.getRecovery("u1");
+    expect(twoEntries).toHaveLength(2);
+
+    const expanded = createDefaultSettings();
+    expanded.inputRecovery.maxEntries = 5;
+    await recoveryStore.saveSettings(expanded, "u1");
+
+    const allEntries = await recoveryStore.getRecovery("u1");
+    expect(allEntries.map((e) => e.id)).toEqual(["r1", "r2", "r3", "r4"]);
+  });
+
+  test("runner.dispose aborts active runs and clears state cleanly", async () => {
+    let streamSignalAborted = false;
+    let notifyStreaming!: () => void;
+    const streamingStarted = new Promise<void>((resolve) => {
+      notifyStreaming = resolve;
+    });
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      chats: { "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hi" })] },
+      rawStreamImpl: async function* ({ signal }) {
+        notifyStreaming();
+        await streamGate;
+        streamSignalAborted = Boolean(signal?.aborted);
+        yield { type: "done", content: "", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    const runPromise = runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await streamingStarted;
+    expect(runner.getActiveRuns("u1")).toHaveLength(1);
+
+    runner.dispose();
+    expect(runner.getActiveRuns("u1")).toHaveLength(0);
+    releaseStream();
+    const res = await runPromise;
+    expect(res.aborted).toBe(true);
+    expect(streamSignalAborted).toBe(true);
+  });
+
+  test("Nemo Engine 30-block preset with hasNonEmptyContent-filtered dryRun preserves unmerged pre_history in none mode and handles merge, guided_response, and guided_regenerate", async () => {
+    const preHistoryBlocks = Array.from({ length: 30 }, (_, idx) => ({
+      role: "system" as const,
+      content: `Nemo Block ${idx + 1}`,
+    }));
+
+    const lumiverseHasNonEmptyContent = (msg: {
+      role: string;
+      content: unknown;
+      partial?: boolean;
+    }): boolean => {
+      if (typeof msg.content === "string") {
+        return msg.content.trim().length > 0 || (msg.role === "assistant" && msg.partial === true);
+      }
+      if (Array.isArray(msg.content)) {
+        return msg.content.length > 0;
+      }
+      return true;
+    };
+
+    const lumiverseApplyMerge = (
+      msgs: Array<Record<string, unknown>>,
+    ): Array<Record<string, unknown>> => {
+      const merged: Array<Record<string, unknown>> = [];
+      for (const msg of msgs) {
+        const prev = merged[merged.length - 1];
+        if (prev && prev.role === msg.role) {
+          merged[merged.length - 1] = {
+            ...prev,
+            content: `${String(prev.content ?? "")}\n\n${String(msg.content ?? "")}`,
+            ...(msg.partial === true ? { partial: true } : {}),
+          };
+        } else {
+          merged.push({ ...msg });
+        }
+      }
+      return merged;
+    };
+
+    const assembleNemoPrompt = (chatMsgs: ChatMessageWithRole[]) => {
+      const pre = preHistoryBlocks.map((b) => ({
+        role: b.role,
+        content: b.content,
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      }));
+      const depth1Block = {
+        role: "system" as const,
+        content: "Depth 1 System",
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      };
+      const historyItems = chatMsgs.map((m) => ({
+        role: (m.role ?? (m.is_user ? "user" : "assistant")) as "user" | "assistant" | "system",
+        content: m.content,
+        __isChatHistory: true,
+        __chatHistorySource: true,
+        sourceMessageId: m.id,
+        __sourceMessageId: m.id,
+      }));
+      const insertAt = Math.max(0, historyItems.length - 1);
+      const historyWithDepth = [
+        ...historyItems.slice(0, insertAt),
+        depth1Block,
+        ...historyItems.slice(insertAt),
+      ];
+      return [
+        ...pre,
+        ...historyWithDepth,
+        {
+          role: "assistant" as const,
+          content: "Depth 0 assistant",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+        {
+          role: "user" as const,
+          content: "Depth 0 user",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+        {
+          role: "system" as const,
+          content: "Trailing system",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+      ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+    };
+
+    const buildDryRunResult = (
+      captured: Array<Record<string, unknown>>,
+      postProcessing: "none" | "merge",
+    ) => {
+      const processed =
+        postProcessing === "merge" ? lumiverseApplyMerge(captured) : captured.map((m) => ({ ...m }));
+      const requestMessages = processed.filter((m) =>
+        lumiverseHasNonEmptyContent(m as { role: string; content: unknown; partial?: boolean }),
+      );
+      return {
+        messages: [],
+        request_messages: requestMessages,
+        parameters: { temperature: 0.7 },
+      };
+    };
+
+    const expectedBaseNone = [
+      ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "assistant:Depth 0 assistant",
+      "user:Depth 0 user",
+      "system:Trailing system",
+    ];
+
+    // 1. guided_swipe (none): a_target("") dropped in request_messages; pre_history stays 30 unmerged blocks
+    let swipeNoneSent: Array<Record<string, unknown>> = [];
+    let swipeNoneCapturedLen = 0;
+    let swipeNoneRequestLen = 0;
+    const swipeNoneHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({
+            id: "m4",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        get "chat-1"() {
+          const assembled = assembleNemoPrompt(swipeNoneHarness.chatMessages.get("chat-1")!);
+          swipeNoneCapturedLen = assembled.length;
+          return assembled;
+        },
+      },
+      dryRunImpl: async () => {
+        const assembled = assembleNemoPrompt(swipeNoneHarness.chatMessages.get("chat-1")!);
+        const res = buildDryRunResult(
+          assembled as unknown as Array<Record<string, unknown>>,
+          "none",
+        );
+        swipeNoneRequestLen = res.request_messages.length;
+        return res;
+      },
+      rawStreamImpl: async function* (input) {
+        swipeNoneSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Replacement" };
+        yield { type: "done", content: "Replacement", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeNoneRunner } = registerBackend(swipeNoneHarness.api);
+    expect(swipeNoneHarness.registerInterceptorCalls).toHaveLength(1);
+    await swipeNoneRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe: false },
+      "u1",
+    );
+    expect(swipeNoneCapturedLen).toBe(38);
+    expect(swipeNoneRequestLen).toBe(38);
+    expect(swipeNoneSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedBaseNone);
+    for (const msg of swipeNoneSent) {
+      expect("__isChatHistory" in msg).toBe(false);
+      expect("__chatHistorySource" in msg).toBe(false);
+      expect("sourceMessageId" in msg).toBe(false);
+      expect("__sourceMessageId" in msg).toBe(false);
+    }
+
+    // 2. guided_swipe (merge): m4("Rejected swipe") merged with assistant(depth=0) in request_messages; reconciled via capturedMessages
+    let swipeMergeSent: Array<Record<string, unknown>> = [];
+    const swipeMergeHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({
+            id: "m4",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        get "chat-1"() {
+          return assembleNemoPrompt(swipeMergeHarness.chatMessages.get("chat-1")!);
+        },
+      },
+      dryRunImpl: async () => {
+        const assembled = assembleNemoPrompt(swipeMergeHarness.chatMessages.get("chat-1")!);
+        return buildDryRunResult(assembled as unknown as Array<Record<string, unknown>>, "merge");
+      },
+      rawStreamImpl: async function* (input) {
+        swipeMergeSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Merged" };
+        yield { type: "done", content: "Merged", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeMergeRunner } = registerBackend(swipeMergeHarness.api);
+    await swipeMergeRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe: false },
+      "u1",
+    );
+    expect(swipeMergeSent.map((m) => `${m.role}:${m.content}`)).toEqual([
+      `system:${preHistoryBlocks.map((b) => b.content).join("\n\n")}`,
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "assistant:Depth 0 assistant",
+      "user:Depth 0 user",
+      "system:Trailing system",
+    ]);
+
+    // 3. guided_response (none): dryRun runs cleanly on 3-turn history without blank slot
+    let responseSent: Array<Record<string, unknown>> = [];
+    let responseCapturedLen = 0;
+    let responseRequestLen = 0;
+    const responseHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        get "chat-1"() {
+          const assembled = assembleNemoPrompt(responseHarness.chatMessages.get("chat-1")!);
+          responseCapturedLen = assembled.length;
+          return assembled;
+        },
+      },
+      dryRunImpl: async () => {
+        const assembled = assembleNemoPrompt(responseHarness.chatMessages.get("chat-1")!);
+        const res = buildDryRunResult(
+          assembled as unknown as Array<Record<string, unknown>>,
+          "none",
+        );
+        responseRequestLen = res.request_messages.length;
+        return res;
+      },
+      rawStreamImpl: async function* (input) {
+        responseSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Response" };
+        yield { type: "done", content: "Response", finish_reason: "stop" };
+      },
+    });
+    const { runner: responseRunner } = registerBackend(responseHarness.api);
+    await responseRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Focus on tension" },
+      "u1",
+    );
+    expect(responseCapturedLen).toBe(37);
+    expect(responseRequestLen).toBe(37);
+    expect(responseSent.map((m) => `${m.role}:${m.content}`)).toEqual([
+      ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "system:[OOC Guidance for the next response: Focus on tension]",
+      "assistant:Depth 0 assistant",
+      "user:Depth 0 user",
+      "system:Trailing system",
+    ]);
+
+    // 4. guided_regenerate (none): dryRun runs cleanly after deleting m4 and before creating blank slot
+    let regenSent: Array<Record<string, unknown>> = [];
+    let regenCapturedLen = 0;
+    let regenRequestLen = 0;
+    const regenHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({ id: "m4", role: "assistant", content: "Old reply" }),
+        ],
+      },
+      interceptorMessagesByChat: {
+        get "chat-1"() {
+          const assembled = assembleNemoPrompt(regenHarness.chatMessages.get("chat-1")!);
+          regenCapturedLen = assembled.length;
+          return assembled;
+        },
+      },
+      dryRunImpl: async () => {
+        const assembled = assembleNemoPrompt(regenHarness.chatMessages.get("chat-1")!);
+        const res = buildDryRunResult(
+          assembled as unknown as Array<Record<string, unknown>>,
+          "none",
+        );
+        regenRequestLen = res.request_messages.length;
+        return res;
+      },
+      rawStreamImpl: async function* (input) {
+        regenSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Regenerated" };
+        yield { type: "done", content: "Regenerated", finish_reason: "stop" };
+      },
+    });
+    const { runner: regenRunner } = registerBackend(regenHarness.api);
+    await regenRunner.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(regenCapturedLen).toBe(37);
+    expect(regenRequestLen).toBe(37);
+    expect(regenSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedBaseNone);
+  });
+
+  test("Nemo Engine 30-block preset with hasNonEmptyContent-filtered dryRun and interceptor: false defers blanking/creation cleanly for guided_swipe, guided_response, and guided_regenerate", async () => {
+    const preHistoryBlocks = Array.from({ length: 30 }, (_, idx) => ({
+      role: "system" as const,
+      content: `Nemo Block ${idx + 1}`,
+    }));
+
+    const lumiverseHasNonEmptyContent = (msg: {
+      role: string;
+      content: unknown;
+      partial?: boolean;
+    }): boolean => {
+      if (typeof msg.content === "string") {
+        return msg.content.trim().length > 0 || (msg.role === "assistant" && msg.partial === true);
+      }
+      if (Array.isArray(msg.content)) {
+        return msg.content.length > 0;
+      }
+      return true;
+    };
+
+    const assembleFilteredRequestMessages = (chatMsgs: ChatMessageWithRole[]) => {
+      const pre = preHistoryBlocks.map((b) => ({
+        role: b.role,
+        content: b.content,
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      }));
+      const depth1Block = {
+        role: "system" as const,
+        content: "Depth 1 System",
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      };
+      const historyItems = chatMsgs.map((m) => ({
+        role: (m.role ?? (m.is_user ? "user" : "assistant")) as "user" | "assistant" | "system",
+        content: m.content,
+        __isChatHistory: true,
+        __chatHistorySource: true,
+        sourceMessageId: m.id,
+        __sourceMessageId: m.id,
+      }));
+      const insertAt = Math.max(0, historyItems.length - 1);
+      const assembled = [
+        ...pre,
+        ...historyItems.slice(0, insertAt),
+        depth1Block,
+        ...historyItems.slice(insertAt),
+        {
+          role: "assistant" as const,
+          content: "Depth 0 assistant",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+        {
+          role: "user" as const,
+          content: "Depth 0 user",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+        {
+          role: "system" as const,
+          content: "Trailing system",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+      ];
+      return assembled.filter((m) => lumiverseHasNonEmptyContent(m));
+    };
+
+    const expectedBase = [
+      ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "assistant:Depth 0 assistant",
+      "user:Depth 0 user",
+      "system:Trailing system",
+    ];
+
+    // 1. guided_swipe with interceptor: false
+    let swipeSent: Array<Record<string, unknown>> = [];
+    let swipeTargetContentAtDryRun = "";
+    let swipeTargetAtStream: ChatMessageWithRole | undefined;
+    const swipeHarness = createSpindleHarness({
+      permissions: { interceptor: false },
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({
+            id: "m4",
+            role: "assistant",
+            content: "Rejected swipe",
+            swipes: ["Rejected swipe"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        const msgs = swipeHarness.chatMessages.get("chat-1")!;
+        swipeTargetContentAtDryRun = msgs[msgs.length - 1]!.content;
+        return {
+          messages: [],
+          request_messages: assembleFilteredRequestMessages(msgs),
+          parameters: { temperature: 0.7 },
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        const msgs = swipeHarness.chatMessages.get("chat-1")!;
+        swipeTargetAtStream = { ...msgs[msgs.length - 1]!, swipes: [...msgs[msgs.length - 1]!.swipes] };
+        swipeSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Swiped" };
+        yield { type: "done", content: "Swiped", finish_reason: "stop" };
+      },
+    });
+    const { runner: swipeRunner } = registerBackend(swipeHarness.api);
+    expect(swipeHarness.registerInterceptorCalls).toHaveLength(0);
+    await swipeRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe: false },
+      "u1",
+    );
+    expect(swipeTargetContentAtDryRun).toBe("Rejected swipe");
+    expect(swipeTargetAtStream?.swipe_id).toBe(1);
+    expect(swipeTargetAtStream?.swipes).toEqual(["Rejected swipe", ""]);
+    expect(swipeSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedBase);
+
+    // 2. guided_response with interceptor: false
+    let responseSent: Array<Record<string, unknown>> = [];
+    let responseChatLenAtDryRun = 0;
+    let responseChatLenAtStream = 0;
+    const responseHarness = createSpindleHarness({
+      permissions: { interceptor: false },
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+        ],
+      },
+      dryRunImpl: async () => {
+        const msgs = responseHarness.chatMessages.get("chat-1")!;
+        responseChatLenAtDryRun = msgs.length;
+        return {
+          messages: [],
+          request_messages: assembleFilteredRequestMessages(msgs),
+          parameters: { temperature: 0.7 },
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        responseChatLenAtStream = responseHarness.chatMessages.get("chat-1")!.length;
+        responseSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Response" };
+        yield { type: "done", content: "Response", finish_reason: "stop" };
+      },
+    });
+    const { runner: responseRunner } = registerBackend(responseHarness.api);
+    expect(responseHarness.registerInterceptorCalls).toHaveLength(0);
+    await responseRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    expect(responseChatLenAtDryRun).toBe(3);
+    expect(responseChatLenAtStream).toBe(4);
+    expect(responseSent.map((m) => `${m.role}:${m.content}`)).toEqual([
+      ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "system:[OOC Guidance for the next response: Steer]",
+      "assistant:Depth 0 assistant",
+      "user:Depth 0 user",
+      "system:Trailing system",
+    ]);
+
+    // 3. guided_regenerate with interceptor: false
+    let regenSent: Array<Record<string, unknown>> = [];
+    let regenChatLenAtDryRun = 0;
+    let regenChatLenAtStream = 0;
+    const regenHarness = createSpindleHarness({
+      permissions: { interceptor: false },
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Earlier user" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Earlier assistant" }),
+          makeMessage({ id: "m3", role: "user", content: "Latest user" }),
+          makeMessage({ id: "m4", role: "assistant", content: "Old reply" }),
+        ],
+      },
+      dryRunImpl: async () => {
+        const msgs = regenHarness.chatMessages.get("chat-1")!;
+        regenChatLenAtDryRun = msgs.length;
+        return {
+          messages: [],
+          request_messages: assembleFilteredRequestMessages(msgs),
+          parameters: { temperature: 0.7 },
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        regenChatLenAtStream = regenHarness.chatMessages.get("chat-1")!.length;
+        regenSent = (input.messages as Array<Record<string, unknown>>) ?? [];
+        yield { type: "token", token: "Regen" };
+        yield { type: "done", content: "Regen", finish_reason: "stop" };
+      },
+    });
+    const { runner: regenRunner } = registerBackend(regenHarness.api);
+    expect(regenHarness.registerInterceptorCalls).toHaveLength(0);
+    await regenRunner.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(regenChatLenAtDryRun).toBe(3);
+    expect(regenChatLenAtStream).toBe(4);
+    expect(regenSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedBase);
+  });
+
+  test("real Lumiverse stripEmptyTextParts-before-interceptor simulation preserves Nemo Engine order for guided_swipe (none/merge/single, fg/bg), guided_response, and guided_regenerate", async () => {
+    const preHistoryBlocks = Array.from({ length: 30 }, (_, idx) => ({
+      role: "system" as const,
+      content: `Nemo Pre ${idx + 1}`,
+    }));
+
+    // Mirrors Lumiverse prompt-assembly.service.ts:620-656 (`stripEmptyTextParts`).
+    const lumiverseStripEmptyTextParts = (msgs: Array<Record<string, unknown>>): Array<Record<string, unknown>> => {
+      const out: Array<Record<string, unknown>> = [];
+      for (const msg of msgs) {
+        if (typeof msg.content === "string") {
+          if (msg.content.trim().length > 0) {
+            out.push(msg);
+          }
+          continue;
+        }
+        if (!Array.isArray(msg.content)) {
+          out.push(msg);
+          continue;
+        }
+        const cleaned = (msg.content as Array<{ type: string; text?: string }>).filter(
+          (p) => p.type !== "text" || String(p.text ?? "").trim().length > 0,
+        );
+        if (cleaned.length > 0) {
+          out.push({ ...msg, content: cleaned });
+        }
+      }
+      return out;
+    };
+
+    const lumiverseHasNonEmptyContent = (msg: Record<string, unknown>): boolean => {
+      if (typeof msg.content === "string") {
+        return msg.content.trim().length > 0 || (msg.role === "assistant" && msg.partial === true);
+      }
+      if (Array.isArray(msg.content)) {
+        return msg.content.length > 0;
+      }
+      return true;
+    };
+
+    const lumiverseApplyPostProcessing = (
+      msgs: Array<Record<string, unknown>>,
+      mode: "none" | "merge" | "single",
+    ): Array<Record<string, unknown>> => {
+      if (mode === "none") {
+        return msgs.map((m) => ({ ...m }));
+      }
+      if (mode === "merge") {
+        const merged: Array<Record<string, unknown>> = [];
+        for (const msg of msgs) {
+          const prev = merged[merged.length - 1];
+          if (prev && prev.role === msg.role) {
+            merged[merged.length - 1] = {
+              ...prev,
+              content: `${String(prev.content ?? "")}\n\n${String(msg.content ?? "")}`,
+            };
+          } else {
+            merged.push({ ...msg });
+          }
+        }
+        return merged;
+      }
+      // "single": collapse all non-empty messages into one system message without chat-history metadata
+      const joined = msgs
+        .map((m) => (typeof m.content === "string" ? m.content : ""))
+        .filter((t) => t.length > 0)
+        .join("\n\n");
+      return [{ role: "system", content: joined }];
+    };
+
+    const assembleNemoWithBlocks = (chatMsgs: ChatMessageWithRole[]): Array<Record<string, unknown>> => {
+      const pre = preHistoryBlocks.map((b) => ({
+        role: b.role,
+        content: b.content,
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      }));
+      const block618 = {
+        role: "system" as const,
+        content: "[618] system(depth=1)",
+        __isChatHistory: false,
+        __chatHistorySource: false,
+      };
+      const historyItems = chatMsgs.map((m) => ({
+        role: (m.role ?? (m.is_user ? "user" : "assistant")) as "user" | "assistant" | "system",
+        content: m.content,
+        __isChatHistory: true,
+        __chatHistorySource: true,
+        sourceMessageId: m.id,
+        __sourceMessageId: m.id,
+      }));
+      const insertAt = Math.max(0, historyItems.length - 1);
+      return [
+        ...pre,
+        ...historyItems.slice(0, insertAt),
+        block618,
+        ...historyItems.slice(insertAt),
+        {
+          role: "assistant" as const,
+          content: "[619] assistant(depth=0)",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+        {
+          role: "user" as const,
+          content: "[620] user(depth=0)",
+          __isChatHistory: false,
+          __chatHistorySource: false,
+        },
+      ];
+    };
+
+    const runLumiverseDryRun = async (
+      harness: ReturnType<typeof createSpindleHarness>,
+      input: Record<string, unknown>,
+      userId: string | undefined,
+      mode: "none" | "merge" | "single",
+    ) => {
+      const chatId = String(input.chatId ?? "chat-1");
+      const rawAssembled = assembleNemoWithBlocks(harness.chatMessages.get(chatId)!);
+      // 1. stripEmptyTextParts runs BEFORE interceptorPipeline.run (prompt-assembly.service.ts:4251, 4287)
+      const afterStripEmpty = lumiverseStripEmptyTextParts(rawAssembled);
+      // 2. invoke registeredInterceptors (generate.service.ts:1238)
+      const ctx = {
+        userId: userId ?? "u1",
+        chatId,
+        generationId: "gen-dry-lumiverse",
+        generationType: (input.generationType as string) ?? "normal",
+        dryRun: true,
+        isDryRun: false,
+        presetId: (input.presetId as string) ?? null,
+        presetMetadata: {},
+        personaId: null,
+        characterId: null,
+        personaAddonStates: {},
+        mainDispatch: {
+          source: "main",
+          descriptor: null,
+          connectionDispatchRevision: null,
+          dispatchKind: null,
+        },
+        prefillCarrier: { id: "p", state: "absent" },
+        interceptorDeadlineAt: Date.now() + 5000,
+        boundWorkDeadlineAt: Date.now() + 5000,
+        signal: new AbortController().signal,
+      };
+      for (const handler of harness.registeredInterceptors) {
+        await handler(
+          afterStripEmpty as unknown as LlmMessageDTO[],
+          ctx as unknown as Parameters<InterceptorHandler>[1],
+        );
+      }
+      // 3. applyPostProcessing -> hasNonEmptyContent (generate.service.ts:1254-1255, 1423)
+      const postProcessed = lumiverseApplyPostProcessing(afterStripEmpty, mode);
+      const requestMessages = postProcessed.filter(lumiverseHasNonEmptyContent);
+      return {
+        messages: [],
+        request_messages: requestMessages,
+        parameters: { temperature: 0.7 },
+      };
+    };
+
+    const expectedNoneMessages = [
+      ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+      "system:[618] system(depth=1)",
+      "user:u_last",
+      "assistant:[619] assistant(depth=0)",
+      "user:[620] user(depth=0)",
+    ];
+    const expectedMergedMessages = [
+      `system:${[...preHistoryBlocks.map((b) => b.content), "[618] system(depth=1)"].join("\n\n")}`,
+      "user:u_last",
+      "assistant:[619] assistant(depth=0)",
+      "user:[620] user(depth=0)",
+    ];
+    const expectedSingleContent = [
+      ...preHistoryBlocks.map((b) => b.content),
+      "[618] system(depth=1)",
+      "u_last",
+      "[619] assistant(depth=0)",
+      "[620] user(depth=0)",
+    ].join("\n\n");
+
+    // 1. guided_swipe across backgroundSwipe (false/true) and promptPostProcessing (none/merge/single)
+    for (const backgroundSwipe of [false, true] as const) {
+      for (const mode of ["none", "merge", "single"] as const) {
+        let sent: Array<Record<string, unknown>> = [];
+        const swipeHarness = createSpindleHarness({
+          chats: {
+            "chat-1": [
+              makeMessage({ id: "u_last", role: "user", content: "u_last" }),
+              makeMessage({
+                id: "a_target",
+                role: "assistant",
+                content: "Old reply",
+                swipes: ["Old reply"],
+                swipe_id: 0,
+              }),
+            ],
+          },
+          dryRunImpl: (input, userId) => runLumiverseDryRun(swipeHarness, input, userId, mode),
+          rawStreamImpl: async function* (input) {
+            sent = (input.messages as Array<Record<string, unknown>>) ?? [];
+            yield { type: "token", token: "New swipe" };
+            yield { type: "done", content: "New swipe", finish_reason: "stop" };
+          },
+        });
+        const { runner } = registerBackend(swipeHarness.api);
+        const res = await runner.run(
+          { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe },
+          "u1",
+        );
+        expect(res.text).toBe("New swipe");
+
+        const serialized = JSON.stringify(sent);
+        expect(serialized.includes("Old reply")).toBe(false);
+
+        if (mode === "none") {
+          expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedNoneMessages);
+        } else if (mode === "merge") {
+          expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedMergedMessages);
+        } else {
+          expect(sent).toHaveLength(1);
+          expect(sent[0]?.role).toBe("system");
+          expect(sent[0]?.content).toBe(expectedSingleContent);
+        }
+      }
+    }
+
+    // 2. guided_response under the same stripEmptyTextParts-before-interceptor mock
+    for (const mode of ["none", "merge", "single"] as const) {
+      let sent: Array<Record<string, unknown>> = [];
+      const respHarness = createSpindleHarness({
+        chats: {
+          "chat-1": [makeMessage({ id: "u_last", role: "user", content: "u_last" })],
+        },
+        dryRunImpl: (input, userId) => runLumiverseDryRun(respHarness, input, userId, mode),
+        rawStreamImpl: async function* (input) {
+          sent = (input.messages as Array<Record<string, unknown>>) ?? [];
+          yield { type: "token", token: "Fresh response" };
+          yield { type: "done", content: "Fresh response", finish_reason: "stop" };
+        },
+      });
+      const { runner } = registerBackend(respHarness.api);
+      await runner.run(
+        { actionId: "guided_response", chatId: "chat-1", inputText: "Steer tension" },
+        "u1",
+      );
+      if (mode === "none") {
+        expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual([
+          ...preHistoryBlocks.map((b) => `${b.role}:${b.content}`),
+          "system:[618] system(depth=1)",
+          "user:u_last",
+          "system:[OOC Guidance for the next response: Steer tension]",
+          "assistant:[619] assistant(depth=0)",
+          "user:[620] user(depth=0)",
+        ]);
+      } else if (mode === "merge") {
+        expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual([
+          `system:${[...preHistoryBlocks.map((b) => b.content), "[618] system(depth=1)"].join("\n\n")}`,
+          "user:u_last",
+          "system:[OOC Guidance for the next response: Steer tension]",
+          "assistant:[619] assistant(depth=0)",
+          "user:[620] user(depth=0)",
+        ]);
+      } else {
+        expect(sent).toHaveLength(1);
+        expect(sent[0]?.role).toBe("system");
+        expect(sent[0]?.content).toBe(
+          [
+            ...preHistoryBlocks.map((b) => b.content),
+            "[618] system(depth=1)",
+            "u_last",
+            "[OOC Guidance for the next response: Steer tension]",
+            "[619] assistant(depth=0)",
+            "[620] user(depth=0)",
+          ].join("\n\n"),
+        );
+      }
+    }
+
+    // 3. guided_regenerate under the same stripEmptyTextParts-before-interceptor mock
+    for (const mode of ["none", "merge", "single"] as const) {
+      let sent: Array<Record<string, unknown>> = [];
+      const regenHarness = createSpindleHarness({
+        chats: {
+          "chat-1": [
+            makeMessage({ id: "u_last", role: "user", content: "u_last" }),
+            makeMessage({ id: "a_target", role: "assistant", content: "Old reply", swipes: ["Old reply"] }),
+          ],
+        },
+        dryRunImpl: (input, userId) => runLumiverseDryRun(regenHarness, input, userId, mode),
+        rawStreamImpl: async function* (input) {
+          sent = (input.messages as Array<Record<string, unknown>>) ?? [];
+          yield { type: "token", token: "Regen reply" };
+          yield { type: "done", content: "Regen reply", finish_reason: "stop" };
+        },
+      });
+      const { runner } = registerBackend(regenHarness.api);
+      await runner.run(
+        { actionId: "guided_regenerate", chatId: "chat-1", inputText: "" },
+        "u1",
+      );
+      expect(JSON.stringify(sent).includes("Old reply")).toBe(false);
+      if (mode === "none") {
+        expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedNoneMessages);
+      } else if (mode === "merge") {
+        expect(sent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedMergedMessages);
+      } else {
+        expect(sent).toHaveLength(1);
+        expect(sent[0]?.role).toBe("system");
+        expect(sent[0]?.content).toBe(expectedSingleContent);
+      }
+    }
+  });
+});
+
+describe("post-audit polish regression tests (backend)", () => {
+  test("guided_swipe on already-empty swipe without interceptor preserves earlier non-empty assistant turn", async () => {
+    let sentMessages: LlmMessageDTO[] = [];
+    const harness = createSpindleHarness({
+      permissions: { interceptor: false },
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Earlier non-empty assistant turn",
+            swipes: ["Earlier non-empty assistant turn"],
+            swipe_id: 0,
+          }),
+          makeMessage({ id: "u2", role: "user", content: "Continue" }),
+          makeMessage({
+            id: "a2",
+            role: "assistant",
+            content: "",
+            swipes: [""],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      dryRunImpl: async () => ({
+        messages: [
+          { role: "system", content: "System" },
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Earlier non-empty assistant turn" },
+          { role: "user", content: "Continue" },
+          { role: "system", content: "Post-history" },
+        ],
+        request_messages: [
+          { role: "system", content: "System" },
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Earlier non-empty assistant turn" },
+          { role: "user", content: "Continue" },
+          { role: "system", content: "Post-history" },
+        ],
+        breakdown: [
+          { type: "preset", name: "System" },
+          { type: "chat_history", name: "Chat History", firstMessageIndex: 1, messageCount: 3 },
+          { type: "preset", name: "Post-history" },
+        ],
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawStreamImpl: async function* (input) {
+        sentMessages = (input.messages as LlmMessageDTO[]) ?? [];
+        yield { type: "token", token: "Fresh swipe reply" };
+        yield { type: "done", content: "Fresh swipe reply", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    const res = await runner.run({ actionId: "guided_swipe", chatId: "chat-1", inputText: "" }, "u1");
+    expect(res.text).toBe("Fresh swipe reply");
+    expect(sentMessages.map((m) => `${m.role}:${m.content}`)).toEqual([
+      "system:System",
+      "user:Hello",
+      "assistant:Earlier non-empty assistant turn",
+      "user:Continue",
+      "system:Post-history",
+    ]);
+  });
+
+  test("mergeDryRunAndCapturedMessages does not misclassify 1-message empty-turn pruning or non-history role merge as collapseToSingleRole", async () => {
+    // Case A: Empty-turn pruning leaves 1 non-empty user message (without metadata on request_messages)
+    let sentA: LlmMessageDTO[] = [];
+    const capturedA = [
+      { role: "user" as const, content: "Only user turn", __chatHistorySource: true, __sourceMessageId: "u1" },
+      { role: "assistant" as const, content: "" },
+    ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+    const harnessA = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Only user turn" })],
+      },
+      interceptorMessagesByChat: { "chat-1": capturedA },
+      dryRunImpl: async () => ({
+        messages: capturedA,
+        request_messages: [{ role: "user", content: "Only user turn" }],
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawStreamImpl: async function* (input) {
+        sentA = (input.messages as LlmMessageDTO[]) ?? [];
+        yield { type: "token", token: "Reply A" };
+        yield { type: "done", content: "Reply A", finish_reason: "stop" };
+      },
+    });
+    const { runner: runnerA } = registerBackend(harnessA.api);
+    await runnerA.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Guide A" }, "u1");
+    // Guidance must be injected as a separate system message, NOT collapsed into the single user message
+    expect(sentA).toEqual([
+      { role: "user", content: "Only user turn" },
+      { role: "system", content: "[OOC Guidance for the next response: Guide A]" },
+    ]);
+
+    // Case B: Non-history consecutive system blocks merge into 1 system message in merge mode
+    let sentB: LlmMessageDTO[] = [];
+    const capturedB = [
+      { role: "system" as const, content: "Sys 1", __chatHistorySource: false },
+      { role: "system" as const, content: "Sys 2", __chatHistorySource: false },
+    ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+    const harnessB = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "a0", role: "assistant", content: "" })],
+      },
+      interceptorMessagesByChat: { "chat-1": capturedB },
+      dryRunImpl: async () => ({
+        messages: capturedB,
+        request_messages: [{ role: "system", content: "Sys 1\n\nSys 2" }],
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawStreamImpl: async function* (input) {
+        sentB = (input.messages as LlmMessageDTO[]) ?? [];
+        yield { type: "token", token: "Reply B" };
+        yield { type: "done", content: "Reply B", finish_reason: "stop" };
+      },
+    });
+    const { runner: runnerB, store: storeB } = registerBackend(harnessB.api);
+    const settingsB = await storeB.getSettings("u1");
+    settingsB.actions.guided_response.injectionRole = "user";
+    await storeB.saveSettings(settingsB, "u1");
+    await runnerB.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "User-role guide" },
+      "u1",
+    );
+    expect(sentB).toEqual([
+      { role: "system", content: "Sys 1\n\nSys 2" },
+      { role: "user", content: "[OOC Guidance for the next response: User-role guide]" },
+    ]);
+  });
+
+  test("guided_swipe handles mid-stream swipe deletion (earlier swipe shifts activeRuns.swipeId; target swipe aborts without resurrection) and concurrent dryRun swipe mutations", async () => {
+    // 1. Deleting an earlier swipe mid-stream shifts targetSwipeIndex & updates activeRuns.swipeId
+    let releaseToken2!: () => void;
+    const token2Gate = new Promise<void>((resolve) => {
+      releaseToken2 = resolve;
+    });
+    let onFirstToken!: () => void;
+    const firstTokenSeen = new Promise<void>((resolve) => {
+      onFirstToken = resolve;
+    });
+
+    const harnessShift = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Swipe 1",
+            swipes: ["Swipe 0", "Swipe 1"],
+            swipe_id: 1,
+            swipe_dates: [100, 200],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "First " };
+        onFirstToken();
+        await token2Gate;
+        yield { type: "token", token: "Second" };
+        yield { type: "done", content: "First Second", finish_reason: "stop" };
+      },
+    });
+    const { runner: shiftRunner } = registerBackend(harnessShift.api);
+    const shiftPromise = shiftRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await firstTokenSeen;
+    expect(shiftRunner.getActiveRun("u1", "chat-1")?.swipeId).toBe(2);
+
+    // Simulate user deleting swipe 0 mid-stream on host
+    const msgBeforeDelete = harnessShift.chatMessages.get("chat-1")![1]!;
+    msgBeforeDelete.swipes.splice(0, 1);
+    msgBeforeDelete.swipe_dates.splice(0, 1);
+    msgBeforeDelete.swipe_id = 1;
+    harnessShift.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "deleted",
+      swipeId: 0,
+      message: { id: "a1", swipe_id: 1 },
+    });
+
+    expect(shiftRunner.getActiveRun("u1", "chat-1")?.swipeId).toBe(1);
+    releaseToken2();
+    const shiftRes = await shiftPromise;
+    expect(shiftRes.swipeId).toBe(1);
+    expect(shiftRes.text).toBe("First Second");
+    const finalMsg = harnessShift.chatMessages.get("chat-1")![1]!;
+    expect(finalMsg.swipes).toEqual(["Swipe 1", "First Second"]);
+    expect(finalMsg.swipe_id).toBe(1);
+
+    // 2. Deleting the target swipe slot itself mid-stream aborts and does NOT resurrect the deleted slot
+    let onTargetToken!: () => void;
+    const targetTokenSeen = new Promise<void>((resolve) => {
+      onTargetToken = resolve;
+    });
+    let releaseTargetStream!: () => void;
+    const targetStreamGate = new Promise<void>((resolve) => {
+      releaseTargetStream = resolve;
+    });
+
+    const harnessDel = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Swipe 0",
+            swipes: ["Swipe 0"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Partial" };
+        onTargetToken();
+        await targetStreamGate;
+        yield { type: "token", token: "AfterDelete" };
+        yield { type: "done", content: "PartialAfterDelete", finish_reason: "stop" };
+      },
+    });
+    const { runner: delRunner } = registerBackend(harnessDel.api);
+    const delPromise = delRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await targetTokenSeen;
+    const updatesBeforeDelete = harnessDel.updateMessageCalls.length;
+
+    // Host deletes target swipe slot 1
+    const targetMsg = harnessDel.chatMessages.get("chat-1")![1]!;
+    targetMsg.swipes = ["Swipe 0"];
+    targetMsg.swipe_dates = [100];
+    targetMsg.swipe_id = 0;
+    targetMsg.content = "Swipe 0";
+    harnessDel.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "deleted",
+      swipeId: 1,
+      message: { id: "a1", swipe_id: 0 },
+    });
+    releaseTargetStream();
+
+    const delRes = await delPromise;
+    expect(delRes.aborted).toBe(true);
+    expect(delRes.text).toBe("");
+    // No post-delete updateMessage calls resurrected swipe slot 1
+    expect(harnessDel.updateMessageCalls.length).toBe(updatesBeforeDelete);
+    expect(harnessDel.chatMessages.get("chat-1")![1]!.swipes).toEqual(["Swipe 0"]);
+
+    // 3. Concurrent swipe added during dryRun is preserved when pendingSwipeSlotWrite re-reads target
+    const harnessConcurrent = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Swipe 0",
+            swipes: ["Swipe 0"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      dryRunImpl: async () => {
+        // Concurrent swipe added while dryRun is in flight
+        const m = harnessConcurrent.chatMessages.get("chat-1")![1]!;
+        m.swipes.push("Concurrent swipe 1");
+        m.swipe_dates.push(150);
+        return {
+          messages: [
+            { role: "user", content: "Prompt" },
+            { role: "assistant", content: "Swipe 0" },
+          ],
+          request_messages: [
+            { role: "user", content: "Prompt" },
+            { role: "assistant", content: "Swipe 0" },
+          ],
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "GG swipe 2" };
+        yield { type: "done", content: "GG swipe 2", finish_reason: "stop" };
+      },
+    });
+    const { runner: concRunner } = registerBackend(harnessConcurrent.api);
+    const concRes = await concRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "" },
+      "u1",
+    );
+    expect(concRes.swipeId).toBe(2);
+    expect(harnessConcurrent.chatMessages.get("chat-1")![1]!.swipes).toEqual([
+      "Swipe 0",
+      "Concurrent swipe 1",
+      "GG swipe 2",
+    ]);
+  });
+
+  test("persists reasoningDuration on guided_response, guided_regenerate, and guided_swipe (active and background)", async () => {
+    const delayedReasoningStream = async function* () {
+      yield { type: "reasoning" as const, token: "Step 1. " };
+      await new Promise((r) => setTimeout(r, 15));
+      yield { type: "reasoning" as const, token: "Step 2." };
+      yield { type: "token" as const, token: "Final answer." };
+      yield { type: "done" as const, content: "Final answer.", reasoning: "Step 1. Step 2.", finish_reason: "stop" };
+    };
+
+    // 1. guided_response
+    const respHarness = createSpindleHarness({
+      chats: { "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hi" })] },
+      rawStreamImpl: delayedReasoningStream,
+    });
+    const { runner: respRunner } = registerBackend(respHarness.api);
+    await respRunner.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Reason" }, "u1");
+    const respFinalPatch = respHarness.updateMessageCalls.at(-1)?.patch;
+    expect(respFinalPatch?.reasoning).toEqual({
+      text: "Step 1. Step 2.",
+      duration: expect.any(Number),
+    });
+    expect((respFinalPatch?.reasoning as { duration: number }).duration).toBeGreaterThan(0);
+
+    // 2. guided_regenerate
+    const regenHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hi" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Old" }),
+        ],
+      },
+      rawStreamImpl: delayedReasoningStream,
+    });
+    const { runner: regenRunner } = registerBackend(regenHarness.api);
+    await regenRunner.run({ actionId: "guided_regenerate", chatId: "chat-1", inputText: "" }, "u1");
+    const regenFinalPatch = regenHarness.updateMessageCalls.at(-1)?.patch;
+    expect((regenFinalPatch?.reasoning as { duration: number }).duration).toBeGreaterThan(0);
+
+    // 3. guided_swipe (active)
+    const swipeHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hi" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Old", swipes: ["Old"], swipe_id: 0 }),
+        ],
+      },
+      rawStreamImpl: delayedReasoningStream,
+    });
+    const { runner: swipeRunner } = registerBackend(swipeHarness.api);
+    await swipeRunner.run({ actionId: "guided_swipe", chatId: "chat-1", inputText: "" }, "u1");
+    const swipeFinalPatch = swipeHarness.updateMessageCalls.at(-1)?.patch;
+    expect((swipeFinalPatch?.reasoning as { duration: number }).duration).toBeGreaterThan(0);
+
+    // 4. guided_swipe (background)
+    const bgHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hi" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Old", swipes: ["Old"], swipe_id: 0 }),
+        ],
+      },
+      rawStreamImpl: delayedReasoningStream,
+    });
+    const { runner: bgRunner } = registerBackend(bgHarness.api);
+    await bgRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe: true },
+      "u1",
+    );
+    const bgFinalPatch = bgHarness.updateMessageCalls.at(-1)?.patch;
+    const bgSwipeReasoning = bgFinalPatch?.swipe_reasoning as Array<{ text: string; duration?: number } | null>;
+    expect(bgSwipeReasoning[1]?.text).toBe("Step 1. Step 2.");
+    expect(bgSwipeReasoning[1]?.duration).toBeGreaterThan(0);
+  });
+
+  test("regenerateLastContinue restores preRegen on post-token transformOutput throw and on final flush error", async () => {
+    // 1. Post-token transformOutput throw after tokens were streamed
+    const harnessTransform = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Base",
+            swipes: ["Base"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Token" };
+        yield { type: "done", content: "Token", finish_reason: "stop" };
+      },
+    });
+    const { runner: runner1, store: store1 } = registerBackend(harnessTransform.api);
+    await runner1.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" }, "u1");
+    expect(harnessTransform.chatMessages.get("chat-1")![1]!.content).toBe("Base Token");
+
+    const origPrepare = (
+      runner1 as unknown as {
+        prepareRawGenerationInput: (...a: unknown[]) => Promise<{
+          rawInput: unknown;
+          transformResponseOutput?: () => Promise<unknown>;
+          transformImpersonateOutput?: unknown;
+        }>;
+      }
+    ).prepareRawGenerationInput.bind(runner1);
+    (
+      runner1 as unknown as {
+        prepareRawGenerationInput: (...a: unknown[]) => Promise<{
+          rawInput: unknown;
+          transformResponseOutput?: () => Promise<unknown>;
+          transformImpersonateOutput?: unknown;
+        }>;
+      }
+    ).prepareRawGenerationInput = async (...a: unknown[]) => {
+      const prepared = await origPrepare(...a);
+      return {
+        ...prepared,
+        transformResponseOutput: async () => {
+          throw new Error("Post-token transformOutput failure");
+        },
+      };
+    };
+
+    await expect(runner1.regenerateLastContinue({ chatId: "chat-1" }, "u1")).rejects.toThrow(
+      "Post-token transformOutput failure",
+    );
+    expect(harnessTransform.chatMessages.get("chat-1")![1]!.content).toBe("Base Token");
+    const entry1 = await store1.peekContinueEntry("chat-1", "a1", 0, "u1");
+    expect(entry1?.resultText).toBe("Base Token");
+
+    // 2. Final flush error after tokens streamed
+    let failFinalFlush = false;
+    const harnessFlush = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hello" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Base",
+            swipes: ["Base"],
+            swipe_id: 0,
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "NewPart" };
+        yield { type: "done", content: "NewPart", finish_reason: "stop" };
+      },
+      updateMessageImpl: async (_chatId, _messageId, patch, defaultUpdate) => {
+        if (failFinalFlush && patch.skipChunkRebuild === false) {
+          throw new Error("Final flush rejected");
+        }
+        await defaultUpdate();
+      },
+    });
+    const { runner: runner2, store: store2 } = registerBackend(harnessFlush.api);
+    await runner2.run({ actionId: "guided_continue", chatId: "chat-1", inputText: "Extend" }, "u1");
+    expect(harnessFlush.chatMessages.get("chat-1")![1]!.content).toBe("Base NewPart");
+
+    failFinalFlush = true;
+    await expect(runner2.regenerateLastContinue({ chatId: "chat-1" }, "u1")).rejects.toThrow(
+      "Final flush rejected",
+    );
+    failFinalFlush = false;
+    expect(harnessFlush.chatMessages.get("chat-1")![1]!.content).toBe("Base NewPart");
+    const entry2 = await store2.peekContinueEntry("chat-1", "a1", 0, "u1");
+    expect(entry2?.resultText).toBe("Base NewPart");
+  });
+
+  test("prepareRawGenerationInput filters empty turns before injectGuidanceMessage and abortCurrent aborts pendingUsers with undefined chatId", async () => {
+    // 1. Empty-turn filtering runs before injectGuidanceMessage so in_history depth counts non-empty turns
+    let sent: LlmMessageDTO[] = [];
+    const capturedWithEmpty = [
+      { role: "system" as const, content: "System", __chatHistorySource: false },
+      { role: "user" as const, content: "First user", __chatHistorySource: true, __sourceMessageId: "u1" },
+      { role: "assistant" as const, content: "First reply", __chatHistorySource: true, __sourceMessageId: "a1" },
+      { role: "assistant" as const, content: "", __chatHistorySource: true, __sourceMessageId: "a-empty" },
+    ] as unknown as Array<LlmMessageDTO & { __isWorldInfoEntry?: boolean }>;
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "First user" }),
+          makeMessage({ id: "a1", role: "assistant", content: "First reply" }),
+        ],
+      },
+      interceptorMessagesByChat: { "chat-1": capturedWithEmpty },
+      dryRunImpl: async () => ({
+        messages: capturedWithEmpty,
+        request_messages: [
+          { role: "system", content: "System" },
+          { role: "user", content: "First user" },
+          { role: "assistant", content: "First reply" },
+        ],
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawStreamImpl: async function* (input) {
+        sent = (input.messages as LlmMessageDTO[]) ?? [];
+        yield { type: "token", token: "Done" };
+        yield { type: "done", content: "Done", finish_reason: "stop" };
+      },
+    });
+    const { runner, store } = registerBackend(harness.api);
+    const s = await store.getSettings("u1");
+    s.actions.guided_response.guidancePosition = "in_history";
+    s.actions.guided_response.guidanceDepth = 1;
+    await store.saveSettings(s, "u1");
+    await runner.run({ actionId: "guided_response", chatId: "chat-1", inputText: "Depth 1 guide" }, "u1");
+    // Depth 1 from non-empty history [u1, a1] must insert right before "First reply", not after "First reply"
+    expect(sent.map((m) => m.content)).toEqual([
+      "System",
+      "First user",
+      "[OOC Guidance for the next response: Depth 1 guide]",
+      "First reply",
+    ]);
+
+    // 2. abortCurrent with chatId aborts pendingUsers entry whose chatId is still undefined during resolveChatContext
+    let releaseChatGet!: () => void;
+    const chatGetGate = new Promise<void>((resolve) => {
+      releaseChatGet = resolve;
+    });
+    let chatGetStarted!: () => void;
+    const chatGetStartedPromise = new Promise<void>((resolve) => {
+      chatGetStarted = resolve;
+    });
+    const slowHarness = createSpindleHarness({
+      chats: { "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hi" })] },
+    });
+    const origGetActive = slowHarness.api.chats.getActive;
+    slowHarness.api.chats.getActive = async (userId?: string) => {
+      chatGetStarted();
+      await chatGetGate;
+      return origGetActive(userId);
+    };
+    const { runner: slowRunner } = registerBackend(slowHarness.api);
+    const pendingRunPromise = slowRunner.run(
+      { actionId: "guided_response", inputText: "Slow resolve" },
+      "u1",
+    );
+    await chatGetStartedPromise;
+    expect(slowRunner.abortCurrent("u1", undefined, "chat-1")).toBe(true);
+    releaseChatGet();
+    const pendingRes = await pendingRunPromise;
+    expect(pendingRes.aborted).toBe(true);
   });
 });

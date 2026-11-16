@@ -15,12 +15,21 @@ const INDICATOR_HTML_AFTER =
   '<div class="gg-streaming-indicator gg-streaming-indicator--after" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
 
 const MAX_RAF_RETRIES = 30;
+const MAX_RUN_STATE_CACHE = 32;
 
 interface ResolvedIndicatorTarget {
   element: Element;
   position: InsertPosition;
   isMessageContent: boolean;
 }
+
+interface PerRunIndicatorState {
+  viewedSwipeId: number | undefined;
+  swipeInitialized: boolean;
+  contentSeen: boolean;
+}
+
+type MessageEventKind = "MESSAGE_SWIPED" | "MESSAGE_EDITED" | "MESSAGE_SENT";
 
 type RetryMode = "row" | "content" | null;
 
@@ -34,6 +43,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export class StreamingIndicatorController {
   private readonly disposers: Array<() => void> = [];
+  private readonly runStateById = new Map<string, PerRunIndicatorState>();
   private currentRun: ActiveRunState | null = null;
   private viewedSwipeId: number | undefined = undefined;
   private swipeInitialized = false;
@@ -49,19 +59,23 @@ export class StreamingIndicatorController {
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     if (typeof this.ctx.events?.on === "function") {
-      const handleMessageEvent = (rawPayload: unknown) => {
-        this.onMessageEvent(rawPayload);
-      };
       const handleChatEvent = () => {
         if (!this.destroyed) {
+          this.rafRetries = 0;
           this.syncCurrent();
         }
       };
 
       this.disposers.push(
-        this.ctx.events.on("MESSAGE_SWIPED", handleMessageEvent),
-        this.ctx.events.on("MESSAGE_EDITED", handleMessageEvent),
-        this.ctx.events.on("MESSAGE_SENT", handleMessageEvent),
+        this.ctx.events.on("MESSAGE_SWIPED", (rawPayload) => {
+          this.onMessageEvent(rawPayload, "MESSAGE_SWIPED");
+        }),
+        this.ctx.events.on("MESSAGE_EDITED", (rawPayload) => {
+          this.onMessageEvent(rawPayload, "MESSAGE_EDITED");
+        }),
+        this.ctx.events.on("MESSAGE_SENT", (rawPayload) => {
+          this.onMessageEvent(rawPayload, "MESSAGE_SENT");
+        }),
         this.ctx.events.on("CHAT_CHANGED", handleChatEvent),
         this.ctx.events.on("CHAT_SWITCHED", handleChatEvent),
       );
@@ -72,15 +86,26 @@ export class StreamingIndicatorController {
     if (this.destroyed) return;
 
     const prevRun = this.currentRun;
+    if (prevRun) {
+      this.saveRunState(prevRun.runId);
+    }
+
     const runIdentityChanged =
       prevRun?.runId !== run?.runId ||
       prevRun?.messageId !== run?.messageId ||
       prevRun?.actionId !== run?.actionId;
 
     if (prevRun?.runId !== run?.runId) {
-      this.contentSeen = false;
-      this.viewedSwipeId = undefined;
-      this.swipeInitialized = false;
+      const cached = run ? this.runStateById.get(run.runId) : undefined;
+      if (cached) {
+        this.contentSeen = cached.contentSeen;
+        this.viewedSwipeId = cached.viewedSwipeId;
+        this.swipeInitialized = cached.swipeInitialized;
+      } else {
+        this.contentSeen = false;
+        this.viewedSwipeId = undefined;
+        this.swipeInitialized = false;
+      }
       this.resetRetry();
     } else if (prevRun?.messageId !== run?.messageId) {
       this.resetRetry();
@@ -91,6 +116,9 @@ export class StreamingIndicatorController {
     if (run && !this.swipeInitialized && run.swipeId !== undefined) {
       this.viewedSwipeId = run.backgroundSwipe ? undefined : run.swipeId;
       this.swipeInitialized = true;
+    }
+    if (run) {
+      this.saveRunState(run.runId);
     }
 
     if (runIdentityChanged) {
@@ -106,6 +134,7 @@ export class StreamingIndicatorController {
     this.resetRetry();
     this.unmount();
     this.currentRun = null;
+    this.runStateById.clear();
     for (const dispose of this.disposers) {
       try {
         dispose();
@@ -116,7 +145,28 @@ export class StreamingIndicatorController {
     this.disposers.length = 0;
   }
 
-  private onMessageEvent(rawPayload: unknown): void {
+  private saveRunState(runId: string): void {
+    if (!runId) return;
+    if (this.runStateById.has(runId)) {
+      this.runStateById.delete(runId);
+    }
+    this.runStateById.set(runId, {
+      viewedSwipeId: this.viewedSwipeId,
+      swipeInitialized: this.swipeInitialized,
+      contentSeen: this.contentSeen,
+    });
+    if (this.runStateById.size > MAX_RUN_STATE_CACHE) {
+      const oldestKey = this.runStateById.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.runStateById.delete(oldestKey);
+      }
+    }
+  }
+
+  private onMessageEvent(
+    rawPayload: unknown,
+    eventType: MessageEventKind,
+  ): void {
     if (this.destroyed || !this.currentRun?.messageId) return;
 
     const payload = isRecord(rawPayload) ? rawPayload : null;
@@ -150,7 +200,9 @@ export class StreamingIndicatorController {
         this.contentSeen = true;
       }
 
-      if (this.mountedEl === null) {
+      this.saveRunState(this.currentRun.runId);
+
+      if (eventType === "MESSAGE_SWIPED" || this.retryMode === "content") {
         this.rafRetries = 0;
       }
     }

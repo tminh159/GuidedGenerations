@@ -58,6 +58,12 @@ interface PendingFocusRestore {
   button: "up" | "down";
 }
 
+interface PendingGeneralFocusRestore {
+  focusKey?: string;
+  tagName?: string;
+  ariaLabel?: string;
+}
+
 interface DebouncedEntry {
   timer: ReturnType<typeof setTimeout>;
   flush: () => void;
@@ -86,10 +92,17 @@ export class SettingsDrawerController {
   private recoveryUi: RecoverySectionUi | null = null;
   private pendingView: ExtensionBootstrapView | null = null;
   private pendingFocusRestore: PendingFocusRestore | null = null;
+  private pendingGeneralFocusRestore: PendingGeneralFocusRestore | null = null;
+  private pointerActiveInDrawer = false;
+  private pointerReleaseCleanup: (() => void) | null = null;
+  private pointerFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingViewFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private noticeText = "";
   private noticeKind: "info" | "warn" | "error" = "info";
+  private recoveryBusy = false;
   private destroyed = false;
   private readonly onFocusOut: (event: FocusEvent) => void;
+  private readonly onPointerDownInDrawer: () => void;
 
   constructor(
     private readonly ctx: SpindleFrontendContext,
@@ -114,30 +127,111 @@ export class SettingsDrawerController {
       iconSvg: DRAWER_TAB_ICON_SVG,
     });
 
+    const clearPointerTracking = () => {
+      if (this.pointerFallbackTimer !== null) {
+        clearTimeout(this.pointerFallbackTimer);
+        this.pointerFallbackTimer = null;
+      }
+      if (this.pointerReleaseCleanup) {
+        const cleanup = this.pointerReleaseCleanup;
+        this.pointerReleaseCleanup = null;
+        cleanup();
+      }
+    };
+
+    this.onPointerDownInDrawer = () => {
+      if (this.destroyed || this.pointerActiveInDrawer) return;
+      this.pointerActiveInDrawer = true;
+      clearPointerTracking();
+
+      if (typeof document === "undefined") {
+        this.pointerActiveInDrawer = false;
+        return;
+      }
+      const win = typeof window !== "undefined" ? window : document.defaultView;
+
+      const finishPointer = () => {
+        clearPointerTracking();
+        // Wait one macrotask so the browser's click event fires before any pendingView re-render.
+        if (this.pendingViewFlushTimer !== null) {
+          clearTimeout(this.pendingViewFlushTimer);
+        }
+        this.pendingViewFlushTimer = setTimeout(() => {
+          this.pendingViewFlushTimer = null;
+          this.pointerActiveInDrawer = false;
+          this.flushPendingViewIfIdle();
+        }, 0);
+      };
+
+      const onWindowBlur = () => {
+        clearPointerTracking();
+        this.pointerActiveInDrawer = false;
+        this.flushPendingViewIfIdle();
+      };
+
+      document.addEventListener("pointerup", finishPointer, true);
+      document.addEventListener("pointercancel", finishPointer, true);
+      document.addEventListener("mouseup", finishPointer, true);
+      win?.addEventListener("blur", onWindowBlur);
+
+      this.pointerReleaseCleanup = () => {
+        document.removeEventListener("pointerup", finishPointer, true);
+        document.removeEventListener("pointercancel", finishPointer, true);
+        document.removeEventListener("mouseup", finishPointer, true);
+        win?.removeEventListener("blur", onWindowBlur);
+      };
+
+      this.pointerFallbackTimer = setTimeout(() => {
+        clearPointerTracking();
+        this.pointerActiveInDrawer = false;
+        this.flushPendingViewIfIdle();
+      }, 3000);
+    };
+
     this.onFocusOut = (event: FocusEvent) => {
       if (this.destroyed) return;
       const nextTarget = event.relatedTarget as Node | null;
+      if (this.debounceTimers.size > 0 && nextTarget !== event.target) {
+        this.flushPendingSaves();
+      }
       const stillInsideEditable =
         isElementNode(nextTarget) &&
         this.tab.root.contains(nextTarget) &&
         isEditableElement(nextTarget);
-      if (!stillInsideEditable) {
-        if (this.debounceTimers.size > 0) {
-          this.flushPendingSaves();
-        }
-        queueMicrotask(() => {
-          if (this.destroyed) return;
-          if (this.pendingView && !this.isEditingDrawerInput()) {
-            const next: ExtensionBootstrapView = this.currentSettings
-              ? { ...this.pendingView, settings: this.currentSettings }
-              : this.pendingView;
-            this.pendingView = null;
-            this.render(next, { force: true });
+      if (!stillInsideEditable && this.pendingView) {
+        if (this.pointerActiveInDrawer || isClickableInside(this.tab.root, nextTarget)) {
+          if (!this.pointerActiveInDrawer) {
+            this.scheduleDeferredPendingViewFlush();
           }
-        });
+        } else {
+          queueMicrotask(() => {
+            this.flushPendingViewIfIdle();
+          });
+        }
       }
     };
+    this.tab.root.addEventListener("pointerdown", this.onPointerDownInDrawer);
+    this.tab.root.addEventListener("mousedown", this.onPointerDownInDrawer);
     this.tab.root.addEventListener("focusout", this.onFocusOut);
+  }
+
+  private scheduleDeferredPendingViewFlush(): void {
+    if (this.destroyed || this.pendingViewFlushTimer !== null) return;
+    this.pendingViewFlushTimer = setTimeout(() => {
+      this.pendingViewFlushTimer = null;
+      this.flushPendingViewIfIdle();
+    }, 0);
+  }
+
+  private flushPendingViewIfIdle(): void {
+    if (this.destroyed || this.pointerActiveInDrawer) return;
+    if (this.pendingView && !this.isEditingDrawerInput()) {
+      const next: ExtensionBootstrapView = this.currentSettings
+        ? { ...this.pendingView, settings: this.currentSettings }
+        : this.pendingView;
+      this.pendingView = null;
+      this.render(next, { force: true });
+    }
   }
 
   onActivate(handler: () => void): () => void {
@@ -174,11 +268,30 @@ export class SettingsDrawerController {
     this.noticeEl.textContent = this.noticeText;
   }
 
+  setRecoveryBusy(busy: boolean): void {
+    if (this.destroyed) return;
+    this.recoveryBusy = busy;
+    if (!this.recoveryUi) return;
+    this.recoveryUi.clearBtn.disabled = busy || this.recoveryUi.recoveryCount === 0;
+    if (this.recoveryUi.listEl) {
+      for (const btn of this.recoveryUi.listEl.querySelectorAll<HTMLButtonElement>("button")) {
+        btn.disabled = busy;
+      }
+    }
+  }
+
   updateRecovery(
     recovery: readonly RecoveryEntry[],
     settings?: GuidedGenerationsSettings,
   ): void {
-    if (this.destroyed || !this.recoveryUi) return;
+    if (this.destroyed) return;
+    if (this.pendingView) {
+      this.pendingView = {
+        ...this.pendingView,
+        recovery: [...recovery],
+      };
+    }
+    if (!this.recoveryUi) return;
     const maxEntries =
       settings?.inputRecovery.maxEntries ??
       this.currentSettings?.inputRecovery.maxEntries ??
@@ -193,7 +306,7 @@ export class SettingsDrawerController {
       recovery.length > 0
         ? `Saved inputs (${recovery.length}/${maxEntries}):`
         : "No saved inputs yet.";
-    this.recoveryUi.clearBtn.disabled = recovery.length === 0;
+    this.recoveryUi.clearBtn.disabled = this.recoveryBusy || recovery.length === 0;
     this.syncRecoveryList(recovery);
   }
 
@@ -208,18 +321,32 @@ export class SettingsDrawerController {
   }
 
   private captureOrderButtonFocus(): void {
-    if (this.pendingFocusRestore) return;
     const active = typeof document !== "undefined" ? document.activeElement : null;
-    if (!isElementNode(active) || active.tagName !== "BUTTON" || !this.tab.root.contains(active)) {
+    if (!isElementNode(active) || !this.tab.root.contains(active)) {
       return;
     }
-    const btn = active as HTMLButtonElement;
-    const moveDir = btn.dataset.ggMove;
-    if (moveDir !== "up" && moveDir !== "down") return;
-    const row = btn.closest("[data-gg-order-id]");
-    const optionId = row?.getAttribute("data-gg-order-id") as ToolbarOptionId | null;
-    if (optionId) {
-      this.pendingFocusRestore = { optionId, button: moveDir };
+    if (!this.pendingFocusRestore && active.tagName === "BUTTON") {
+      const btn = active as HTMLButtonElement;
+      const moveDir = btn.dataset.ggMove;
+      if (moveDir === "up" || moveDir === "down") {
+        const row = btn.closest("[data-gg-order-id]");
+        const optionId = row?.getAttribute("data-gg-order-id") as ToolbarOptionId | null;
+        if (optionId) {
+          this.pendingFocusRestore = { optionId, button: moveDir };
+          return;
+        }
+      }
+    }
+    if (!this.pendingFocusRestore && !this.pendingGeneralFocusRestore) {
+      const focusKey = active.getAttribute("data-gg-focus-key") ?? undefined;
+      const ariaLabel = active.getAttribute("aria-label") ?? undefined;
+      if (focusKey || ariaLabel) {
+        this.pendingGeneralFocusRestore = {
+          focusKey,
+          tagName: active.tagName,
+          ariaLabel,
+        };
+      }
     }
   }
 
@@ -240,13 +367,25 @@ export class SettingsDrawerController {
     }
 
     this.pendingView = null;
+    if (this.pendingViewFlushTimer !== null) {
+      clearTimeout(this.pendingViewFlushTimer);
+      this.pendingViewFlushTimer = null;
+    }
     this.captureOrderButtonFocus();
-    this.cancelPendingSaves();
+    let effectiveView = view;
+    if (options?.force && this.debounceTimers.size > 0) {
+      this.flushPendingSaves();
+      if (effectiveView && this.currentSettings) {
+        effectiveView = { ...effectiveView, settings: this.currentSettings };
+      }
+    } else {
+      this.cancelPendingSaves();
+    }
     this.clearComponentHandles();
     this.orderStateTags.clear();
     this.recoveryUi = null;
     this.noticeEl = null;
-    this.currentSettings = view?.settings ?? null;
+    this.currentSettings = effectiveView?.settings ?? null;
 
     const root = document.createElement("div");
     root.className = "gg-drawer";
@@ -269,6 +408,7 @@ export class SettingsDrawerController {
     const refreshBtn = document.createElement("button");
     refreshBtn.type = "button";
     refreshBtn.className = "gg-btn-sm";
+    refreshBtn.dataset.ggFocusKey = "refresh";
     refreshBtn.textContent = "Refresh";
     refreshBtn.addEventListener("click", () => {
       this.flushPendingSaves();
@@ -280,19 +420,20 @@ export class SettingsDrawerController {
 
     this.syncNoticeElement();
 
-    if (!view) {
+    if (!effectiveView) {
       const loading = document.createElement("p");
       loading.className = "gg-muted";
       loading.textContent = "Loading Guided Generations settings…";
       root.append(loading);
+      this.restoreCapturedFocus(root);
       return;
     }
 
     const missingPerms: string[] = [];
-    if (!view.permissions.generation) missingPerms.push("generation");
-    if (!view.permissions.chats) missingPerms.push("chats");
-    if (!view.permissions.chat_mutation) missingPerms.push("chat_mutation");
-    if (!view.permissions.presets) missingPerms.push("presets");
+    if (!effectiveView.permissions.generation) missingPerms.push("generation");
+    if (!effectiveView.permissions.chats) missingPerms.push("chats");
+    if (!effectiveView.permissions.chat_mutation) missingPerms.push("chat_mutation");
+    if (!effectiveView.permissions.presets) missingPerms.push("presets");
 
     if (missingPerms.length > 0) {
       const warn = document.createElement("div");
@@ -305,13 +446,13 @@ export class SettingsDrawerController {
 
     const missingFeaturePerms: string[] = [];
     const degradedNotes: string[] = [];
-    if (view.permissions.interceptor === false) {
+    if (effectiveView.permissions.interceptor === false) {
       missingFeaturePerms.push("interceptor");
       degradedNotes.push(
         "preset-aware guidance placement (pre-history, in-history, before/after post-history) and swipe turn matching fall back to basic heuristic placement",
       );
     }
-    if (view.permissions.regex_scripts === false) {
+    if (effectiveView.permissions.regex_scripts === false) {
       missingFeaturePerms.push("regex_scripts");
       degradedNotes.push(
         "Lumiverse regex scripts are skipped on guidance prompts and generated/impersonated outputs",
@@ -327,42 +468,46 @@ export class SettingsDrawerController {
       root.append(featureWarn);
     }
 
-    if (view.catalogWarnings && view.catalogWarnings.length > 0) {
+    if (effectiveView.catalogWarnings && effectiveView.catalogWarnings.length > 0) {
       const catalogWarn = document.createElement("div");
       catalogWarn.className = "gg-notice is-warn";
       catalogWarn.setAttribute("role", "alert");
       catalogWarn.setAttribute("aria-live", "assertive");
-      catalogWarn.textContent = view.catalogWarnings.join(" ");
+      catalogWarn.textContent = effectiveView.catalogWarnings.join(" ");
       root.append(catalogWarn);
     }
 
-    const connectionOptions = buildConnectionOptions(view.connections);
-    const presetOptions = buildPresetOptions(view.presets);
+    const connectionOptions = buildConnectionOptions(effectiveView.connections);
+    const presetOptions = buildPresetOptions(effectiveView.presets);
     const roleOptions: SpindleSelectOption[] = [
       { value: "system", label: "System" },
       { value: "user", label: "User" },
       { value: "assistant", label: "Assistant" },
     ];
 
-    this.renderToolbarLayoutSection(root, view.settings);
+    this.renderToolbarLayoutSection(root, effectiveView.settings);
 
     for (const actionId of GUIDED_ACTION_ORDER) {
       this.renderActionSection(
         root,
-        view.settings,
+        effectiveView.settings,
         actionId,
-        view.connections,
+        effectiveView.connections,
         connectionOptions,
         presetOptions,
         roleOptions,
       );
     }
 
-    this.renderRecoverySection(root, view.settings, view.recovery);
+    this.renderRecoverySection(root, effectiveView.settings, effectiveView.recovery);
+    this.restoreCapturedFocus(root);
+  }
 
+  private restoreCapturedFocus(root: HTMLElement): void {
     if (this.pendingFocusRestore) {
       const restore = this.pendingFocusRestore;
       this.pendingFocusRestore = null;
+      this.pendingGeneralFocusRestore = null;
       const targetRow = root.querySelector<HTMLElement>(
         `[data-gg-order-id="${restore.optionId}"]`,
       );
@@ -379,6 +524,27 @@ export class SettingsDrawerController {
             ? fallback
             : null;
       targetBtn?.focus();
+      return;
+    }
+
+    if (this.pendingGeneralFocusRestore) {
+      const restore = this.pendingGeneralFocusRestore;
+      this.pendingGeneralFocusRestore = null;
+      let target: HTMLElement | null = null;
+      if (restore.focusKey) {
+        target = findElementByAttribute(root, "data-gg-focus-key", restore.focusKey);
+      }
+      if (!target && restore.ariaLabel) {
+        target = findElementByAttribute(
+          root,
+          "aria-label",
+          restore.ariaLabel,
+          restore.tagName,
+        );
+      }
+      if (target && !(target as HTMLButtonElement).disabled) {
+        target.focus();
+      }
     }
   }
 
@@ -401,6 +567,7 @@ export class SettingsDrawerController {
     const headerBtn = document.createElement("button");
     headerBtn.type = "button";
     headerBtn.className = "gg-card-header";
+    headerBtn.dataset.ggFocusKey = `card-header:${sectionId}`;
     headerBtn.setAttribute(
       "aria-expanded",
       String(this.expandedSections.has(sectionId)),
@@ -616,6 +783,7 @@ export class SettingsDrawerController {
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
     resetBtn.className = "gg-btn-sm";
+    resetBtn.dataset.ggFocusKey = "reset-layout";
     resetBtn.textContent = "Reset layout";
     resetBtn.addEventListener("click", () => {
       this.flushPendingSaves();
@@ -784,13 +952,7 @@ export class SettingsDrawerController {
           });
         },
       });
-      const comboboxInput = modelField.slot.querySelector("input");
-      if (comboboxInput) {
-        if (!comboboxInput.id) comboboxInput.id = modelFieldId;
-        if (!comboboxInput.getAttribute("aria-label")) {
-          comboboxInput.setAttribute("aria-label", `${meta.label} Model`);
-        }
-      }
+      this.attachSlotInputAttributes(modelField.slot, modelFieldId, `${meta.label} Model`);
       this.handles.push(modelHandle);
     }
 
@@ -912,13 +1074,20 @@ export class SettingsDrawerController {
     };
 
     let currentValue = clamp(options.initialValue);
+    let hasEmptyDraft = false;
     let syncingUi = false;
     let handle: SpindleNumericInputHandle | null = null;
     let fallbackInput: HTMLInputElement | null = null;
 
     const commitInput = (rawNumber: number | null) => {
       if (syncingUi) return;
-      const normalized = clamp(rawNumber === null ? options.defaultValue : rawNumber);
+      if (rawNumber === null) {
+        hasEmptyDraft = true;
+        this.cancelPendingSaveKey(options.debounceKey);
+        return;
+      }
+      hasEmptyDraft = false;
+      const normalized = clamp(rawNumber);
       currentValue = normalized;
       this.scheduleDebouncedSave(options.debounceKey, () => {
         options.onCommit(normalized);
@@ -938,15 +1107,22 @@ export class SettingsDrawerController {
         ariaLabel: options.ariaLabel,
         onChange: commitInput,
       });
-      const mountedInput = options.slot.querySelector("input");
-      if (mountedInput) {
-        if (!mountedInput.id) mountedInput.id = options.fieldId;
-        if (!mountedInput.getAttribute("aria-label")) {
-          mountedInput.setAttribute("aria-label", options.ariaLabel);
+      this.attachSlotInputAttributes(options.slot, options.fieldId, options.ariaLabel);
+      options.slot.addEventListener("focusout", (event) => {
+        const nextTarget = (event as FocusEvent).relatedTarget as Node | null;
+        if (nextTarget && options.slot.contains(nextTarget)) {
+          return;
         }
-      }
-      options.slot.addEventListener("focusout", () => {
-        this.flushPendingSaveKey(options.debounceKey);
+        if (hasEmptyDraft || handle?.getValue() === null) {
+          hasEmptyDraft = false;
+          const fallbackVal = clamp(options.defaultValue);
+          if (fallbackVal !== currentValue) {
+            currentValue = fallbackVal;
+            options.onCommit(fallbackVal);
+          }
+        } else {
+          this.flushPendingSaveKey(options.debounceKey);
+        }
         if (handle && handle.getValue() !== currentValue) {
           syncingUi = true;
           try {
@@ -975,7 +1151,16 @@ export class SettingsDrawerController {
         commitInput(parsed !== null && Number.isFinite(parsed) ? parsed : null);
       });
       input.addEventListener("blur", () => {
-        this.flushPendingSaveKey(options.debounceKey);
+        if (hasEmptyDraft || input.value.trim() === "") {
+          hasEmptyDraft = false;
+          const fallbackVal = clamp(options.defaultValue);
+          if (fallbackVal !== currentValue) {
+            currentValue = fallbackVal;
+            options.onCommit(fallbackVal);
+          }
+        } else {
+          this.flushPendingSaveKey(options.debounceKey);
+        }
         input.value = String(currentValue);
       });
       fallbackInput = input;
@@ -1100,8 +1285,9 @@ export class SettingsDrawerController {
     const clearBtn = document.createElement("button");
     clearBtn.type = "button";
     clearBtn.className = "gg-btn-sm";
+    clearBtn.dataset.ggFocusKey = "clear-recovery";
     clearBtn.textContent = "Clear History";
-    clearBtn.disabled = recovery.length === 0;
+    clearBtn.disabled = this.recoveryBusy || recovery.length === 0;
     clearBtn.addEventListener("click", () => {
       void this.handlers.onClearRecovery();
     });
@@ -1157,6 +1343,7 @@ export class SettingsDrawerController {
       restoreBtn.type = "button";
       restoreBtn.className = "gg-btn-sm";
       restoreBtn.textContent = "Restore";
+      restoreBtn.disabled = this.recoveryBusy;
       restoreBtn.setAttribute(
         "aria-label",
         `Restore ${actionLabel} draft: ${formatRecoverySnippet(entry.text, 40)}`,
@@ -1171,6 +1358,34 @@ export class SettingsDrawerController {
     this.recoveryUi.body.append(list);
   }
 
+  private attachSlotInputAttributes(
+    slot: HTMLElement,
+    fieldId: string,
+    ariaLabel: string,
+  ): void {
+    const apply = (): boolean => {
+      const input = slot.querySelector("input");
+      if (!input) return false;
+      if (!input.id) input.id = fieldId;
+      if (!input.getAttribute("aria-label")) {
+        input.setAttribute("aria-label", ariaLabel);
+      }
+      return true;
+    };
+
+    if (apply() || typeof MutationObserver !== "function") return;
+
+    const observer = new MutationObserver(() => {
+      if (apply()) {
+        observer.disconnect();
+      }
+    });
+    observer.observe(slot, { childList: true, subtree: true });
+    this.handles.push({
+      destroy: () => observer.disconnect(),
+    });
+  }
+
   private scheduleDebouncedSave(key: string, fn: () => void, delayMs = 250): void {
     const prev = this.debounceTimers.get(key);
     if (prev) clearTimeout(prev.timer);
@@ -1181,13 +1396,7 @@ export class SettingsDrawerController {
     const timer = setTimeout(() => {
       this.debounceTimers.delete(key);
       flush();
-      if (this.pendingView && !this.isEditingDrawerInput()) {
-        const next: ExtensionBootstrapView = this.currentSettings
-          ? { ...this.pendingView, settings: this.currentSettings }
-          : this.pendingView;
-        this.pendingView = null;
-        this.render(next, { force: true });
-      }
+      this.flushPendingViewIfIdle();
     }, delayMs);
     this.debounceTimers.set(key, { timer, flush });
   }
@@ -1211,6 +1420,13 @@ export class SettingsDrawerController {
     entry.flush();
   }
 
+  private cancelPendingSaveKey(key: string): void {
+    const entry = this.debounceTimers.get(key);
+    if (!entry) return;
+    this.debounceTimers.delete(key);
+    clearTimeout(entry.timer);
+  }
+
   private cancelPendingSaves(): void {
     for (const entry of this.debounceTimers.values()) {
       clearTimeout(entry.timer);
@@ -1230,11 +1446,28 @@ export class SettingsDrawerController {
     this.destroyed = true;
     this.pendingView = null;
     this.pendingFocusRestore = null;
+    this.pendingGeneralFocusRestore = null;
+    this.pointerActiveInDrawer = false;
+    if (this.pointerFallbackTimer !== null) {
+      clearTimeout(this.pointerFallbackTimer);
+      this.pointerFallbackTimer = null;
+    }
+    if (this.pendingViewFlushTimer !== null) {
+      clearTimeout(this.pendingViewFlushTimer);
+      this.pendingViewFlushTimer = null;
+    }
+    if (this.pointerReleaseCleanup) {
+      const cleanup = this.pointerReleaseCleanup;
+      this.pointerReleaseCleanup = null;
+      cleanup();
+    }
     this.rootEl = null;
     this.headerEl = null;
     this.noticeEl = null;
     this.recoveryUi = null;
     this.orderStateTags.clear();
+    this.tab.root.removeEventListener("pointerdown", this.onPointerDownInDrawer);
+    this.tab.root.removeEventListener("mousedown", this.onPointerDownInDrawer);
     this.tab.root.removeEventListener("focusout", this.onFocusOut);
     this.cancelPendingSaves();
     this.clearComponentHandles();
@@ -1255,6 +1488,30 @@ function isEditableElement(el: Element): boolean {
     tag === "SELECT" ||
     (el as HTMLElement).isContentEditable
   );
+}
+
+function isClickableInside(root: Element, node: Node | null): boolean {
+  if (!isElementNode(node) || !root.contains(node)) return false;
+  return Boolean(
+    node.closest(
+      'button, [role="button"], [role="switch"], [role="menuitem"], [role="option"], summary, a[href]',
+    ),
+  );
+}
+
+function findElementByAttribute(
+  root: HTMLElement,
+  attrName: string,
+  attrValue: string,
+  tagName?: string,
+): HTMLElement | null {
+  const selector = tagName ? tagName.toLowerCase() : "*";
+  for (const el of root.querySelectorAll<HTMLElement>(selector)) {
+    if (el.getAttribute(attrName) === attrValue) {
+      return el;
+    }
+  }
+  return null;
 }
 
 function getActiveConnectionId(ctx: SpindleFrontendContext): string | null {

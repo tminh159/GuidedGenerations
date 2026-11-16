@@ -11,6 +11,7 @@ import type {
   RpcActionName,
   RunActionInput,
 } from "./shared/types";
+import { ChatHeadController } from "./frontend/chat-head";
 import { InputToolbarController } from "./frontend/input-toolbar";
 import { PillMetricsController } from "./frontend/pill-metrics";
 import { pickRecoveryEntry } from "./frontend/recovery-store";
@@ -50,6 +51,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function areJsonValuesEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== typeof b || a === null || b === null) return false;
+  if (typeof a !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0; i < a.length; i += 1) {
+      if (!areJsonValuesEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const recA = a as Record<string, unknown>;
+  const recB = b as Record<string, unknown>;
+  const keysA = Object.keys(recA);
+  const keysB = Object.keys(recB);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(recB, key)) return false;
+    if (!areJsonValuesEqual(recA[key], recB[key])) return false;
+  }
+  return true;
+}
+
 function extractChatIdFromPayload(rawPayload: unknown): string | null {
   if (!isRecord(rawPayload)) return null;
   if (typeof rawPayload.chatId === "string" && rawPayload.chatId) {
@@ -61,24 +87,44 @@ function extractChatIdFromPayload(rawPayload: unknown): string | null {
   return null;
 }
 
-function withFrontendConnectionFallback(
+function extractDeletedChatIdFromPayload(rawPayload: unknown): string | null {
+  const fromChat = extractChatIdFromPayload(rawPayload);
+  if (fromChat) return fromChat;
+  if (isRecord(rawPayload) && typeof rawPayload.id === "string" && rawPayload.id) {
+    return rawPayload.id;
+  }
+  return null;
+}
+
+function mapConnectionProfiles(
+  next: ExtensionBootstrapView,
+  profiles: unknown,
+): ExtensionBootstrapView {
+  if (!Array.isArray(profiles) || profiles.length === 0) return next;
+  return {
+    ...next,
+    connections: profiles.map((c) => ({
+      id: c.id,
+      name: c.name,
+      provider: c.provider ?? "",
+      model: c.model ?? "",
+      isDefault: Boolean((c as { is_default?: unknown }).is_default),
+    })),
+  };
+}
+
+async function withFrontendConnectionFallback(
   next: ExtensionBootstrapView,
   ctx: FrontendContextWithHostExtensions,
-): ExtensionBootstrapView {
+): Promise<ExtensionBootstrapView> {
   if (next.connections.length > 0 || !ctx.connections?.list) return next;
   try {
-    const profiles = ctx.connections.list();
-    if (!Array.isArray(profiles) || profiles.length === 0) return next;
-    return {
-      ...next,
-      connections: profiles.map((c) => ({
-        id: c.id,
-        name: c.name,
-        provider: c.provider ?? "",
-        model: c.model ?? "",
-        isDefault: Boolean((c as { is_default?: unknown }).is_default),
-      })),
-    };
+    const raw = ctx.connections.list() as unknown;
+    if (raw && typeof (raw as PromiseLike<unknown>).then === "function") {
+      const profiles = await raw;
+      return mapConnectionProfiles(next, profiles);
+    }
+    return mapConnectionProfiles(next, raw);
   } catch {
     return next;
   }
@@ -94,9 +140,18 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let bootstrapSeq = 0;
   let settingsRevision = 0;
   let statusSeq = 0;
-  let isLaunching = false;
+  let globalClearSeq = 0;
+  let isPreChatLaunching = false;
+  const launchingChats = new Set<string>();
   let view: ExtensionBootstrapView | null = null;
   let activeRun: ActiveRunState | null = null;
+  const activeRunsByChat = new Map<string, ActiveRunState>();
+  const chatStatusSeq = new Map<string, number>();
+  const pendingImpersonateDrafts = new Map<string, string>();
+  const IMPERSONATE_DRAFT_RETRY_DELAYS_MS = [0, 20, 50, 100, 200] as const;
+  let impersonateDraftRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let impersonateDraftRetryChatId: string | null = null;
+  let impersonateDraftRetryAttempt = 0;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let composerAlertMount: Element | null = null;
 
@@ -104,6 +159,100 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     composerAlertMount = ctx.ui.mount("chat_composer_above");
   } catch {
     composerAlertMount = null;
+  }
+
+  function getActiveRunForChat(
+    chatId: string | null | undefined,
+  ): ActiveRunState | null {
+    if (!chatId) return null;
+    return (
+      activeRunsByChat.get(chatId) ??
+      (activeRun?.chatId === chatId ? activeRun : null)
+    );
+  }
+
+  function isChatBusy(chatId: string | null | undefined): boolean {
+    if (!chatId) return false;
+    return Boolean(getActiveRunForChat(chatId)) || launchingChats.has(chatId);
+  }
+
+  function syncPrimaryActiveRun(): void {
+    const currentChatId = ctx.getActiveChat().chatId;
+    if (currentChatId && activeRunsByChat.has(currentChatId)) {
+      activeRun = activeRunsByChat.get(currentChatId)!;
+      return;
+    }
+    let latest: ActiveRunState | null = null;
+    for (const run of activeRunsByChat.values()) {
+      if (!latest || run.startedAt >= latest.startedAt) {
+        latest = run;
+      }
+    }
+    activeRun = latest;
+  }
+
+  function clearImpersonateDraftRetry(): void {
+    if (impersonateDraftRetryTimer !== undefined) {
+      clearTimeout(impersonateDraftRetryTimer);
+      impersonateDraftRetryTimer = undefined;
+    }
+    impersonateDraftRetryChatId = null;
+    impersonateDraftRetryAttempt = 0;
+  }
+
+  function scheduleImpersonateDraftRetry(chatId: string): void {
+    if (destroyed) return;
+    if (impersonateDraftRetryChatId !== chatId) {
+      clearImpersonateDraftRetry();
+      impersonateDraftRetryChatId = chatId;
+      impersonateDraftRetryAttempt = 0;
+    }
+    if (impersonateDraftRetryTimer !== undefined) return;
+    const delayMs = IMPERSONATE_DRAFT_RETRY_DELAYS_MS[impersonateDraftRetryAttempt];
+    if (delayMs === undefined) return;
+    impersonateDraftRetryAttempt += 1;
+    impersonateDraftRetryTimer = setTimeout(() => {
+      impersonateDraftRetryTimer = undefined;
+      if (destroyed) return;
+      applyPendingImpersonateDraft(chatId, { fromRetry: true });
+    }, delayMs);
+  }
+
+  function applyPendingImpersonateDraft(
+    chatId: string | null | undefined,
+    options: { fromRetry?: boolean } = {},
+  ): void {
+    if (destroyed || !chatId) return;
+    const draft = pendingImpersonateDrafts.get(chatId);
+    if (draft === undefined) {
+      if (impersonateDraftRetryChatId === chatId) {
+        clearImpersonateDraftRetry();
+      }
+      return;
+    }
+    const state = safeGetComposerState();
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (activeChatId !== chatId) {
+      if (impersonateDraftRetryChatId === chatId) {
+        clearImpersonateDraftRetry();
+      }
+      return;
+    }
+    if (!isComposerAvailable(state) || state.chatId !== chatId) {
+      if (!options.fromRetry) {
+        clearImpersonateDraftRetry();
+      }
+      scheduleImpersonateDraftRetry(chatId);
+      return;
+    }
+    clearImpersonateDraftRetry();
+    if (state.text.trim().length > 0) {
+      return;
+    }
+    if (safeSetComposerText(draft)) {
+      pendingImpersonateDrafts.delete(chatId);
+      safeFocusComposer();
+    }
   }
 
   function safeGetComposerState(): HostComposerState | null {
@@ -235,15 +384,22 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     composerAlertMount?.replaceChildren();
   }
 
+  function syncRecoveryBusy(): void {
+    if (destroyed) return;
+    const { chatId } = ctx.getActiveChat();
+    drawer.setRecoveryBusy(isChatBusy(chatId));
+  }
+
   function renderToolbar(): void {
     if (destroyed || !view) return;
     const { chatId } = ctx.getActiveChat();
     toolbar.render({
       settings: view.settings,
-      activeRun,
+      activeRun: getActiveRunForChat(chatId),
       recovery: view.recovery,
       hasActiveChat: Boolean(chatId),
     });
+    syncRecoveryBusy();
   }
 
   async function refresh(options: { onlyIfChanged?: boolean } = {}): Promise<void> {
@@ -254,14 +410,61 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     try {
       const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap");
       if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
-      const next = withFrontendConnectionFallback(rawNext, ctx);
+      const next = await withFrontendConnectionFallback(rawNext, ctx);
+      if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
 
       const resolvedSettings =
         view && settingsRevision !== startSettingsRevision
           ? view.settings
           : next.settings;
-      const resolvedActiveRun =
-        statusSeq !== startStatusSeq ? activeRun : next.activeRun;
+
+      const bootstrapRunsByChat = new Map<string, ActiveRunState>();
+      const bootstrapRuns = (
+        next as ExtensionBootstrapView & { activeRuns?: ActiveRunState[] }
+      ).activeRuns;
+      if (Array.isArray(bootstrapRuns)) {
+        for (const r of bootstrapRuns) {
+          if (r && typeof r.chatId === "string" && r.chatId.length > 0) {
+            bootstrapRunsByChat.set(r.chatId, r);
+          }
+        }
+      }
+      if (
+        next.activeRun &&
+        typeof next.activeRun.chatId === "string" &&
+        next.activeRun.chatId.length > 0
+      ) {
+        bootstrapRunsByChat.set(next.activeRun.chatId, next.activeRun);
+      }
+
+      if (statusSeq === startStatusSeq) {
+        activeRunsByChat.clear();
+        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+          activeRunsByChat.set(chatId, run);
+        }
+      } else if (globalClearSeq <= startStatusSeq) {
+        for (const chatId of [...activeRunsByChat.keys()]) {
+          if ((chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq) {
+            const refreshedRun = bootstrapRunsByChat.get(chatId);
+            if (refreshedRun) {
+              activeRunsByChat.set(chatId, refreshedRun);
+            } else {
+              activeRunsByChat.delete(chatId);
+            }
+          }
+        }
+        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+          if (
+            !activeRunsByChat.has(chatId) &&
+            (chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq
+          ) {
+            activeRunsByChat.set(chatId, run);
+          }
+        }
+      }
+
+      syncPrimaryActiveRun();
+      const resolvedActiveRun = activeRun;
 
       const mergedNext: ExtensionBootstrapView = {
         ...next,
@@ -294,7 +497,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
       view = mergedNext;
       activeRun = resolvedActiveRun;
-      indicator.sync(activeRun);
+      const currentChatId = ctx.getActiveChat().chatId;
+      indicator.sync(getActiveRunForChat(currentChatId));
+      chatHeads.syncRuns(activeRunsByChat.values(), currentChatId);
       if (!coreUnchanged) {
         drawer.render(view);
       } else if (!recoveryUnchanged) {
@@ -312,17 +517,44 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     actionId: GuidedActionId,
     options?: { backgroundSwipe?: boolean },
   ): Promise<void> {
-    if (destroyed || activeRun || isLaunching) return;
-    isLaunching = true;
+    if (destroyed || isPreChatLaunching) return;
+    const preChatId = ctx.getActiveChat().chatId;
+    if (
+      preChatId &&
+      (getActiveRunForChat(preChatId) || launchingChats.has(preChatId))
+    ) {
+      return;
+    }
+
+    isPreChatLaunching = true;
+    let lockedChatId: string | null = preChatId;
+    if (lockedChatId) {
+      launchingChats.add(lockedChatId);
+      syncRecoveryBusy();
+    }
+
     try {
       if (!view) await refresh();
-      if (destroyed || !view || activeRun) return;
+      isPreChatLaunching = false;
+      if (destroyed || !view) return;
 
       const { chatId } = ctx.getActiveChat();
       if (!chatId) {
         showBanner("Open a chat before triggering a guided action.", "warn");
         return;
       }
+
+      if (lockedChatId !== chatId) {
+        if (lockedChatId) {
+          launchingChats.delete(lockedChatId);
+        }
+        if (launchingChats.has(chatId)) return;
+        lockedChatId = chatId;
+        launchingChats.add(lockedChatId);
+        syncRecoveryBusy();
+      }
+
+      if (getActiveRunForChat(chatId)) return;
 
       const state = safeGetComposerState();
       if (!isComposerAvailable(state)) {
@@ -350,6 +582,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       }
 
       clearBanner();
+      pendingImpersonateDrafts.delete(chatId);
 
       const shouldClear =
         Boolean(inputText.trim()) &&
@@ -376,9 +609,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         if (destroyed) return;
       } catch (error) {
         if (destroyed) return;
-        // Restore cleared input only when no backend run is still active,
+        // Restore cleared input only when no backend run is still active for this chat,
         // the same chat & composer are still mounted, and the user hasn't typed.
-        if (shouldClear && !activeRun) {
+        if (shouldClear && !getActiveRunForChat(chatId)) {
           const currentComposer = safeGetComposerState();
           const activeChatId = ctx.getActiveChat().chatId;
           if (
@@ -394,18 +627,34 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         showBanner(msg, "error", 7_000);
       }
     } finally {
-      isLaunching = false;
+      isPreChatLaunching = false;
+      if (lockedChatId) {
+        launchingChats.delete(lockedChatId);
+      }
+      syncRecoveryBusy();
     }
   }
 
   function restoreRecoveryEntry(entry: RecoveryEntry): void {
-    if (destroyed) return;
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed || !view) return;
+    if (isChatBusy(activeChatId)) {
+      showBanner(
+        "Wait for the active guided generation to finish before restoring input.",
+        "warn",
+      );
+      return;
+    }
     const state = safeGetComposerState();
     if (!isComposerAvailable(state)) {
       showBanner(
         "Composer is unavailable right now — cannot restore input.",
         "warn",
       );
+      return;
+    }
+    if (state.chatId !== null && state.chatId !== activeChatId) {
+      showBanner("Active chat changed; please try again.", "warn");
       return;
     }
     if (!safeSetComposerText(entry.text)) {
@@ -420,7 +669,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   }
 
   function clearCurrentInput(): void {
-    if (destroyed || !view || activeRun) return;
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed || !view || isChatBusy(activeChatId)) {
+      return;
+    }
     if (!view.settings.inputRecovery.enabled) return;
 
     const state = safeGetComposerState();
@@ -429,6 +681,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         "Composer is unavailable right now — cannot clear input.",
         "warn",
       );
+      return;
+    }
+    if (state.chatId !== null && state.chatId !== activeChatId) {
+      showBanner("Active chat changed; please try again.", "warn");
       return;
     }
 
@@ -451,14 +707,17 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   }
 
   async function removeLastContinue(): Promise<void> {
-    if (destroyed || activeRun || isLaunching) return;
-    isLaunching = true;
+    if (destroyed || isPreChatLaunching) return;
+    const { chatId } = ctx.getActiveChat();
+    if (!chatId) {
+      showBanner("Open a chat before removing the last continue.", "warn");
+      return;
+    }
+    if (isChatBusy(chatId)) return;
+    launchingChats.add(chatId);
+    syncRecoveryBusy();
+    pendingImpersonateDrafts.delete(chatId);
     try {
-      const { chatId } = ctx.getActiveChat();
-      if (!chatId) {
-        showBanner("Open a chat before removing the last continue.", "warn");
-        return;
-      }
       clearBanner();
       await rpc<RemoveContinueResult>("remove_last_continue", { chatId });
     } catch (error) {
@@ -466,19 +725,23 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       const msg = error instanceof Error ? error.message : String(error);
       showBanner(msg, "warn", 7_000);
     } finally {
-      isLaunching = false;
+      launchingChats.delete(chatId);
+      syncRecoveryBusy();
     }
   }
 
   async function regenerateLastContinue(): Promise<void> {
-    if (destroyed || activeRun || isLaunching) return;
-    isLaunching = true;
+    if (destroyed || isPreChatLaunching) return;
+    const { chatId } = ctx.getActiveChat();
+    if (!chatId) {
+      showBanner("Open a chat before regenerating the last continue.", "warn");
+      return;
+    }
+    if (isChatBusy(chatId)) return;
+    launchingChats.add(chatId);
+    syncRecoveryBusy();
+    pendingImpersonateDrafts.delete(chatId);
     try {
-      const { chatId } = ctx.getActiveChat();
-      if (!chatId) {
-        showBanner("Open a chat before regenerating the last continue.", "warn");
-        return;
-      }
       clearBanner();
       const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
       const payload: RegenerateContinueInput = {
@@ -491,11 +754,40 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       const msg = error instanceof Error ? error.message : String(error);
       showBanner(msg, "error", 7_000);
     } finally {
-      isLaunching = false;
+      launchingChats.delete(chatId);
+      syncRecoveryBusy();
+    }
+  }
+
+  async function clearRecoveryHistory(): Promise<void> {
+    const activeChatId = ctx.getActiveChat().chatId;
+    if (destroyed) return;
+    if (isChatBusy(activeChatId)) {
+      showBanner(
+        "Wait for the active guided generation to finish before clearing input recovery history.",
+        "warn",
+      );
+      return;
+    }
+    try {
+      const recovery = await rpc<RecoveryEntry[]>("clear_recovery");
+      if (destroyed) return;
+      if (view) {
+        view = { ...view, recovery };
+        renderToolbar();
+        drawer.updateRecovery(view.recovery, view.settings);
+      }
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        error instanceof Error ? error.message : String(error),
+        "error",
+      );
     }
   }
 
   const indicator = new StreamingIndicatorController(ctx);
+  const chatHeads = new ChatHeadController(ctx);
   const pillMetrics = new PillMetricsController(ctx);
 
   const toolbar = new InputToolbarController(ctx, {
@@ -507,13 +799,22 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       void rpc("abort_action", { runId }).catch(() => undefined);
     },
     onRestoreLatest: () => {
-      if (destroyed || !view || activeRun) return;
+      const activeChatId = ctx.getActiveChat().chatId;
+      if (destroyed || !view || isChatBusy(activeChatId)) {
+        return;
+      }
       const latest = pickRecoveryEntry(view.recovery);
       if (latest) {
         restoreRecoveryEntry(latest);
       } else {
         clearCurrentInput();
       }
+    },
+    onRestoreEntry: (entry) => {
+      restoreRecoveryEntry(entry);
+    },
+    onClearRecovery: () => {
+      void clearRecoveryHistory();
     },
     onRemoveLastContinue: () => {
       void removeLastContinue();
@@ -541,9 +842,12 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           nextSettings,
         );
         if (destroyed || !view || rev !== settingsRevision) return;
+        const settingsUnchanged = areJsonValuesEqual(saved, view.settings);
         view = { ...view, settings: saved };
-        renderToolbar();
-        if (options?.rebuildDrawer) drawer.render(view, { force: true });
+        if (!settingsUnchanged) {
+          renderToolbar();
+          if (options?.rebuildDrawer) drawer.render(view);
+        }
       } catch (error) {
         if (destroyed) return;
         showBanner(
@@ -556,25 +860,22 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       }
     },
     onRestoreEntry: (entry) => restoreRecoveryEntry(entry),
-    onClearRecovery: async () => {
-      if (destroyed) return;
-      try {
-        const recovery = await rpc<RecoveryEntry[]>("clear_recovery");
-        if (destroyed) return;
-        if (view) {
-          view = { ...view, recovery };
-          renderToolbar();
-          drawer.updateRecovery(view.recovery, view.settings);
-        }
-      } catch (error) {
-        if (destroyed) return;
-        showBanner(
-          error instanceof Error ? error.message : String(error),
-          "error",
-        );
-      }
-    },
+    onClearRecovery: () => clearRecoveryHistory(),
   });
+
+  function handleActiveChatChanged(metricsChatId?: string | null): void {
+    if (destroyed) return;
+    const activeChatId = ctx.getActiveChat().chatId;
+    clearImpersonateDraftRetry();
+    syncPrimaryActiveRun();
+    indicator.sync(getActiveRunForChat(activeChatId));
+    chatHeads.onChatChanged(activeChatId);
+    renderToolbar();
+    applyPendingImpersonateDraft(activeChatId);
+    pillMetrics.onChatChanged(
+      metricsChatId !== undefined ? metricsChatId : activeChatId,
+    );
+  }
 
   disposers.push(
     drawer.onActivate(() => {
@@ -604,9 +905,85 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       switch (event.type) {
         case "gg:status": {
           statusSeq += 1;
-          activeRun = event.run ?? null;
-          if (view) view = { ...view, activeRun };
-          indicator.sync(activeRun);
+          const eventChatId =
+            typeof event.chatId === "string" && event.chatId.length > 0
+              ? event.chatId
+              : undefined;
+          const hasTerminalSignal =
+            Boolean(event.done) || Boolean(event.aborted) || Boolean(event.error);
+          const prevEventChatRun = eventChatId
+            ? activeRunsByChat.get(eventChatId)
+            : undefined;
+          const prevRunChatRun = event.run
+            ? activeRunsByChat.get(event.run.chatId)
+            : undefined;
+
+          if (event.run) {
+            if (
+              eventChatId &&
+              event.run.chatId !== eventChatId &&
+              hasTerminalSignal
+            ) {
+              activeRunsByChat.delete(eventChatId);
+              chatStatusSeq.set(eventChatId, statusSeq);
+              if (
+                (prevEventChatRun !== undefined &&
+                  prevEventChatRun.actionId !== "guided_impersonate") ||
+                event.aborted ||
+                event.error
+              ) {
+                pendingImpersonateDrafts.delete(eventChatId);
+              }
+            }
+            if (
+              !hasTerminalSignal ||
+              (eventChatId !== undefined && event.run.chatId !== eventChatId)
+            ) {
+              if (prevRunChatRun?.runId !== event.run.runId) {
+                pendingImpersonateDrafts.delete(event.run.chatId);
+              }
+              activeRunsByChat.set(event.run.chatId, event.run);
+              chatStatusSeq.set(event.run.chatId, statusSeq);
+            } else {
+              activeRunsByChat.delete(event.run.chatId);
+              chatStatusSeq.set(event.run.chatId, statusSeq);
+              if (
+                event.run.actionId !== "guided_impersonate" ||
+                event.aborted ||
+                event.error
+              ) {
+                pendingImpersonateDrafts.delete(event.run.chatId);
+              }
+            }
+          } else if (eventChatId) {
+            activeRunsByChat.delete(eventChatId);
+            chatStatusSeq.set(eventChatId, statusSeq);
+            if (
+              (prevEventChatRun !== undefined &&
+                prevEventChatRun.actionId !== "guided_impersonate") ||
+              event.aborted ||
+              event.error
+            ) {
+              pendingImpersonateDrafts.delete(eventChatId);
+            }
+          } else {
+            activeRunsByChat.clear();
+            globalClearSeq = statusSeq;
+            if (hasTerminalSignal) {
+              pendingImpersonateDrafts.clear();
+            }
+          }
+
+          syncPrimaryActiveRun();
+          if (view) {
+            view = {
+              ...view,
+              activeRun,
+            };
+          }
+          const activeChatId = ctx.getActiveChat().chatId;
+          indicator.sync(getActiveRunForChat(activeChatId));
+          chatHeads.handleStatusEvent(event, activeChatId);
           renderToolbar();
           if (event.error) {
             showBanner(event.error, "error", 7_000);
@@ -617,19 +994,44 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           if (typeof event.text === "string") {
             const rawChatId = (event as { chatId?: unknown }).chatId;
             const chunkChatId = typeof rawChatId === "string" ? rawChatId : null;
-            const expectedChatId = chunkChatId ?? activeRun?.chatId ?? null;
+            const expectedChatId =
+              chunkChatId ??
+              (activeRunsByChat.size === 1
+                ? Array.from(activeRunsByChat.values())[0]!.chatId
+                : activeRun?.chatId ?? null);
             const state = safeGetComposerState();
             const activeChatId = ctx.getActiveChat().chatId;
+            if (expectedChatId !== null && expectedChatId !== activeChatId) {
+              if (event.done && !event.aborted && event.text.length > 0) {
+                pendingImpersonateDrafts.set(expectedChatId, event.text);
+              }
+              return;
+            }
             if (
               !isComposerAvailable(state) ||
               !activeChatId ||
-              state.chatId !== activeChatId ||
-              (expectedChatId !== null && expectedChatId !== activeChatId)
+              state.chatId !== activeChatId
             ) {
+              if (
+                event.done &&
+                !event.aborted &&
+                event.text.length > 0 &&
+                expectedChatId
+              ) {
+                pendingImpersonateDrafts.set(expectedChatId, event.text);
+                if (expectedChatId === activeChatId) {
+                  applyPendingImpersonateDraft(activeChatId);
+                }
+              }
               return;
             }
-            if (safeSetComposerText(event.text) && event.done) {
-              safeFocusComposer();
+            if (safeSetComposerText(event.text)) {
+              pendingImpersonateDrafts.delete(activeChatId);
+              if (event.done) {
+                safeFocusComposer();
+              }
+            } else if (event.done && !event.aborted && event.text.length > 0) {
+              pendingImpersonateDrafts.set(activeChatId, event.text);
             }
           }
           return;
@@ -662,20 +1064,37 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   disposers.push(
     ctx.events.on("CHAT_SWITCHED", (payload) => {
-      if (destroyed) return;
-      renderToolbar();
-      pillMetrics.onChatChanged(
+      handleActiveChatChanged(
         extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
       );
     }),
   );
   disposers.push(
     ctx.events.on("CHAT_CHANGED", (payload) => {
-      if (destroyed) return;
-      renderToolbar();
-      pillMetrics.onChatChanged(
+      handleActiveChatChanged(
         extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
       );
+    }),
+  );
+  disposers.push(
+    ctx.events.on("CHAT_DELETED", (payload) => {
+      if (destroyed) return;
+      const deletedChatId = extractDeletedChatIdFromPayload(payload);
+      if (!deletedChatId) return;
+      statusSeq += 1;
+      chatStatusSeq.set(deletedChatId, statusSeq);
+      activeRunsByChat.delete(deletedChatId);
+      pendingImpersonateDrafts.delete(deletedChatId);
+      if (impersonateDraftRetryChatId === deletedChatId) {
+        clearImpersonateDraftRetry();
+      }
+      launchingChats.delete(deletedChatId);
+      syncPrimaryActiveRun();
+      const activeChatId = ctx.getActiveChat().chatId;
+      indicator.sync(getActiveRunForChat(activeChatId));
+      chatHeads.onChatDeleted(deletedChatId);
+      pillMetrics.onChatDeleted(deletedChatId);
+      renderToolbar();
     }),
   );
   disposers.push(
@@ -686,6 +1105,11 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   disposers.push(
     ctx.events.on("MESSAGE_EDITED", (payload) => {
       if (!destroyed) pillMetrics.onMessageEvent(payload);
+    }),
+  );
+  disposers.push(
+    ctx.events.on("MESSAGE_DELETED", (payload) => {
+      if (!destroyed) pillMetrics.onMessageDeleted(payload);
     }),
   );
 
@@ -702,10 +1126,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     if (ctx.state) {
       disposers.push(
         ctx.state.subscribe("chat.active", () => {
-          if (!destroyed) {
-            indicator.sync(activeRun);
-            renderToolbar();
-          }
+          handleActiveChatChanged();
         }),
       );
       stateSubscribed = true;
@@ -720,8 +1141,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       const nextChatId = ctx.getActiveChat().chatId;
       if (nextChatId !== lastChatId) {
         lastChatId = nextChatId;
-        indicator.sync(activeRun);
-        renderToolbar();
+        handleActiveChatChanged(nextChatId);
       }
     }, 600);
     disposers.push(() => clearInterval(poll));
@@ -731,23 +1151,54 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   void refresh();
 
   return () => {
-    drawer.flushPendingSaves();
+    try {
+      drawer.flushPendingSaves();
+    } catch {
+      // Ignore flush errors on teardown
+    }
     destroyed = true;
+    clearImpersonateDraftRetry();
     if (noticeTimer) {
       clearTimeout(noticeTimer);
       noticeTimer = undefined;
     }
-    for (const dispose of disposers) dispose();
+    for (const dispose of disposers) {
+      try {
+        dispose();
+      } catch {
+        // Ignore teardown disposer errors
+      }
+    }
+    disposers.length = 0;
     for (const waiter of pending.values()) {
       clearTimeout(waiter.timer);
       waiter.reject(new Error("Guided Generations unloaded."));
     }
     pending.clear();
-    pillMetrics.destroy();
-    indicator.destroy();
-    toolbar.destroy();
-    drawer.destroy();
-    composerAlertMount?.replaceChildren();
-    removeStyle();
+    launchingChats.clear();
+    activeRunsByChat.clear();
+    chatStatusSeq.clear();
+    pendingImpersonateDrafts.clear();
+    try {
+      pillMetrics.destroy();
+    } catch {}
+    try {
+      chatHeads.destroy();
+    } catch {}
+    try {
+      indicator.destroy();
+    } catch {}
+    try {
+      toolbar.destroy();
+    } catch {}
+    try {
+      drawer.destroy();
+    } catch {}
+    try {
+      composerAlertMount?.replaceChildren();
+    } catch {}
+    try {
+      removeStyle();
+    } catch {}
   };
 }

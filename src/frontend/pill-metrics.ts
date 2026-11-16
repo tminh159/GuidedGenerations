@@ -21,6 +21,8 @@ type GetMessagesFn = (
   options?: { limit?: number; tail?: boolean },
 ) => Promise<unknown>;
 
+type GetSingleMessageFn = (messageId: string) => Promise<unknown>;
+
 type UpdateMessageFn = (
   chatId: string,
   messageId: string,
@@ -40,6 +42,8 @@ interface PendingMetricsEntry {
 }
 
 const MESSAGE_READ_LIMIT = 50;
+const WIDER_MESSAGE_READ_LIMIT = 200;
+const RETRY_DELAYS_MS = [0, 50, 150] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -60,6 +64,14 @@ function extractMessageList(page: unknown): HostMessageShape[] {
     }
   }
   return result;
+}
+
+function isPageTruncated(page: unknown, messageCount: number, limit: number): boolean {
+  if (messageCount >= limit) return true;
+  if (isRecord(page) && typeof page.total === "number" && page.total > messageCount) {
+    return true;
+  }
+  return false;
 }
 
 function isPermanentError(error: unknown): boolean {
@@ -200,10 +212,14 @@ export class PillMetricsController {
           this.pending.delete(key);
           this.scheduledKeys.delete(key);
           this.clearRetryTimer(key);
-          entry.swipeId -= 1;
-          entry.latestFallback = null;
-          entry.key = this.makeKey(entry.chatId, entry.messageId, entry.swipeId);
-          shifted.push(entry);
+          const nextSwipeId = entry.swipeId - 1;
+          shifted.push({
+            ...entry,
+            swipeId: nextSwipeId,
+            latestFallback: null,
+            key: this.makeKey(entry.chatId, entry.messageId, nextSwipeId),
+            revision: ++this.nextRevision,
+          });
         }
       }
 
@@ -245,11 +261,55 @@ export class PillMetricsController {
     }
   }
 
+  onChatDeleted(chatId: string | null | undefined): void {
+    if (this.destroyed || !chatId || this.pending.size === 0) return;
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.chatId !== chatId) continue;
+      this.pending.delete(key);
+      this.scheduledKeys.delete(key);
+      this.clearRetryTimer(key);
+    }
+  }
+
+  onMessageDeleted(rawPayload: unknown): void {
+    if (this.destroyed || this.pending.size === 0) return;
+
+    const payload = isRecord(rawPayload) ? rawPayload : null;
+    const msg = payload && isRecord(payload.message) ? payload.message : null;
+    const messageId =
+      typeof msg?.id === "string"
+        ? msg.id
+        : typeof payload?.messageId === "string"
+          ? payload.messageId
+          : typeof payload?.id === "string"
+            ? payload.id
+            : null;
+    if (!messageId) return;
+
+    const chatId =
+      typeof payload?.chatId === "string"
+        ? payload.chatId
+        : typeof payload?.chat_id === "string"
+          ? payload.chat_id
+          : typeof msg?.chat_id === "string"
+            ? msg.chat_id
+            : null;
+
+    for (const [key, entry] of [...this.pending.entries()]) {
+      if (entry.messageId !== messageId) continue;
+      if (chatId && entry.chatId !== chatId) continue;
+      this.pending.delete(key);
+      this.scheduledKeys.delete(key);
+      this.clearRetryTimer(key);
+    }
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
     this.pending.clear();
     this.scheduledKeys.clear();
+    this.inFlightByMessage.clear();
     for (const timer of this.retryTimers.values()) {
       clearTimeout(timer);
     }
@@ -292,8 +352,10 @@ export class PillMetricsController {
     eventFallback: HostMessageShape | null,
   ): Promise<void> {
     if (this.destroyed) return;
-    const snapshot = this.pending.get(key);
-    if (!snapshot) return;
+    const current = this.pending.get(key);
+    if (!current) return;
+    // Snapshot by value so concurrent deletedSwipeId shifts cannot mutate fields in-flight.
+    const snapshot: PendingMetricsEntry = { ...current };
     const resolvedFallback = snapshot.latestFallback ?? eventFallback;
 
     const updateMessage = this.resolveUpdateMessage();
@@ -323,15 +385,56 @@ export class PillMetricsController {
       target = messages.find((m) => m.id === snapshot.messageId) ?? null;
 
       if (!target) {
-        if (
-          resolvedFallback &&
-          resolvedFallback.id === snapshot.messageId &&
-          messages.length >= MESSAGE_READ_LIMIT
-        ) {
-          target = resolvedFallback;
-        } else {
-          // Message was deleted or does not exist in chat — drop cleanly.
+        const truncated = isPageTruncated(page, messages.length, MESSAGE_READ_LIMIT);
+        if (!truncated) {
+          // Full tail/chat was returned and message is absent -> deleted cleanly.
           this.deleteIfSameRevision(key, snapshot.revision);
+          return;
+        }
+
+        const getSingleMessage = this.resolveGetSingleMessage();
+        if (getSingleMessage) {
+          try {
+            const single = await getSingleMessage(snapshot.messageId);
+            if (this.destroyed) return;
+            if (
+              isRecord(single) &&
+              typeof single.id === "string" &&
+              single.id === snapshot.messageId &&
+              (typeof single.chat_id !== "string" || single.chat_id === snapshot.chatId)
+            ) {
+              target = single as unknown as HostMessageShape;
+            }
+          } catch {
+            // Fall through to wider tail / fallback check
+          }
+        }
+
+        if (!target && truncated) {
+          try {
+            const widerPage = await getMessages(snapshot.chatId, {
+              limit: WIDER_MESSAGE_READ_LIMIT,
+              tail: true,
+            });
+            if (this.destroyed) return;
+            const widerMessages = extractMessageList(widerPage);
+            target = widerMessages.find((m) => m.id === snapshot.messageId) ?? null;
+            if (
+              !target &&
+              !isPageTruncated(widerPage, widerMessages.length, WIDER_MESSAGE_READ_LIMIT)
+            ) {
+              this.deleteIfSameRevision(key, snapshot.revision);
+              return;
+            }
+          } catch (error) {
+            if (this.destroyed) return;
+            this.handleFlushFailure(key, snapshot, error);
+            return;
+          }
+        }
+
+        if (!target) {
+          // Tail read was truncated (or single-message read failed); keep queued for next event.
           return;
         }
       }
@@ -339,6 +442,11 @@ export class PillMetricsController {
       target = resolvedFallback;
     } else {
       // Cannot verify swipe_id without getMessages or event message payload.
+      return;
+    }
+
+    const latestBeforeWrite = this.pending.get(key);
+    if (!latestBeforeWrite || latestBeforeWrite.revision !== snapshot.revision) {
       return;
     }
 
@@ -381,15 +489,16 @@ export class PillMetricsController {
   ): void {
     const current = this.pending.get(key);
     if (!current || current.revision !== snapshot.revision) {
-      // Newer update arrived while in flight; let the newer flush handle it.
+      // Newer update or swipe-index shift arrived while in flight; let the newer flush handle it.
       return;
     }
-    if (isPermanentError(error) || snapshot.attempts >= 1) {
+    if (isPermanentError(error) || snapshot.attempts >= RETRY_DELAYS_MS.length) {
       this.pending.delete(key);
       return;
     }
+    const delayMs = RETRY_DELAYS_MS[snapshot.attempts] ?? 150;
     current.attempts = snapshot.attempts + 1;
-    this.scheduleRetry(key);
+    this.scheduleRetry(key, delayMs);
   }
 
   private deleteIfSameRevision(key: string, revision: number): void {
@@ -399,13 +508,13 @@ export class PillMetricsController {
     }
   }
 
-  private scheduleRetry(key: string): void {
+  private scheduleRetry(key: string, delayMs: number): void {
     if (this.destroyed || this.retryTimers.has(key)) return;
     const timer = setTimeout(() => {
       this.retryTimers.delete(key);
       if (this.destroyed) return;
       this.enqueueFlush(key);
-    }, 0);
+    }, delayMs);
     this.retryTimers.set(key, timer);
   }
 
@@ -432,6 +541,20 @@ export class PillMetricsController {
         | undefined;
       if (typeof chats?.getMessages === "function") {
         return chats.getMessages.bind(chats);
+      }
+    } catch {
+      // Host context may be inactive
+    }
+    return null;
+  }
+
+  private resolveGetSingleMessage(): GetSingleMessageFn | null {
+    try {
+      const messagesApi = this.ctx.messages as unknown as
+        | { get?: GetSingleMessageFn }
+        | undefined;
+      if (typeof messagesApi?.get === "function") {
+        return messagesApi.get.bind(messagesApi);
       }
     } catch {
       // Host context may be inactive

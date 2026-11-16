@@ -25,6 +25,12 @@ export interface AssembledLlmMessageDTO extends LlmMessageDTO {
   __worldInfoSource?: boolean;
   __sourceMessageId?: string;
   __sourceIndexInChat?: number;
+  __sourceMessageMetadata?: unknown;
+  __continueNudge?: boolean;
+  __contextAnchorProtected?: boolean;
+  __preserveDisplayReasoningDelimiters?: boolean;
+  __cortexHistorySummary?: unknown;
+  __runtimeWorldInfoPlacementId?: string;
   partial?: boolean;
 }
 
@@ -214,6 +220,8 @@ export function resolveChatHistoryFlags(
         const expectedRole = mapPromptBlockRole(block.role);
         if (messages[preEnd]?.role === expectedRole) {
           preEnd += 1;
+        } else {
+          break;
         }
       }
 
@@ -226,6 +234,8 @@ export function resolveChatHistoryFlags(
         const expectedRole = mapPromptBlockRole(postBlocks[i]!.role);
         if (messages[postStart - 1]?.role === expectedRole) {
           postStart -= 1;
+        } else {
+          break;
         }
       }
 
@@ -256,8 +266,19 @@ export function stripInternalMessageMarkers(
       __worldInfoSource: _worldInfoSource,
       __sourceMessageId: _sourceMessageId,
       __sourceIndexInChat: _sourceIndexInChat,
+      __sourceMessageMetadata: _sourceMetaUnderscore,
+      __continueNudge: _continueNudge,
+      __contextAnchorProtected: _contextAnchorProtected,
+      __preserveDisplayReasoningDelimiters: _preserveReasoningDelims,
+      __cortexHistorySummary: _cortexHistorySummary,
+      __runtimeWorldInfoPlacementId: _runtimeWiPlacementId,
+      sourceMessageId: _sourceId,
+      sourceIndexInChat: _sourceIdx,
+      sourceMessageMetadata: _sourceMeta,
       ...rest
-    } = msg;
+    } = msg as AssembledLlmMessageDTO & {
+      sourceMessageMetadata?: unknown;
+    };
     return rest;
   });
 }
@@ -327,12 +348,33 @@ export function injectGuidanceMessage(
     return -1;
   };
 
+  const findMovedContinueAssistantIndex = (afterIdx: number): number => {
+    if (options.actionId !== "guided_continue") return -1;
+    let idx = copy.length - 1;
+    while (idx > afterIdx && copy[idx]?.role === "system") {
+      idx -= 1;
+    }
+    if (idx > afterIdx && copy[idx]?.role === "assistant") {
+      return idx;
+    }
+    return -1;
+  };
+
   let insertIndex = copy.length;
 
   switch (position) {
     case "pre_history": {
       if (hasHistoryFlags) {
-        insertIndex = historyIndices.length > 0 ? historyIndices[0]! : 0;
+        if (historyIndices.length > 0) {
+          insertIndex = historyIndices[0]!;
+        } else if (options.actionId === "guided_continue") {
+          const firstTurnIdx = copy.findIndex(
+            (m) => m.role === "user" || m.role === "assistant",
+          );
+          insertIndex = firstTurnIdx >= 0 ? firstTurnIdx : 0;
+        } else {
+          insertIndex = 0;
+        }
       } else {
         const firstTurnIdx = copy.findIndex(
           (m) => m.role === "user" || m.role === "assistant",
@@ -347,18 +389,19 @@ export function injectGuidanceMessage(
         if (historyIndices.length > 0) {
           const lastHistoryIdx = historyIndices[historyIndices.length - 1]!;
           if (options.actionId === "guided_continue") {
-            const continueIdx = findHistoryContinueAssistantIndex();
-            const fallbackIdx =
-              continueIdx >= 0 ? continueIdx : findFallbackContinueAssistantIndex();
-            insertIndex = fallbackIdx >= 0 ? fallbackIdx : lastHistoryIdx + 1;
+            const movedContinueIdx = findMovedContinueAssistantIndex(lastHistoryIdx);
+            if (movedContinueIdx >= 0) {
+              insertIndex = lastHistoryIdx + 1;
+            } else {
+              const continueIdx = findHistoryContinueAssistantIndex();
+              insertIndex = continueIdx >= 0 ? continueIdx : lastHistoryIdx + 1;
+            }
           } else {
             insertIndex = lastHistoryIdx + 1;
           }
         } else {
-          insertIndex =
-            copy.length > 0 && copy[copy.length - 1]?.role === "assistant"
-              ? copy.length - 1
-              : copy.length;
+          const continueIdx = findFallbackContinueAssistantIndex();
+          insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
         }
       } else {
         const continueIdx = findFallbackContinueAssistantIndex();
@@ -371,18 +414,39 @@ export function injectGuidanceMessage(
       if (hasHistoryFlags) {
         if (historyIndices.length > 0) {
           const lastHistoryIdx = historyIndices[historyIndices.length - 1]!;
+          const movedContinueIdx =
+            options.actionId === "guided_continue"
+              ? findMovedContinueAssistantIndex(lastHistoryIdx)
+              : -1;
           if (depth === 0) {
             if (options.actionId === "guided_continue") {
-              const continueIdx = findHistoryContinueAssistantIndex();
-              const fallbackIdx =
-                continueIdx >= 0 ? continueIdx : findFallbackContinueAssistantIndex();
-              insertIndex = fallbackIdx >= 0 ? fallbackIdx : lastHistoryIdx + 1;
+              if (movedContinueIdx >= 0) {
+                insertIndex = lastHistoryIdx + 1;
+              } else {
+                const continueIdx = findHistoryContinueAssistantIndex();
+                insertIndex = continueIdx >= 0 ? continueIdx : lastHistoryIdx + 1;
+              }
             } else {
               insertIndex = lastHistoryIdx + 1;
+            }
+          } else if (movedContinueIdx >= 0) {
+            if (depth === 1) {
+              insertIndex = lastHistoryIdx + 1;
+            } else {
+              const clampedOffset = Math.max(0, historyIndices.length - (depth - 1));
+              insertIndex = historyIndices[clampedOffset]!;
             }
           } else {
             const clampedOffset = Math.max(0, historyIndices.length - depth);
             insertIndex = historyIndices[clampedOffset]!;
+          }
+        } else if (options.actionId === "guided_continue") {
+          const continueIdx = findFallbackContinueAssistantIndex();
+          if (depth === 0) {
+            insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
+          } else {
+            const endBound = continueIdx >= 0 ? continueIdx : copy.length;
+            insertIndex = Math.max(0, endBound - depth);
           }
         } else {
           insertIndex =
@@ -395,20 +459,36 @@ export function injectGuidanceMessage(
         insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
       } else {
         const endBound =
-          copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1])
-            ? copy.length - 1
-            : copy.length;
+          options.actionId === "guided_continue"
+            ? (() => {
+                const continueIdx = findFallbackContinueAssistantIndex();
+                return continueIdx >= 0 ? continueIdx : copy.length;
+              })()
+            : copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1])
+              ? copy.length - 1
+              : copy.length;
         insertIndex = Math.max(0, endBound - depth);
       }
       break;
     }
 
     case "post_history": {
-      if (
-        copy.length > 0 &&
-        (isPartialAssistantPrefill(copy[copy.length - 1]) ||
-          (options.actionId === "guided_continue" && copy[copy.length - 1]?.role === "assistant"))
-      ) {
+      if (options.actionId === "guided_continue") {
+        if (hasHistoryFlags && historyIndices.length > 0) {
+          const lastHistoryIdx = historyIndices[historyIndices.length - 1]!;
+          const movedContinueIdx = findMovedContinueAssistantIndex(lastHistoryIdx);
+          if (movedContinueIdx >= 0) {
+            insertIndex = movedContinueIdx;
+          } else if (copy.length > 0 && copy[copy.length - 1]?.role === "assistant") {
+            insertIndex = copy.length - 1;
+          } else {
+            insertIndex = copy.length;
+          }
+        } else {
+          const continueIdx = findFallbackContinueAssistantIndex();
+          insertIndex = continueIdx >= 0 ? continueIdx : copy.length;
+        }
+      } else if (copy.length > 0 && isPartialAssistantPrefill(copy[copy.length - 1])) {
         insertIndex = copy.length - 1;
       } else {
         insertIndex = copy.length;
@@ -421,50 +501,317 @@ export function injectGuidanceMessage(
   return copy;
 }
 
+function isWorldInfoMessage(msg: AssembledLlmMessageDTO): boolean {
+  return Boolean(msg.__isWorldInfoEntry || msg.__worldInfoSource);
+}
+
+function getLlmMessageTextContent(content: LlmMessageDTO["content"]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+function mergeMessageContents(
+  prev: LlmMessageDTO["content"],
+  curr: LlmMessageDTO["content"],
+): LlmMessageDTO["content"] {
+  if (typeof prev === "string" && typeof curr === "string") {
+    return `${prev}\n\n${curr}`;
+  }
+  const hasNonText = (content: LlmMessageDTO["content"]): boolean =>
+    Array.isArray(content) && content.some((part) => part.type !== "text");
+  if (!hasNonText(prev) && !hasNonText(curr)) {
+    return `${getLlmMessageTextContent(prev)}\n\n${getLlmMessageTextContent(curr)}`;
+  }
+  const toParts = (content: LlmMessageDTO["content"]) =>
+    typeof content === "string"
+      ? content.length > 0
+        ? [{ type: "text" as const, text: content }]
+        : []
+      : content;
+  const prevParts = toParts(prev);
+  const currParts = toParts(curr);
+  return [
+    ...prevParts,
+    ...(prevParts.length > 0 && currParts.length > 0
+      ? [{ type: "text" as const, text: "\n\n" }]
+      : []),
+    ...currParts,
+  ];
+}
+
+/**
+ * Mirrors Lumiverse's `hasNonEmptyContent` filter in `generate.service.ts`
+ * so `mergeDryRunAndCapturedMessages` can reconcile `capturedMessages` against
+ * `dryRun.request_messages` after empty-turn pruning.
+ */
+export function hasNonEmptyLlmContent(msg: AssembledLlmMessageDTO): boolean {
+  if (typeof msg.content === "string") {
+    return msg.content.trim().length > 0 || (msg.role === "assistant" && msg.partial === true);
+  }
+  if (Array.isArray(msg.content)) {
+    return msg.content.length > 0;
+  }
+  return true;
+}
+
+/**
+ * Mirrors Lumiverse's `applyPostProcessing` consecutive same-role merging
+ * (`merge` / `semi` / `strict` modes) after unmerged capture processing.
+ */
+export function mergeConsecutiveSameRoleMessages(
+  messages: readonly AssembledLlmMessageDTO[],
+): AssembledLlmMessageDTO[] {
+  const merged: AssembledLlmMessageDTO[] = [];
+  for (const rawMsg of messages) {
+    const msg = { ...rawMsg };
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role) {
+      merged[merged.length - 1] = {
+        ...prev,
+        content: mergeMessageContents(prev.content, msg.content),
+        ...(msg.partial === true ? { partial: true } : {}),
+      };
+    } else {
+      merged.push(msg);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Collapses all assembled messages into a single `system` or `user` message,
+ * matching Lumiverse's `applyPostProcessing("single")` (`role: "system"`) and
+ * `collapseToSingleUserMessage` (`role: "user"`).
+ */
+export function collapseMessagesToSingleRole(
+  messages: readonly AssembledLlmMessageDTO[],
+  role: "system" | "user",
+): AssembledLlmMessageDTO[] {
+  if (messages.length <= 1) {
+    return messages.map((msg) => ({ ...msg }));
+  }
+
+  const textChunks: string[] = [];
+  const mediaParts: Exclude<
+    Extract<LlmMessageDTO["content"], readonly unknown[]>[number],
+    { type: "text" }
+  >[] = [];
+
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      if (msg.content) {
+        textChunks.push(msg.content);
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          if (part.text) {
+            textChunks.push(part.text);
+          }
+        } else {
+          mediaParts.push(part);
+        }
+      }
+    }
+  }
+
+  const collapsed = textChunks.join("\n\n");
+  if (mediaParts.length > 0) {
+    const parts: Extract<LlmMessageDTO["content"], readonly unknown[]> = [
+      ...(collapsed ? [{ type: "text" as const, text: collapsed }] : []),
+      ...mediaParts,
+    ];
+    return [{ role, content: parts }];
+  }
+  return [{ role, content: collapsed }];
+}
+
+/**
+ * Removes the trailing chat-history turn at `targetIdx` and unshifts any
+ * depth-inserted (`depth >= 1`) non-chat-history blocks one history turn earlier
+ * so they remain at the same depth as when the trailing assistant turn is excluded
+ * natively before prompt assembly.
+ */
+function removeTrailingHistoryTurnAndUnshiftDepth(
+  messages: readonly AssembledLlmMessageDTO[],
+  isChatHistory: readonly boolean[],
+  targetIdx: number,
+): { messages: AssembledLlmMessageDTO[]; isChatHistory: boolean[] } {
+  const historyIndices: number[] = [];
+  for (let i = 0; i < isChatHistory.length; i += 1) {
+    if (isChatHistory[i]) {
+      historyIndices.push(i);
+    }
+  }
+
+  const lastHistoryPos = historyIndices.length - 1;
+  if (lastHistoryPos < 1 || historyIndices[lastHistoryPos] !== targetIdx) {
+    const nextMessages: AssembledLlmMessageDTO[] = [];
+    const nextFlags: boolean[] = [];
+    for (let i = 0; i < messages.length; i += 1) {
+      if (i === targetIdx) continue;
+      nextMessages.push({ ...messages[i]! });
+      nextFlags.push(Boolean(isChatHistory[i]));
+    }
+    return { messages: nextMessages, isChatHistory: nextFlags };
+  }
+
+  const h0 = historyIndices[0]!;
+  const h1 = historyIndices[1]!;
+  const hk = targetIdx;
+
+  const nextMessages: AssembledLlmMessageDTO[] = [];
+  const nextFlags: boolean[] = [];
+  const pushItem = (idx: number, flag: boolean) => {
+    nextMessages.push({ ...messages[idx]! });
+    nextFlags.push(flag);
+  };
+
+  // Preserve blocks originally before the first chat-history turn (`depth >= k + 1`, pre_history).
+  for (let i = 0; i < h0; i += 1) {
+    pushItem(i, false);
+  }
+
+  // Gap 1 (`h0 .. h1`): non-WI blocks were inserted by depth = k and shift before `h0`,
+  // while standalone WI entries (`anAfter` / `emAfter`) remain anchored right after `h0`.
+  const gap1KeepAfterH0: number[] = [];
+  for (let i = h0 + 1; i < h1; i += 1) {
+    if (isWorldInfoMessage(messages[i]!)) {
+      gap1KeepAfterH0.push(i);
+    } else {
+      pushItem(i, false);
+    }
+  }
+
+  pushItem(h0, true);
+  for (const idx of gap1KeepAfterH0) {
+    pushItem(idx, false);
+  }
+
+  // Gap j (`2 <= j <= k`, i.e. `h_{j-1} .. h_j`): all non-history blocks move to Gap j - 1
+  // (immediately before `h_{j-1}`), and `h_k` (`targetIdx`) is omitted.
+  for (let j = 2; j <= lastHistoryPos; j += 1) {
+    const prevH = historyIndices[j - 1]!;
+    const currH = historyIndices[j]!;
+    for (let i = prevH + 1; i < currH; i += 1) {
+      pushItem(i, false);
+    }
+    pushItem(prevH, true);
+  }
+
+  // Keep post-target messages (`depth = 0`, `before_post_history`, `post_history`, prefill) in place.
+  for (let i = hk + 1; i < messages.length; i += 1) {
+    pushItem(i, false);
+  }
+
+  return { messages: nextMessages, isChatHistory: nextFlags };
+}
+
+function stripTrailingAssistantTurnWithHistory(
+  messages: readonly AssembledLlmMessageDTO[],
+  matchId: string | null | undefined,
+  isChatHistory: readonly boolean[] | undefined,
+  options: { requireBlankFallback: boolean },
+): { messages: AssembledLlmMessageDTO[]; isChatHistory?: boolean[] } {
+  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
+
+  if (matchId) {
+    const matchingIndices: number[] = [];
+    for (let i = 0; i < messages.length; i += 1) {
+      if (getMessageSourceId(messages[i]!) === matchId) {
+        matchingIndices.push(i);
+      }
+    }
+    if (matchingIndices.length === 1) {
+      const targetIdx = matchingIndices[0]!;
+      if (hasFlags) {
+        return removeTrailingHistoryTurnAndUnshiftDepth(messages, isChatHistory!, targetIdx);
+      }
+      return {
+        messages: messages
+          .filter((_, idx) => idx !== targetIdx)
+          .map((msg) => ({ ...msg })),
+      };
+    }
+    if (matchingIndices.length > 1) {
+      const matchSet = new Set(matchingIndices);
+      const nextMessages: AssembledLlmMessageDTO[] = [];
+      const nextFlags: boolean[] = [];
+      for (let i = 0; i < messages.length; i += 1) {
+        if (matchSet.has(i)) continue;
+        nextMessages.push({ ...messages[i]! });
+        if (hasFlags) nextFlags.push(Boolean(isChatHistory![i]));
+      }
+      return {
+        messages: nextMessages,
+        ...(hasFlags ? { isChatHistory: nextFlags } : {}),
+      };
+    }
+  }
+
+  let targetIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg) continue;
+    if (hasFlags && !isChatHistory![i]) {
+      continue;
+    }
+    if (msg.role === "user") {
+      break;
+    }
+    if (msg.role === "assistant") {
+      if (msg.partial) {
+        continue;
+      }
+      const candidateSourceId = getMessageSourceId(msg);
+      if (matchId && candidateSourceId && candidateSourceId !== matchId) {
+        break;
+      }
+      if (!options.requireBlankFallback || isBlankLlmContent(msg.content)) {
+        targetIdx = i;
+      }
+      break;
+    }
+  }
+
+  if (targetIdx === -1) {
+    return {
+      messages: messages.map((msg) => ({ ...msg })),
+      ...(hasFlags ? { isChatHistory: [...isChatHistory!] } : {}),
+    };
+  }
+
+  if (hasFlags) {
+    return removeTrailingHistoryTurnAndUnshiftDepth(messages, isChatHistory!, targetIdx);
+  }
+
+  return {
+    messages: messages
+      .filter((_, idx) => idx !== targetIdx)
+      .map((msg) => ({ ...msg })),
+  };
+}
+
 /**
  * Removes the rejected trailing assistant message from an assembled swipe prompt
- * along with its matching `isChatHistory` entry if provided.
+ * (unshifting any `depth >= 1` non-history blocks) along with its matching `isChatHistory` entry if provided.
  */
 export function stripRejectedSwipeAssistantTurnWithHistory(
   messages: readonly AssembledLlmMessageDTO[],
   targetMessageId?: string | null,
   isChatHistory?: readonly boolean[],
+  options?: { requireBlankFallback?: boolean },
 ): { messages: AssembledLlmMessageDTO[]; isChatHistory?: boolean[] } {
-  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
-
-  if (targetMessageId && messages.some((msg) => getMessageSourceId(msg) === targetMessageId)) {
-    const nextMessages: AssembledLlmMessageDTO[] = [];
-    const nextFlags: boolean[] = [];
-    for (let i = 0; i < messages.length; i += 1) {
-      const msg = messages[i]!;
-      if (getMessageSourceId(msg) === targetMessageId) continue;
-      nextMessages.push({ ...msg });
-      if (hasFlags) nextFlags.push(Boolean(isChatHistory![i]));
-    }
-    return {
-      messages: nextMessages,
-      ...(hasFlags ? { isChatHistory: nextFlags } : {}),
-    };
-  }
-
-  const copy = messages.map((msg) => ({ ...msg }));
-  const nextFlags = hasFlags ? [...isChatHistory!] : undefined;
-  for (let i = copy.length - 1; i >= 0; i -= 1) {
-    const msg = copy[i];
-    if (!msg) continue;
-    if (msg.role === "user") {
-      break;
-    }
-    if (msg.role === "assistant") {
-      copy.splice(i, 1);
-      if (nextFlags) nextFlags.splice(i, 1);
-      break;
-    }
-  }
-  return {
-    messages: copy,
-    ...(nextFlags ? { isChatHistory: nextFlags } : {}),
-  };
+  return stripTrailingAssistantTurnWithHistory(messages, targetMessageId, isChatHistory, {
+    requireBlankFallback: options?.requireBlankFallback ?? false,
+  });
 }
 
 /**
@@ -495,57 +842,17 @@ function isBlankLlmContent(content: LlmMessageDTO["content"]): boolean {
 
 /**
  * Removes an eagerly created blank assistant placeholder message from an assembled
- * dry-run prompt (matched by `sourceMessageId` or trailing blank chat-history assistant turn)
- * along with its matching `isChatHistory` entry if provided.
+ * dry-run prompt (matched by `sourceMessageId` or trailing blank chat-history assistant turn,
+ * unshifting any `depth >= 1` non-history blocks) along with its matching `isChatHistory` entry if provided.
  */
 export function stripCreatedBlankAssistantTurnWithHistory(
   messages: readonly AssembledLlmMessageDTO[],
   createdMessageId?: string | null,
   isChatHistory?: readonly boolean[],
 ): { messages: AssembledLlmMessageDTO[]; isChatHistory?: boolean[] } {
-  const hasFlags = Array.isArray(isChatHistory) && isChatHistory.length === messages.length;
-
-  if (createdMessageId && messages.some((msg) => getMessageSourceId(msg) === createdMessageId)) {
-    const nextMessages: AssembledLlmMessageDTO[] = [];
-    const nextFlags: boolean[] = [];
-    for (let i = 0; i < messages.length; i += 1) {
-      const msg = messages[i]!;
-      if (getMessageSourceId(msg) === createdMessageId) continue;
-      nextMessages.push({ ...msg });
-      if (hasFlags) nextFlags.push(Boolean(isChatHistory![i]));
-    }
-    return {
-      messages: nextMessages,
-      ...(hasFlags ? { isChatHistory: nextFlags } : {}),
-    };
-  }
-
-  const copy = messages.map((msg) => ({ ...msg }));
-  const nextFlags = hasFlags ? [...isChatHistory!] : undefined;
-  for (let i = copy.length - 1; i >= 0; i -= 1) {
-    const msg = copy[i];
-    if (!msg) continue;
-    if (hasFlags && !nextFlags![i]) {
-      continue;
-    }
-    if (msg.role === "user") {
-      break;
-    }
-    if (msg.role === "assistant") {
-      if (msg.partial) {
-        continue;
-      }
-      if (isBlankLlmContent(msg.content)) {
-        copy.splice(i, 1);
-        if (nextFlags) nextFlags.splice(i, 1);
-      }
-      break;
-    }
-  }
-  return {
-    messages: copy,
-    ...(nextFlags ? { isChatHistory: nextFlags } : {}),
-  };
+  return stripTrailingAssistantTurnWithHistory(messages, createdMessageId, isChatHistory, {
+    requireBlankFallback: true,
+  });
 }
 
 /**
@@ -677,10 +984,17 @@ export function stitchContinueContent(baseContent: string, delta: string): strin
   if (!baseContent) return delta;
 
   const endsWithWhitespace = /\s$/.test(baseContent);
+  const endsWithOpeningDelimiter =
+    /[(\[{“‘—–-]$/.test(baseContent) || /(?:^|[\s(\[>])["'*_]$/.test(baseContent);
   const startsWithWhitespace = /^\s/.test(delta);
   const startsWithPunctuation = /^[,.;:!?'"’”\)\]\-—…]/.test(delta);
 
-  if (endsWithWhitespace || startsWithWhitespace || startsWithPunctuation) {
+  if (
+    endsWithWhitespace ||
+    endsWithOpeningDelimiter ||
+    startsWithWhitespace ||
+    startsWithPunctuation
+  ) {
     return baseContent + delta;
   }
 
@@ -829,7 +1143,11 @@ export function buildPresetContextMetadata(
   while (nextContexts.length <= idx) {
     nextContexts.push(null);
   }
-  nextContexts[idx] = { preset_id: presetId };
+  const existingEntry = nextContexts[idx];
+  nextContexts[idx] = {
+    ...(existingEntry ?? {}),
+    preset_id: presetId,
+  };
   return {
     ...(existingMetadata ?? {}),
     preset_contexts: nextContexts,
@@ -883,6 +1201,7 @@ export function buildBackgroundSwipePatch(args: {
   content: string;
   swipeDates?: readonly number[];
   reasoningText?: string;
+  reasoningDuration?: number | null;
   clearReasoningSlot?: boolean;
   existingExtra?: Record<string, unknown>;
   existingActiveSwipeId?: number;
@@ -892,13 +1211,24 @@ export function buildBackgroundSwipePatch(args: {
 
   const hasNewReasoning =
     typeof args.reasoningText === "string" && args.reasoningText.length > 0;
+  const validDuration =
+    typeof args.reasoningDuration === "number" &&
+    Number.isFinite(args.reasoningDuration) &&
+    args.reasoningDuration >= 0
+      ? args.reasoningDuration
+      : undefined;
   const shouldWriteSwipeReasoning = hasNewReasoning || Boolean(args.clearReasoningSlot);
 
   let swipeReasoning: SwipeReasoningSlot[] | undefined;
   if (shouldWriteSwipeReasoning) {
     swipeReasoning = updatedSwipes.map((_, idx) => {
       if (idx === args.swipeIndex) {
-        return hasNewReasoning ? { text: args.reasoningText! } : null;
+        return hasNewReasoning
+          ? {
+              text: args.reasoningText!,
+              ...(validDuration !== undefined ? { duration: validDuration } : {}),
+            }
+          : null;
       }
       return resolveExistingSwipeReasoningSlot(
         idx,

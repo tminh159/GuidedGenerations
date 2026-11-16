@@ -1,7 +1,7 @@
 {
   "name": "Guided Generations",
   "identifier": "guided_generations",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Gehihi",
   "github": "https://github.com/tminh159/GuidedGenerations",
   "homepage": "https://github.com/tminh159/GuidedGenerations",
@@ -10,6 +10,7 @@
     "generation",
     "chats",
     "chat_mutation",
+    "characters",
     "presets",
     "regex_scripts",
     "interceptor"

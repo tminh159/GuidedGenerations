@@ -138,11 +138,16 @@ export function appendRecoveryEntry(
     return [...entries].slice(0, limit);
   }
 
+  const trimmedChatId =
+    typeof next.chatId === "string" && next.chatId.trim().length > 0
+      ? next.chatId.trim()
+      : null;
+
   const entry: RecoveryEntry = {
     id: next.id ?? `rec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     text,
     actionId: next.actionId,
-    chatId: next.chatId ?? null,
+    chatId: trimmedChatId,
     createdAt: next.createdAt ?? Date.now(),
   };
 
@@ -236,9 +241,16 @@ export class SettingsStore {
   private readonly settingsCache = new Map<string, GuidedGenerationsSettings>();
   private readonly recoveryCache = new Map<string, RecoveryEntry[]>();
   private readonly continueHistoryCache = new Map<string, ContinueHistoryEntry[]>();
+  private readonly settingsVersions = new Map<string, number>();
+  private readonly recoveryVersions = new Map<string, number>();
+  private readonly continueVersions = new Map<string, number>();
   private readonly writeQueues = new Map<string, Promise<unknown>>();
 
   constructor(private readonly spindle: SpindleAPI) {}
+
+  private bumpVersion(versions: Map<string, number>, key: string): void {
+    versions.set(key, (versions.get(key) ?? 0) + 1);
+  }
 
   private userKey(userId?: string): string {
     return userId && userId.length > 0 ? userId : "__default__";
@@ -299,12 +311,15 @@ export class SettingsStore {
       if (rechecked) return this.cloneSettings(rechecked);
     }
 
+    const versionBeforeRead = this.settingsVersions.get(key) ?? 0;
+    let resolved: GuidedGenerationsSettings;
+
     try {
       if (await this.spindle.userStorage.exists(SETTINGS_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(SETTINGS_FILE, userId);
-        const parsed = normalizeSettings(JSON.parse(raw));
-        this.settingsCache.set(key, parsed);
-        return this.cloneSettings(parsed);
+        resolved = normalizeSettings(JSON.parse(raw));
+      } else {
+        resolved = createDefaultSettings();
       }
     } catch (error) {
       this.spindle.log.warn(
@@ -313,9 +328,17 @@ export class SettingsStore {
       return createDefaultSettings();
     }
 
-    const defaults = createDefaultSettings();
-    this.settingsCache.set(key, defaults);
-    return this.cloneSettings(defaults);
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.settingsCache.get(key);
+    if (concurrentCached) {
+      return this.cloneSettings(concurrentCached);
+    }
+    if ((this.settingsVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.settingsCache.set(key, resolved);
+    }
+    return this.cloneSettings(resolved);
   }
 
   async saveSettingsWithMeta(
@@ -335,6 +358,7 @@ export class SettingsStore {
         userId,
       );
       this.settingsCache.set(key, normalized);
+      this.bumpVersion(this.settingsVersions, key);
 
       const currentRecovery = await this.readRawRecoveryUnlocked(userId, true);
       const recoveryPruned = currentRecovery.length > normalized.inputRecovery.maxEntries;
@@ -342,10 +366,6 @@ export class SettingsStore {
       if (recoveryPruned) {
         await this.writeRecoveryUnlocked(trimmed, userId);
       }
-      this.recoveryCache.set(
-        key,
-        trimmed.map((e) => ({ ...e })),
-      );
       return {
         settings: this.cloneSettings(normalized),
         recoveryPruned,
@@ -405,15 +425,15 @@ export class SettingsStore {
       if (rechecked) return rechecked.map((e) => ({ ...e }));
     }
 
+    const versionBeforeRead = this.recoveryVersions.get(key) ?? 0;
+    let parsed: RecoveryEntry[];
+
     try {
       if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
-        const parsed = normalizeRecoveryList(JSON.parse(raw), 50);
-        this.recoveryCache.set(
-          key,
-          parsed.map((e) => ({ ...e })),
-        );
-        return parsed.map((e) => ({ ...e }));
+        parsed = normalizeRecoveryList(JSON.parse(raw), 50);
+      } else {
+        parsed = [];
       }
     } catch (error) {
       this.spindle.log.warn(
@@ -422,8 +442,20 @@ export class SettingsStore {
       return [];
     }
 
-    this.recoveryCache.set(key, []);
-    return [];
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.recoveryCache.get(key);
+    if (concurrentCached) {
+      return concurrentCached.map((e) => ({ ...e }));
+    }
+    if ((this.recoveryVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.recoveryCache.set(
+        key,
+        parsed.map((e) => ({ ...e })),
+      );
+    }
+    return parsed.map((e) => ({ ...e }));
   }
 
   private async readRecoveryUnlocked(
@@ -431,50 +463,26 @@ export class SettingsStore {
     maxEntries: number,
     skipWriteWait = false,
   ): Promise<RecoveryEntry[]> {
-    const key = this.userKey(userId);
-    const cached = this.recoveryCache.get(key);
-    if (cached) return cached.slice(0, maxEntries).map((e) => ({ ...e }));
-
-    if (!skipWriteWait) {
-      await this.waitForPendingWrites(key);
-      const rechecked = this.recoveryCache.get(key);
-      if (rechecked) return rechecked.slice(0, maxEntries).map((e) => ({ ...e }));
-    }
-
-    try {
-      if (await this.spindle.userStorage.exists(RECOVERY_FILE, userId)) {
-        const raw = await this.spindle.userStorage.read(RECOVERY_FILE, userId);
-        const parsed = normalizeRecoveryList(JSON.parse(raw), maxEntries);
-        this.recoveryCache.set(
-          key,
-          parsed.map((e) => ({ ...e })),
-        );
-        return parsed.map((e) => ({ ...e }));
-      }
-    } catch (error) {
-      this.spindle.log.warn(
-        `[GuidedGenerations] Failed reading recovery history: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return [];
-    }
-
-    this.recoveryCache.set(key, []);
-    return [];
+    const limit = Number.isFinite(maxEntries) ? Math.max(1, Math.floor(maxEntries)) : 10;
+    const all = await this.readRawRecoveryUnlocked(userId, skipWriteWait);
+    return all.slice(0, limit);
   }
 
   private async writeRecoveryUnlocked(
     entries: RecoveryEntry[],
     userId?: string,
   ): Promise<void> {
+    const key = this.userKey(userId);
     await this.spindle.userStorage.write(
       RECOVERY_FILE,
       JSON.stringify(entries, null, 2),
       userId,
     );
     this.recoveryCache.set(
-      this.userKey(userId),
+      key,
       entries.map((e) => ({ ...e })),
     );
+    this.bumpVersion(this.recoveryVersions, key);
   }
 
   async getContinueHistory(userId?: string): Promise<ContinueHistoryEntry[]> {
@@ -604,15 +612,15 @@ export class SettingsStore {
       if (rechecked) return rechecked.map((entry) => ({ ...entry }));
     }
 
+    const versionBeforeRead = this.continueVersions.get(key) ?? 0;
+    let parsed: ContinueHistoryEntry[];
+
     try {
       if (await this.spindle.userStorage.exists(CONTINUE_HISTORY_FILE, userId)) {
         const raw = await this.spindle.userStorage.read(CONTINUE_HISTORY_FILE, userId);
-        const parsed = normalizeContinueHistoryList(JSON.parse(raw), MAX_CONTINUE_ENTRIES);
-        this.continueHistoryCache.set(
-          key,
-          parsed.map((entry) => ({ ...entry })),
-        );
-        return parsed.map((entry) => ({ ...entry }));
+        parsed = normalizeContinueHistoryList(JSON.parse(raw), MAX_CONTINUE_ENTRIES);
+      } else {
+        parsed = [];
       }
     } catch (error) {
       this.spindle.log.warn(
@@ -621,23 +629,37 @@ export class SettingsStore {
       return [];
     }
 
-    this.continueHistoryCache.set(key, []);
-    return [];
+    if (!skipWriteWait && this.writeQueues.has(key)) {
+      await this.waitForPendingWrites(key);
+    }
+    const concurrentCached = this.continueHistoryCache.get(key);
+    if (concurrentCached) {
+      return concurrentCached.map((entry) => ({ ...entry }));
+    }
+    if ((this.continueVersions.get(key) ?? 0) === versionBeforeRead) {
+      this.continueHistoryCache.set(
+        key,
+        parsed.map((entry) => ({ ...entry })),
+      );
+    }
+    return parsed.map((entry) => ({ ...entry }));
   }
 
   private async writeContinueHistoryUnlocked(
     entries: ContinueHistoryEntry[],
     userId?: string,
   ): Promise<void> {
+    const key = this.userKey(userId);
     await this.spindle.userStorage.write(
       CONTINUE_HISTORY_FILE,
       JSON.stringify(entries, null, 2),
       userId,
     );
     this.continueHistoryCache.set(
-      this.userKey(userId),
+      key,
       entries.map((entry) => ({ ...entry })),
     );
+    this.bumpVersion(this.continueVersions, key);
   }
 
   async listConnections(userId?: string): Promise<ConnectionOptionSummary[]> {

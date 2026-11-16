@@ -12,13 +12,16 @@ import {
   buildDryRunInput,
   buildPresetContextMetadata,
   type ChatMessageWithRole,
+  collapseMessagesToSingleRole,
   computeEffectiveGuidanceDepth,
   extractSwipeReasoning,
   findLastAssistantMessage,
   formatGuidanceText,
+  hasNonEmptyLlmContent,
   hasPresetContextForSwipe,
   injectGuidanceMessage,
   mapInjectionRoleToRegexPlacement,
+  mergeConsecutiveSameRoleMessages,
   normalizeMessageSwipes,
   resolveChatHistoryFlags,
   resolveEffectiveModelAndProvider,
@@ -987,6 +990,380 @@ describe("prompt-builder", () => {
       "Post-History",
     ]);
     expect(strippedBlank.isChatHistory).toEqual([false, true, false]);
+  });
+
+  test("injectGuidanceMessage places guided_continue accurately after finalizeContinuePrompt with continueNudge and strips safely with partial/non-history guards", () => {
+    // Shape produced by Lumiverse finalizeContinuePrompt:
+    // continued assistant turn moved out of isChatHistory, followed by continueNudge system block
+    const finalizedContinue: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Main", __chatHistorySource: false },
+      { role: "user", content: "Turn 1 user", __chatHistorySource: true },
+      { role: "assistant", content: "Turn 1 assistant", __chatHistorySource: true },
+      { role: "user", content: "Turn 2 user", __chatHistorySource: true },
+      { role: "system", content: "Post-History", __chatHistorySource: false },
+      { role: "assistant", content: "Continued turn...", __chatHistorySource: false },
+      { role: "system", content: "[Continue Nudge]", __continueNudge: true, __chatHistorySource: false },
+    ];
+    const flags = resolveChatHistoryFlags(finalizedContinue);
+    expect(flags).toEqual([false, true, true, true, false, false, false]);
+
+    expect(
+      injectGuidanceMessage(finalizedContinue, "[G]", "user", {
+        actionId: "guided_continue",
+        guidancePosition: "pre_history",
+        isChatHistory: flags,
+      }).map((m) => m.content),
+    ).toEqual([
+      "Main",
+      "[G]",
+      "Turn 1 user",
+      "Turn 1 assistant",
+      "Turn 2 user",
+      "Post-History",
+      "Continued turn...",
+      "[Continue Nudge]",
+    ]);
+
+    expect(
+      injectGuidanceMessage(finalizedContinue, "[G]", "user", {
+        actionId: "guided_continue",
+        guidancePosition: "before_post_history",
+        isChatHistory: flags,
+      }).map((m) => m.content),
+    ).toEqual([
+      "Main",
+      "Turn 1 user",
+      "Turn 1 assistant",
+      "Turn 2 user",
+      "[G]",
+      "Post-History",
+      "Continued turn...",
+      "[Continue Nudge]",
+    ]);
+
+    // in_history depth 0 & 1 both land right after Turn 2 user (just before the moved continued turn / post-history)
+    for (const depth of [0, 1]) {
+      expect(
+        injectGuidanceMessage(finalizedContinue, "[G]", "user", {
+          actionId: "guided_continue",
+          guidancePosition: "in_history",
+          guidanceDepth: depth,
+          isChatHistory: flags,
+        }).map((m) => m.content),
+      ).toEqual([
+        "Main",
+        "Turn 1 user",
+        "Turn 1 assistant",
+        "Turn 2 user",
+        "[G]",
+        "Post-History",
+        "Continued turn...",
+        "[Continue Nudge]",
+      ]);
+    }
+
+    // in_history depth 2 steps 1 message further back in remaining history (before Turn 2 user)
+    expect(
+      injectGuidanceMessage(finalizedContinue, "[G]", "user", {
+        actionId: "guided_continue",
+        guidancePosition: "in_history",
+        guidanceDepth: 2,
+        isChatHistory: flags,
+      }).map((m) => m.content),
+    ).toEqual([
+      "Main",
+      "Turn 1 user",
+      "Turn 1 assistant",
+      "[G]",
+      "Turn 2 user",
+      "Post-History",
+      "Continued turn...",
+      "[Continue Nudge]",
+    ]);
+
+    // post_history places right before the moved continued assistant turn (after Post-History, before Continue Nudge)
+    expect(
+      injectGuidanceMessage(finalizedContinue, "[G]", "user", {
+        actionId: "guided_continue",
+        guidancePosition: "post_history",
+        isChatHistory: flags,
+      }).map((m) => m.content),
+    ).toEqual([
+      "Main",
+      "Turn 1 user",
+      "Turn 1 assistant",
+      "Turn 2 user",
+      "Post-History",
+      "[G]",
+      "Continued turn...",
+      "[Continue Nudge]",
+    ]);
+
+    // Fallback swipe stripping skips non-history and partial assistant prefill turns
+    const swipeFallbackMsgs: AssembledLlmMessageDTO[] = [
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: "Old reply" },
+      { role: "assistant", content: "Post-history assistant example" },
+      { role: "assistant", content: "Prefill", partial: true },
+    ];
+    const stripped = stripRejectedSwipeAssistantTurnWithHistory(
+      swipeFallbackMsgs,
+      "missing-id",
+      [true, true, false, false],
+    );
+    expect(stripped.messages.map((m) => m.content)).toEqual([
+      "Hello",
+      "Post-history assistant example",
+      "Prefill",
+    ]);
+    expect(stripped.isChatHistory).toEqual([true, false, false]);
+  });
+
+  test("stripRejectedSwipeAssistantTurnWithHistory unshifts depth=1 in_history system block before latest user with post_history assistant-user-system", () => {
+    // Exact reported guided_swipe bug:
+    // Chat has prior turns + latest user + rejected assistant swipe; preset has in_history system at depth=1
+    // plus post_history assistant - user - system.
+    const assembled: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Main Prompt", __chatHistorySource: false },
+      { role: "user", content: "Earlier user", __chatHistorySource: true, __sourceMessageId: "m1" },
+      { role: "assistant", content: "Earlier assistant", __chatHistorySource: true, __sourceMessageId: "m2" },
+      { role: "user", content: "Latest user", __chatHistorySource: true, __sourceMessageId: "m3" },
+      { role: "system", content: "Depth 1 System", __chatHistorySource: false },
+      { role: "assistant", content: "", __chatHistorySource: true, __sourceMessageId: "m4" },
+      { role: "assistant", content: "Post assistant", __chatHistorySource: false },
+      { role: "user", content: "Post user", __chatHistorySource: false },
+      { role: "system", content: "Post system", __chatHistorySource: false },
+    ];
+    const flags = resolveChatHistoryFlags(assembled);
+    expect(flags).toEqual([false, true, true, true, false, true, false, false, false]);
+
+    const stripped = stripRejectedSwipeAssistantTurnWithHistory(assembled, "m4", flags);
+    expect(stripped.messages.map((m) => `${m.role}:${m.content}`)).toEqual([
+      "system:Main Prompt",
+      "user:Earlier user",
+      "assistant:Earlier assistant",
+      "system:Depth 1 System",
+      "user:Latest user",
+      "assistant:Post assistant",
+      "user:Post user",
+      "system:Post system",
+    ]);
+    expect(stripped.isChatHistory).toEqual([false, true, true, false, true, false, false, false]);
+  });
+
+  test("removeTrailingHistoryTurnAndUnshiftDepth shifts multi-depth blocks (depth=1..k), preserves WI after h0, and keeps depth=0/post_history after h_{k-1}", () => {
+    // Chat has 4 history turns: h0 (m1), h1 (m2), h2 (m3), h3 (m4 - stripped blank/rejected)
+    // Gap 1 (h0..h1) has WI anAfter (must stay after h0) + depth=3 system (must shift before h0)
+    // Gap 2 (h1..h2) has depth=2 system + depth=2 WI (must shift before h1)
+    // Gap 3 (h2..h3) has depth=1 system (must shift before h2)
+    // Post h3 has depth=0 system + post_history + prefill (must stay after h2)
+    const assembled: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Pre-history / depth>=4", __chatHistorySource: false },
+      { role: "user", content: "h0", __chatHistorySource: true, __sourceMessageId: "m1" },
+      { role: "system", content: "WI anAfter", __chatHistorySource: false, __isWorldInfoEntry: true },
+      { role: "system", content: "Depth 3 block", __chatHistorySource: false },
+      { role: "assistant", content: "h1", __chatHistorySource: true, __sourceMessageId: "m2" },
+      { role: "system", content: "Depth 2 preset", __chatHistorySource: false },
+      { role: "system", content: "Depth 2 WI", __chatHistorySource: false, __worldInfoSource: true },
+      { role: "user", content: "h2", __chatHistorySource: true, __sourceMessageId: "m3" },
+      { role: "system", content: "Depth 1 block", __chatHistorySource: false },
+      { role: "assistant", content: "", __chatHistorySource: true, __sourceMessageId: "m4" },
+      { role: "system", content: "Depth 0 block", __chatHistorySource: false },
+      { role: "system", content: "Post-history", __chatHistorySource: false },
+      { role: "assistant", content: "Prefill", partial: true, __chatHistorySource: false },
+    ];
+    const flags = resolveChatHistoryFlags(assembled);
+
+    const swipeStripped = stripRejectedSwipeAssistantTurnWithHistory(assembled, "m4", flags);
+    expect(swipeStripped.messages.map((m) => m.content)).toEqual([
+      "Pre-history / depth>=4",
+      "Depth 3 block",
+      "h0",
+      "WI anAfter",
+      "Depth 2 preset",
+      "Depth 2 WI",
+      "h1",
+      "Depth 1 block",
+      "h2",
+      "Depth 0 block",
+      "Post-history",
+      "Prefill",
+    ]);
+    expect(swipeStripped.isChatHistory).toEqual([
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+    ]);
+
+    // Same behavior for stripCreatedBlankAssistantTurnWithHistory (guided_response / guided_regenerate)
+    const blankStripped = stripCreatedBlankAssistantTurnWithHistory(assembled, "m4", flags);
+    expect(blankStripped.messages.map((m) => m.content)).toEqual(
+      swipeStripped.messages.map((m) => m.content),
+    );
+    expect(blankStripped.isChatHistory).toEqual(swipeStripped.isChatHistory);
+
+    // Fallback without sourceMessageId also unshifts depth cleanly
+    const noIds = assembled.map(({ __sourceMessageId: _ignored, ...rest }) => rest);
+    const fallbackBlank = stripCreatedBlankAssistantTurnWithHistory(noIds, "missing", flags);
+    expect(fallbackBlank.messages.map((m) => m.content)).toEqual(
+      swipeStripped.messages.map((m) => m.content),
+    );
+    expect(fallbackBlank.isChatHistory).toEqual(swipeStripped.isChatHistory);
+
+    // Single-turn chat (k === 0, only h0 = targetIdx): strips h0 without touching non-history order
+    const singleTurn: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Main", __chatHistorySource: false },
+      { role: "assistant", content: "", __chatHistorySource: true, __sourceMessageId: "m-only" },
+      { role: "system", content: "Post", __chatHistorySource: false },
+    ];
+    const singleStripped = stripCreatedBlankAssistantTurnWithHistory(
+      singleTurn,
+      "m-only",
+      [false, true, false],
+    );
+    expect(singleStripped.messages.map((m) => m.content)).toEqual(["Main", "Post"]);
+    expect(singleStripped.isChatHistory).toEqual([false, false]);
+  });
+
+  test("mergeConsecutiveSameRoleMessages merges string and multimodal parts and preserves partial flag", () => {
+    const merged = mergeConsecutiveSameRoleMessages([
+      { role: "system", content: "Main" },
+      { role: "system", content: "Depth 1" },
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: "First part" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Prefill" }],
+        partial: true,
+      },
+    ]);
+
+    expect(merged).toEqual([
+      { role: "system", content: "Main\n\nDepth 1" },
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: "First part\n\nPrefill", partial: true },
+    ]);
+
+    const multimodal = mergeConsecutiveSameRoleMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Look:" },
+          { type: "image", data: "YWJj", mime_type: "image/png" },
+        ],
+      },
+      { role: "user", content: "What is this?" },
+    ]);
+    expect(multimodal).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Look:" },
+          { type: "image", data: "YWJj", mime_type: "image/png" },
+          { type: "text", text: "\n\n" },
+          { type: "text", text: "What is this?" },
+        ],
+      },
+    ]);
+  });
+
+  test("hasNonEmptyLlmContent mirrors Lumiverse generate.service.ts empty-turn filtering", () => {
+    expect(hasNonEmptyLlmContent({ role: "assistant", content: "" })).toBe(false);
+    expect(hasNonEmptyLlmContent({ role: "assistant", content: "   \n\t  " })).toBe(false);
+    expect(hasNonEmptyLlmContent({ role: "assistant", content: "", partial: true })).toBe(true);
+    expect(hasNonEmptyLlmContent({ role: "user", content: "", partial: true })).toBe(false);
+    expect(hasNonEmptyLlmContent({ role: "system", content: "Main prompt" })).toBe(true);
+    expect(hasNonEmptyLlmContent({ role: "user", content: [] })).toBe(false);
+    expect(
+      hasNonEmptyLlmContent({
+        role: "user",
+        content: [{ type: "image", data: "YWJj", mime_type: "image/png" }],
+      }),
+    ).toBe(true);
+  });
+
+  test("stripRejectedSwipeAssistantTurnWithHistory with requireBlankFallback preserves earlier non-empty assistant turn when already-empty swipe was pruned", () => {
+    // Trailing blank assistant turn was dropped by stripEmptyTextParts and sourceMessageId is absent (!interceptor)
+    const prunedPrompt: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Main", __chatHistorySource: false },
+      { role: "user", content: "Turn 1", __chatHistorySource: true },
+      { role: "assistant", content: "Earlier non-empty reply", __chatHistorySource: true },
+      { role: "system", content: "Post-history", __chatHistorySource: false },
+    ];
+    const flags = [false, true, true, false];
+
+    const preserved = stripRejectedSwipeAssistantTurnWithHistory(
+      prunedPrompt,
+      "m-empty-target",
+      flags,
+      { requireBlankFallback: true },
+    );
+    expect(preserved.messages.map((m) => m.content)).toEqual([
+      "Main",
+      "Turn 1",
+      "Earlier non-empty reply",
+      "Post-history",
+    ]);
+    expect(preserved.isChatHistory).toEqual([false, true, true, false]);
+
+    // Still strips when trailing assistant turn IS blank
+    const withBlankTrailing: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "Main", __chatHistorySource: false },
+      { role: "user", content: "Turn 1", __chatHistorySource: true },
+      { role: "assistant", content: "Earlier non-empty reply", __chatHistorySource: true },
+      { role: "assistant", content: "   ", __chatHistorySource: true },
+      { role: "system", content: "Post-history", __chatHistorySource: false },
+    ];
+    const strippedBlank = stripRejectedSwipeAssistantTurnWithHistory(
+      withBlankTrailing,
+      "m-empty-target",
+      [false, true, true, true, false],
+      { requireBlankFallback: true },
+    );
+    expect(strippedBlank.messages.map((m) => m.content)).toEqual([
+      "Main",
+      "Turn 1",
+      "Earlier non-empty reply",
+      "Post-history",
+    ]);
+    expect(strippedBlank.isChatHistory).toEqual([false, true, true, false]);
+  });
+
+  test("collapseMessagesToSingleRole returns 1-message prompts unchanged and collapses multimodal multi-message prompts", () => {
+    const singleUser: AssembledLlmMessageDTO[] = [{ role: "user", content: "Only message" }];
+    const singleResult = collapseMessagesToSingleRole(singleUser, "system");
+    expect(singleResult).toEqual([{ role: "user", content: "Only message" }]);
+    expect(singleResult[0]).not.toBe(singleUser[0]);
+
+    const multimodal: AssembledLlmMessageDTO[] = [
+      { role: "system", content: "System intro" },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this:" },
+          { type: "image", data: "YWJj", mime_type: "image/png" },
+        ],
+      },
+      { role: "assistant", content: "Looks cool" },
+    ];
+    expect(collapseMessagesToSingleRole(multimodal, "user")).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "System intro\n\nDescribe this:\n\nLooks cool" },
+          { type: "image", data: "YWJj", mime_type: "image/png" },
+        ],
+      },
+    ]);
   });
 });
 

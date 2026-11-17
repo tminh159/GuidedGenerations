@@ -71,7 +71,15 @@ interface HarnessOptions {
   chats?: Record<string, ChatMessageWithRole[]>;
   chatCharacterIds?: Record<string, string>;
   activeChatByUser?: Record<string, string | null>;
-  presets?: Record<string, { id: string; name: string; prompt_order?: PromptBlockSnapshotDTO[] }>;
+  presets?: Record<
+    string,
+    {
+      id: string;
+      name: string;
+      parameters?: Record<string, unknown>;
+      prompt_order?: PromptBlockSnapshotDTO[];
+    }
+  >;
   activePresetId?: string | null;
   getActivePresetThrows?: boolean;
   regexScripts?: RegexScriptDTO[];
@@ -86,6 +94,9 @@ interface HarnessOptions {
   dryRunImpl?: (
     input: Record<string, unknown>,
     userId?: string,
+  ) => Promise<Record<string, unknown>>;
+  rawImpl?: (
+    input: Record<string, unknown> & { signal?: AbortSignal },
   ) => Promise<Record<string, unknown>>;
   rawStreamImpl?: (
     input: Record<string, unknown> & { signal?: AbortSignal },
@@ -142,6 +153,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
 
   const sentFrontend: Array<{ payload: unknown; userId?: string }> = [];
   const dryRunCalls: Array<{ input: Record<string, unknown>; userId?: string }> = [];
+  const rawCalls: Array<Record<string, unknown>> = [];
   const rawStreamCalls: Array<Record<string, unknown>> = [];
   const presetGetCalls: Array<{ id: string; userId?: string }> = [];
   const registerInterceptorCalls: Array<{ options?: unknown; priority?: unknown }> = [];
@@ -521,6 +533,16 @@ function createSpindleHarness(options: HarnessOptions = {}) {
           provider: "openai",
         };
       },
+      raw: async (input: Record<string, unknown> & { signal?: AbortSignal }) => {
+        rawCalls.push(input);
+        if (options.rawImpl) {
+          return options.rawImpl(input);
+        }
+        return {
+          content: "Generated reply.",
+          finish_reason: "stop",
+        };
+      },
       rawStream: async function* (input: Record<string, unknown> & { signal?: AbortSignal }) {
         rawStreamCalls.push(input);
         if (options.rawStreamImpl) {
@@ -540,6 +562,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     chatMessages,
     sentFrontend,
     dryRunCalls,
+    rawCalls,
     rawStreamCalls,
     presetGetCalls,
     registerInterceptorCalls,
@@ -3464,6 +3487,7 @@ describe("generation metrics helpers and gg:generation_metrics emission", () => 
     expect(metricEvents[0]?.generationMetrics?.presetName).toBe("Regen Preset");
 
     // Now test non-streaming guided_swipe in background mode
+    const nonStreamParams = { _streaming: false, temperature: 0.5 };
     const nonStreamHarness = createSpindleHarness({
       presets: { "p-regen": { id: "p-regen", name: "Regen Preset" } },
       activePresetId: "p-regen",
@@ -3475,19 +3499,20 @@ describe("generation metrics helpers and gg:generation_metrics emission", () => 
       },
       dryRunImpl: async () => ({
         messages: [{ role: "user", content: "Hi" }],
-        parameters: { _streaming: false },
+        parameters: nonStreamParams,
         model: "gpt-4o",
         provider: "openai",
       }),
-      rawStreamImpl: async function* () {
+      rawImpl: async () => {
         await new Promise((r) => setTimeout(r, 15));
-        yield { type: "token", token: "Second swipe" };
-        yield {
-          type: "done",
+        return {
           content: "Second swipe",
           finish_reason: "stop",
           usage: { prompt_tokens: 5, completion_tokens: 14, total_tokens: 19 },
         };
+      },
+      rawStreamImpl: async function* () {
+        throw new Error("rawStream must not be called when _streaming is false");
       },
     });
     const nonStreamBackend = registerBackend(nonStreamHarness.api);
@@ -3501,6 +3526,11 @@ describe("generation metrics helpers and gg:generation_metrics emission", () => 
       "u1",
     );
 
+    expect(nonStreamHarness.rawCalls).toHaveLength(1);
+    expect(nonStreamHarness.rawStreamCalls).toHaveLength(0);
+    expect(nonStreamHarness.rawCalls[0]?.parameters).toEqual({ temperature: 0.5 });
+    expect("_streaming" in ((nonStreamHarness.rawCalls[0]?.parameters as Record<string, unknown>) ?? {})).toBe(false);
+    expect(nonStreamParams._streaming).toBe(false);
     expect(swipeRes.swipeId).toBe(1);
     metricEvents = nonStreamHarness.sentFrontend
       .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
@@ -6511,5 +6541,297 @@ describe("post-audit polish regression tests (backend)", () => {
     releaseChatGet();
     const pendingRes = await pendingRunPromise;
     expect(pendingRes.aborted).toBe(true);
+  });
+});
+
+describe("non-streaming (_streaming: false) vs streaming generation dispatch", () => {
+  test("streamIntoMessage calls generate.raw when _streaming is false, handles content/reasoning/usage/regex, strips _streaming without mutating dryRun parameters", async () => {
+    const dryRunParams: Record<string, unknown> = { _streaming: false, temperature: 0.65, top_p: 0.9 };
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+      regexScripts: [
+        {
+          id: "rx-resp",
+          script_name: "Replace foo",
+          find_regex: "foo",
+          replace_string: "bar",
+          trim_strings: [],
+          placement: ["ai_output"],
+          target: "response",
+          disabled: false,
+          markdown_only: false,
+          prompt_only: false,
+          run_on_edit: false,
+          substitute_regex: 0,
+          min_depth: null,
+          max_depth: null,
+        } as unknown as RegexScriptDTO,
+      ],
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Hello" }],
+        parameters: dryRunParams,
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async () => ({
+        content: "Answer foo",
+        reasoning: "Thought process",
+        finish_reason: "stop",
+        usage: { prompt_tokens: 10, completion_tokens: 22, total_tokens: 32 },
+      }),
+      rawStreamImpl: async function* () {
+        throw new Error("rawStream must not be called when _streaming is false");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Keep it brief" },
+      "u1",
+    );
+
+    expect(harness.rawCalls).toHaveLength(1);
+    expect(harness.rawStreamCalls).toHaveLength(0);
+    expect(harness.rawCalls[0]?.parameters).toEqual({ temperature: 0.65, top_p: 0.9 });
+    expect("_streaming" in ((harness.rawCalls[0]?.parameters as Record<string, unknown>) ?? {})).toBe(false);
+    expect(dryRunParams).toEqual({ _streaming: false, temperature: 0.65, top_p: 0.9 });
+
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("Answer bar");
+    const msgs = harness.chatMessages.get("chat-1") ?? [];
+    const created = msgs.find((m) => m.id === res.messageId);
+    expect(created?.content).toBe("Answer bar");
+    expect(created?.extra?.reasoning).toBe("Thought process");
+
+    const metricEvents = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:generation_metrics")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:generation_metrics" }>);
+    expect(metricEvents).toHaveLength(1);
+    expect(metricEvents[0]?.tokenCount).toBe(22);
+    expect(metricEvents[0]?.generationMetrics?.wasStreaming).toBe(false);
+    expect(metricEvents[0]?.generationMetrics?.ttft).toBeUndefined();
+    expect(metricEvents[0]?.generationMetrics?.tps).toBeUndefined();
+  });
+
+  test("streamIntoMessage handles AbortError during non-streaming generate.raw and restores regenerated snapshot", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "m1", role: "user", content: "Hello" }),
+          makeMessage({ id: "m2", role: "assistant", content: "Original reply", swipes: ["Original reply"], swipe_id: 0 }),
+        ],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Hello" }],
+        parameters: { _streaming: false },
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async ({ signal }) => {
+        const err = new Error("Aborted");
+        err.name = "AbortError";
+        if (signal?.aborted) throw err;
+        throw err;
+      },
+      rawStreamImpl: async function* () {
+        throw new Error("rawStream must not be called when _streaming is false");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_regenerate", chatId: "chat-1", inputText: "Try again" },
+      "u1",
+    );
+
+    expect(harness.rawCalls).toHaveLength(1);
+    expect(harness.rawStreamCalls).toHaveLength(0);
+    expect(res.aborted).toBe(true);
+    const msgs = harness.chatMessages.get("chat-1") ?? [];
+    expect(msgs.some((m) => m.role === "assistant" && m.content === "Original reply")).toBe(true);
+  });
+
+  test("executeImpersonate calls generate.raw when _streaming is false, applies regex, emits terminal chunk, and handles abort", async () => {
+    const dryRunParams: Record<string, unknown> = { _streaming: false, max_tokens: 120 };
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "assistant", content: "What do you do?" })],
+      },
+      regexScripts: [
+        {
+          id: "rx-imp",
+          script_name: "Clean draft",
+          find_regex: "DRAFT",
+          replace_string: "FINAL",
+          trim_strings: [],
+          placement: ["ai_output"],
+          target: "response",
+          disabled: false,
+          markdown_only: false,
+          prompt_only: false,
+          run_on_edit: false,
+          substitute_regex: 0,
+          min_depth: null,
+          max_depth: null,
+        } as unknown as RegexScriptDTO,
+      ],
+      dryRunImpl: async () => ({
+        messages: [{ role: "assistant", content: "What do you do?" }],
+        parameters: dryRunParams,
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async () => ({
+        content: "I say DRAFT response.",
+        finish_reason: "stop",
+      }),
+      rawStreamImpl: async function* () {
+        throw new Error("rawStream must not be called when _streaming is false");
+      },
+    });
+    const { runner } = registerBackend(harness.api);
+
+    const res = await runner.run(
+      { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Respond boldly" },
+      "u1",
+    );
+
+    expect(harness.rawCalls).toHaveLength(1);
+    expect(harness.rawStreamCalls).toHaveLength(0);
+    expect(harness.rawCalls[0]?.parameters).toEqual({ max_tokens: 120 });
+    expect("_streaming" in ((harness.rawCalls[0]?.parameters as Record<string, unknown>) ?? {})).toBe(false);
+    expect(dryRunParams).toEqual({ _streaming: false, max_tokens: 120 });
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("I say FINAL response.");
+
+    const chunks = harness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:impersonate-chunk")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:impersonate-chunk" }>);
+    expect(chunks).toEqual([
+      {
+        type: "gg:impersonate-chunk",
+        chatId: "chat-1",
+        text: "I say FINAL response.",
+        done: true,
+        aborted: false,
+      },
+    ]);
+
+    // Abort handling on non-streaming impersonate
+    const abortHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "assistant", content: "Hi" })],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "assistant", content: "Hi" }],
+        parameters: { _streaming: false },
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async () => {
+        const err = new Error("Aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+    });
+    const abortBackend = registerBackend(abortHarness.api);
+    const abortRes = await abortBackend.runner.run(
+      { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Outline" },
+      "u1",
+    );
+    expect(abortRes.aborted).toBe(true);
+    expect(abortRes.text).toBe("");
+    const abortChunks = abortHarness.sentFrontend
+      .filter((e) => (e.payload as BackendPushEvent).type === "gg:impersonate-chunk")
+      .map((e) => e.payload as Extract<BackendPushEvent, { type: "gg:impersonate-chunk" }>);
+    expect(abortChunks).toEqual([
+      {
+        type: "gg:impersonate-chunk",
+        chatId: "chat-1",
+        text: "",
+        done: true,
+        aborted: true,
+      },
+    ]);
+  });
+
+  test("honors already-fetched preset samplerOverrides.streaming === false without extra presets RPC and keeps rawStream when streaming is enabled with _streaming stripped", async () => {
+    const presetDryRunParams: Record<string, unknown> = { temperature: 0.8 };
+    const presetHarness = createSpindleHarness({
+      presets: {
+        "p-nostream": {
+          id: "p-nostream",
+          name: "No Stream Preset",
+          parameters: { samplerOverrides: { streaming: false } },
+        },
+      },
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hi" })],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Hi", __isChatHistory: true }],
+        parameters: presetDryRunParams,
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async () => ({
+        content: "Non-streamed preset reply",
+        finish_reason: "stop",
+      }),
+      rawStreamImpl: async function* () {
+        throw new Error("rawStream must not be called when already-fetched preset has streaming: false");
+      },
+    });
+    const presetBackend = registerBackend(presetHarness.api);
+    const s = await presetBackend.store.getSettings("u1");
+    s.actions.guided_response.presetId = "p-nostream";
+    await presetBackend.store.saveSettings(s, "u1");
+
+    const presetRes = await presetBackend.runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Guide" },
+      "u1",
+    );
+    expect(presetRes.text).toBe("Non-streamed preset reply");
+    expect(presetHarness.rawCalls).toHaveLength(1);
+    expect(presetHarness.rawStreamCalls).toHaveLength(0);
+    // Only the single resolvePresetContext presets.get call should occur (no extra RPC).
+    expect(presetHarness.presetGetCalls).toHaveLength(1);
+    expect(presetHarness.rawCalls[0]?.parameters).toEqual({ temperature: 0.8 });
+    expect(presetDryRunParams).toEqual({ temperature: 0.8 });
+
+    // Streaming enabled (_streaming: true) still uses rawStream and strips _streaming
+    const streamParams: Record<string, unknown> = { _streaming: true, temperature: 0.7 };
+    const streamHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hi" })],
+      },
+      dryRunImpl: async () => ({
+        messages: [{ role: "user", content: "Hi" }],
+        parameters: streamParams,
+        model: "gpt-4o",
+        provider: "openai",
+      }),
+      rawImpl: async () => {
+        throw new Error("raw must not be called when streaming is enabled");
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Streamed " };
+        yield { type: "token", token: "reply" };
+        yield { type: "done", content: "Streamed reply", finish_reason: "stop" };
+      },
+    });
+    const streamBackend = registerBackend(streamHarness.api);
+    const streamRes = await streamBackend.runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Stream it" },
+      "u1",
+    );
+    expect(streamRes.text).toBe("Streamed reply");
+    expect(streamHarness.rawStreamCalls).toHaveLength(1);
+    expect(streamHarness.rawCalls).toHaveLength(0);
+    expect(streamHarness.rawStreamCalls[0]?.parameters).toEqual({ temperature: 0.7 });
+    expect("_streaming" in ((streamHarness.rawStreamCalls[0]?.parameters as Record<string, unknown>) ?? {})).toBe(false);
+    expect(streamParams).toEqual({ _streaming: true, temperature: 0.7 });
   });
 });

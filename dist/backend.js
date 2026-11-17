@@ -2335,6 +2335,35 @@ var STREAM_FLUSH_INTERVAL_MS = 120;
 function isAbortError(error) {
   return error instanceof Error && error.name === "AbortError";
 }
+function extractPresetStreamingOverride(preset) {
+  const overrides = preset?.parameters?.samplerOverrides;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+    return;
+  }
+  const streaming = overrides.streaming;
+  return typeof streaming === "boolean" ? streaming : undefined;
+}
+function prepareOutboundGenerationInput(rawInput) {
+  const params = rawInput.parameters;
+  const wasStreaming = params?._streaming !== false;
+  if (!params) {
+    return { wasStreaming, outboundInput: rawInput };
+  }
+  const { _streaming: _omitted, ...sanitizedParameters } = params;
+  return {
+    wasStreaming,
+    outboundInput: {
+      ...rawInput,
+      parameters: sanitizedParameters
+    }
+  };
+}
+function asGenerationResponse(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  return raw;
+}
 
 class GuidedGenerationRunner {
   spindle;
@@ -2840,6 +2869,7 @@ class GuidedGenerationRunner {
           connectionId,
           resolvedConnection,
           resolvedPresetId,
+          presetStreaming: presetContext.presetStreaming,
           dryRunResult,
           capturedMessages,
           signal: controller.signal,
@@ -3137,6 +3167,7 @@ class GuidedGenerationRunner {
           connectionId,
           resolvedConnection,
           resolvedPresetId,
+          presetStreaming: presetContext.presetStreaming,
           dryRunResult: dryRunCapture.result,
           capturedMessages: dryRunCapture.capturedMessages,
           signal: controller.signal,
@@ -3261,6 +3292,7 @@ class GuidedGenerationRunner {
       connectionId,
       resolvedConnection,
       resolvedPresetId,
+      presetStreaming,
       dryRunResult,
       capturedMessages,
       signal,
@@ -3393,10 +3425,12 @@ class GuidedGenerationRunner {
       });
       return processed.content;
     } : undefined;
+    const rawParams = dryRunResult.parameters;
+    const parameters = presetStreaming === false && rawParams?._streaming === undefined ? { ...rawParams ?? {}, _streaming: false } : rawParams;
     const rawInput = {
       type: "raw",
       messages,
-      parameters: dryRunResult.parameters,
+      parameters,
       ...connectionId ? { connection_id: connectionId } : {},
       ...provider ? { provider } : {},
       ...model ? { model } : {},
@@ -3646,7 +3680,12 @@ class GuidedGenerationRunner {
         if (!preverifiedPreset)
           return { presetId: null };
         const name = typeof preverifiedPreset.name === "string" && preverifiedPreset.name.trim() ? preverifiedPreset.name.trim() : undefined;
-        return { presetId: trimmedConfigured, ...name ? { presetName: name } : {} };
+        const presetStreaming = extractPresetStreamingOverride(preverifiedPreset);
+        return {
+          presetId: trimmedConfigured,
+          ...name ? { presetName: name } : {},
+          ...presetStreaming !== undefined ? { presetStreaming } : {}
+        };
       }
       if (typeof this.spindle.presets?.get === "function") {
         try {
@@ -3654,7 +3693,12 @@ class GuidedGenerationRunner {
           if (!preset)
             return { presetId: null };
           const name = typeof preset.name === "string" && preset.name.trim() ? preset.name.trim() : undefined;
-          return { presetId: trimmedConfigured, ...name ? { presetName: name } : {} };
+          const presetStreaming = extractPresetStreamingOverride(preset);
+          return {
+            presetId: trimmedConfigured,
+            ...name ? { presetName: name } : {},
+            ...presetStreaming !== undefined ? { presetStreaming } : {}
+          };
         } catch {
           return { presetId: null };
         }
@@ -4161,6 +4205,7 @@ class GuidedGenerationRunner {
     };
   }
   async executeImpersonate(runId, chatId, rawInput, signal, userId, transformOutput) {
+    const { wasStreaming, outboundInput } = prepareOutboundGenerationInput(rawInput);
     if (signal.aborted) {
       this.emitFrontend({ type: "gg:impersonate-chunk", chatId, text: "", done: true, aborted: true }, userId);
       return {
@@ -4176,21 +4221,33 @@ class GuidedGenerationRunner {
     let aborted = false;
     try {
       try {
-        for await (const chunk of this.spindle.generate.rawStream(rawInput)) {
+        if (wasStreaming) {
+          for await (const chunk of this.spindle.generate.rawStream(outboundInput)) {
+            if (signal.aborted) {
+              aborted = true;
+              break;
+            }
+            if (chunk.type === "token") {
+              generated += chunk.token;
+              const now = Date.now();
+              if (now - lastEmitAt >= STREAM_FLUSH_INTERVAL_MS) {
+                lastEmitAt = now;
+                this.emitFrontend({ type: "gg:impersonate-chunk", chatId, text: generated, done: false }, userId);
+              }
+            } else if (chunk.type === "done") {
+              if (chunk.content)
+                generated = chunk.content;
+            }
+          }
+        } else {
+          const rawResponse = await this.spindle.generate.raw(outboundInput);
           if (signal.aborted) {
             aborted = true;
-            break;
-          }
-          if (chunk.type === "token") {
-            generated += chunk.token;
-            const now = Date.now();
-            if (now - lastEmitAt >= STREAM_FLUSH_INTERVAL_MS) {
-              lastEmitAt = now;
-              this.emitFrontend({ type: "gg:impersonate-chunk", chatId, text: generated, done: false }, userId);
+          } else {
+            const response = asGenerationResponse(rawResponse);
+            if (typeof response.content === "string") {
+              generated = response.content;
             }
-          } else if (chunk.type === "done") {
-            if (chunk.content)
-              generated = chunk.content;
           }
         }
       } catch (error) {
@@ -4387,7 +4444,7 @@ class GuidedGenerationRunner {
         onFirstContent?.();
       }
     };
-    const wasStreaming = rawInput.parameters?._streaming !== false;
+    const { wasStreaming, outboundInput } = prepareOutboundGenerationInput(rawInput);
     let streamingStartedAt = Date.now();
     let firstTokenAt;
     let firstContentTokenAt;
@@ -4396,54 +4453,77 @@ class GuidedGenerationRunner {
     let completedAt;
     let streamUsage;
     try {
-      const stream = this.spindle.generate.rawStream(rawInput);
-      streamingStartedAt = Date.now();
-      for await (const chunk of stream) {
-        if (signal.aborted) {
-          aborted = true;
-          break;
-        }
-        if (chunk.type === "token") {
-          const receivedAt = Date.now();
-          if (chunk.token.length > 0) {
-            if (firstTokenAt === undefined) {
+      if (wasStreaming) {
+        const stream = this.spindle.generate.rawStream(outboundInput);
+        streamingStartedAt = Date.now();
+        for await (const chunk of stream) {
+          if (signal.aborted) {
+            aborted = true;
+            break;
+          }
+          if (chunk.type === "token") {
+            const receivedAt = Date.now();
+            if (chunk.token.length > 0) {
+              if (firstTokenAt === undefined) {
+                firstTokenAt = receivedAt;
+              }
+              if (firstContentTokenAt === undefined && /\S/.test(chunk.token)) {
+                firstContentTokenAt = receivedAt;
+              }
+            }
+            lastProviderContentAt = receivedAt;
+            deltaText += chunk.token;
+            await ensureInitializedOnOutput();
+            maybeFlush(false);
+          } else if (chunk.type === "reasoning") {
+            const receivedAt = Date.now();
+            if (reasoningStartedAt === undefined) {
+              reasoningStartedAt = receivedAt;
+            }
+            reasoningEndedAt = receivedAt;
+            if (chunk.token.length > 0 && firstTokenAt === undefined) {
               firstTokenAt = receivedAt;
             }
-            if (firstContentTokenAt === undefined && /\S/.test(chunk.token)) {
-              firstContentTokenAt = receivedAt;
+            reasoningText += chunk.token;
+            await ensureInitializedOnOutput();
+            maybeFlush(false);
+          } else if (chunk.type === "done") {
+            if (chunk.content)
+              deltaText = chunk.content;
+            if (chunk.reasoning)
+              reasoningText = chunk.reasoning;
+            if (chunk.usage) {
+              streamUsage = chunk.usage;
             }
+            await ensureInitializedOnOutput();
           }
-          lastProviderContentAt = receivedAt;
-          deltaText += chunk.token;
-          await ensureInitializedOnOutput();
-          maybeFlush(false);
-        } else if (chunk.type === "reasoning") {
-          const receivedAt = Date.now();
-          if (reasoningStartedAt === undefined) {
-            reasoningStartedAt = receivedAt;
-          }
-          reasoningEndedAt = receivedAt;
-          if (chunk.token.length > 0 && firstTokenAt === undefined) {
-            firstTokenAt = receivedAt;
-          }
-          reasoningText += chunk.token;
-          await ensureInitializedOnOutput();
-          maybeFlush(false);
-        } else if (chunk.type === "done") {
-          if (chunk.content)
-            deltaText = chunk.content;
-          if (chunk.reasoning)
-            reasoningText = chunk.reasoning;
-          if (chunk.usage) {
-            streamUsage = chunk.usage;
-          }
-          await ensureInitializedOnOutput();
         }
-      }
-      if (!aborted && !signal.aborted) {
-        responseStoppedAt = Math.max(Date.now(), lastProviderContentAt ?? 0);
+        if (!aborted && !signal.aborted) {
+          responseStoppedAt = Math.max(Date.now(), lastProviderContentAt ?? 0);
+        } else if (signal.aborted) {
+          aborted = true;
+        }
       } else if (signal.aborted) {
         aborted = true;
+      } else {
+        streamingStartedAt = Date.now();
+        const rawResponse = await this.spindle.generate.raw(outboundInput);
+        if (signal.aborted) {
+          aborted = true;
+        } else {
+          const response = asGenerationResponse(rawResponse);
+          if (typeof response.content === "string" && response.content.length > 0) {
+            deltaText = response.content;
+          }
+          if (typeof response.reasoning === "string" && response.reasoning.length > 0) {
+            reasoningText = response.reasoning;
+          }
+          if (response.usage && typeof response.usage === "object" && !Array.isArray(response.usage)) {
+            streamUsage = response.usage;
+          }
+          await ensureInitializedOnOutput();
+          responseStoppedAt = Date.now();
+        }
       }
     } catch (error) {
       if (isAbortError(error) || signal.aborted) {

@@ -113,6 +113,8 @@ interface HarnessOptions {
     preset_id?: string | null;
     is_default: boolean;
   }>;
+  connectionsListThrows?: boolean;
+  presetsListThrows?: boolean;
   updateMessageImpl?: (
     chatId: string,
     messageId: string,
@@ -156,8 +158,11 @@ function createSpindleHarness(options: HarnessOptions = {}) {
   const rawCalls: Array<Record<string, unknown>> = [];
   const rawStreamCalls: Array<Record<string, unknown>> = [];
   const presetGetCalls: Array<{ id: string; userId?: string }> = [];
+  const connectionListCalls: Array<{ userId?: string }> = [];
+  const presetListCalls: Array<Record<string, unknown> | undefined> = [];
   const registerInterceptorCalls: Array<{ options?: unknown; priority?: unknown }> = [];
   const registeredInterceptors: InterceptorHandler[] = [];
+  let unregisterInterceptorCount = 0;
   const regexGetActiveCalls: Array<Record<string, unknown>> = [];
   const macroResolveCalls: Array<{ template: string; opts?: Record<string, unknown> }> = [];
   const countTextCalls: Array<{ text: string; opts?: Record<string, unknown> }> = [];
@@ -239,16 +244,23 @@ function createSpindleHarness(options: HarnessOptions = {}) {
       },
     },
     connections: {
-      list: async () =>
-        options.connections ?? [
-          {
-            id: "conn-1",
-            name: "Primary",
-            provider: "openai",
-            model: "gpt-4o",
-            is_default: true,
-          },
-        ],
+      list: async (userId?: string) => {
+        connectionListCalls.push({ userId });
+        if (options.connectionsListThrows) {
+          throw new Error("connections list failed");
+        }
+        return (
+          options.connections ?? [
+            {
+              id: "conn-1",
+              name: "Primary",
+              provider: "openai",
+              model: "gpt-4o",
+              is_default: true,
+            },
+          ]
+        );
+      },
     },
     ...(options.countTextImpl
       ? {
@@ -261,10 +273,16 @@ function createSpindleHarness(options: HarnessOptions = {}) {
         }
       : {}),
     presets: {
-      list: async () => ({
-        data: Object.values(options.presets ?? { "p-1": { id: "p-1", name: "Default" } }),
-        total: Object.keys(options.presets ?? { "p-1": true }).length,
-      }),
+      list: async (opts?: Record<string, unknown>) => {
+        presetListCalls.push(opts);
+        if (options.presetsListThrows) {
+          throw new Error("presets list failed");
+        }
+        return {
+          data: Object.values(options.presets ?? { "p-1": { id: "p-1", name: "Default" } }),
+          total: Object.keys(options.presets ?? { "p-1": true }).length,
+        };
+      },
       get: async (id: string, userId?: string) => {
         presetGetCalls.push({ id, userId });
         return options.presets?.[id] ?? null;
@@ -310,6 +328,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
       });
       registeredInterceptors.push(handler);
       return () => {
+        unregisterInterceptorCount += 1;
         const idx = registeredInterceptors.indexOf(handler);
         if (idx >= 0) registeredInterceptors.splice(idx, 1);
       };
@@ -565,8 +584,14 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     rawCalls,
     rawStreamCalls,
     presetGetCalls,
+    connectionListCalls,
+    presetListCalls,
     registerInterceptorCalls,
     registeredInterceptors,
+    getUnregisterInterceptorCount: () => unregisterInterceptorCount,
+    setPermission: (perm: keyof typeof perms, granted: boolean) => {
+      perms[perm] = granted;
+    },
     regexGetActiveCalls,
     macroResolveCalls,
     countTextCalls,
@@ -1208,13 +1233,14 @@ describe("backend handleRpc orchestration", () => {
       "Draft 1",
     ]);
 
-    // Events forward gg:changed cleanly.
+    // Permission changes forward gg:changed; CHAT_SWITCHED/CHAT_CHANGED do not trigger backend gg:changed churn.
     harness.triggerEvent("CHAT_SWITCHED", {}, "user-1");
+    harness.triggerEvent("CHAT_CHANGED", {}, "user-1");
     harness.triggerPermissionsChanged();
     const changedReasons = harness.sentFrontend
       .filter((m) => (m.payload as BackendPushEvent).type === "gg:changed")
       .map((m) => (m.payload as BackendPushEvent).reason);
-    expect(changedReasons).toEqual(["chat_switched", "permissions"]);
+    expect(changedReasons).toEqual(["permissions"]);
   });
 
   test("bootstrap exposes regex_scripts/interceptor permissions and normalizeSettings defaults legacy action configs", () => {
@@ -1265,6 +1291,7 @@ describe("backend handleRpc orchestration", () => {
   });
 
   test("captures dry-run interceptor messages with dryRun=true quirk, places guidance by preset position, and strips swipe by captured sourceMessageId", async () => {
+    let liveResult: Awaited<ReturnType<InterceptorHandler>> | undefined;
     const harness = createSpindleHarness({
       chats: {
         "chat-1": [
@@ -1298,25 +1325,36 @@ describe("backend handleRpc orchestration", () => {
           { role: "system", content: "Post-History Rules", __isChatHistory: false },
         ],
       },
-      dryRunImpl: async () => ({
-        messages: [
-          { role: "system", content: "Main Prompt" },
-          { role: "user", content: "Hello" },
-          { role: "assistant", content: "Rejected old swipe" },
-          { role: "system", content: "Post-History Rules" },
-        ],
-        // Deliberately omit sourceMessageId & __isChatHistory from request_messages
-        // so the runner must rely on the dry-run interceptor capture.
-        request_messages: [
-          { role: "system", content: "Main Prompt" },
-          { role: "user", content: "Hello" },
-          { role: "assistant", content: "Rejected old swipe" },
-          { role: "system", content: "Post-History Rules" },
-        ],
-        parameters: {},
-        model: "gpt-4o",
-        provider: "openai",
-      }),
+      dryRunImpl: async () => {
+        // Non-dry-run interceptor calls during an active dryRun must pass through untouched and not clobber captures
+        if (liveResult === undefined) {
+          liveResult = await harness.registeredInterceptors[0]!(
+            [{ role: "user", content: "Live call" }],
+            { chatId: "chat-1", isDryRun: false, dryRun: false } as unknown as Parameters<
+              InterceptorHandler
+            >[1],
+          );
+        }
+        return {
+          messages: [
+            { role: "system", content: "Main Prompt" },
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Rejected old swipe" },
+            { role: "system", content: "Post-History Rules" },
+          ],
+          // Deliberately omit sourceMessageId & __isChatHistory from request_messages
+          // so the runner must rely on the dry-run interceptor capture.
+          request_messages: [
+            { role: "system", content: "Main Prompt" },
+            { role: "user", content: "Hello" },
+            { role: "assistant", content: "Rejected old swipe" },
+            { role: "system", content: "Post-History Rules" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
     });
 
     const store = new SettingsStore(harness.api);
@@ -1331,9 +1369,12 @@ describe("backend handleRpc orchestration", () => {
       "u1",
     );
 
-    // Must NOT register with match: { isDryRun: true } (which fails on Lumiverse's dryRun: true quirk)
+    // Must NOT register with match: { isDryRun: true } (which fails on Lumiverse's dryRun: true quirk),
+    // and must unregister after dryRun completes.
     expect(harness.registerInterceptorCalls.length).toBe(1);
     expect(harness.registerInterceptorCalls[0]?.options).toBeUndefined();
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(liveResult).toEqual([{ role: "user", content: "Live call" }]);
 
     // Rejected m2 stripped via captured sourceMessageId; guidance injected before Post-History Rules
     const swipeMessages = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
@@ -1346,20 +1387,13 @@ describe("backend handleRpc orchestration", () => {
     // Internal __isChatHistory flag is stripped before sending to rawStream
     expect(swipeMessages.every((m) => m.__isChatHistory === undefined)).toBe(true);
 
-    // Non-dry-run interceptor calls must pass through untouched and not clobber captures
-    const liveResult = await harness.registeredInterceptors[0]!(
-      [{ role: "user", content: "Live call" }],
-      { chatId: "chat-1", isDryRun: false, dryRun: false } as unknown as Parameters<
-        InterceptorHandler
-      >[1],
-    );
-    expect(liveResult).toEqual([{ role: "user", content: "Live call" }]);
-
     // pre_history places guidance right before first chat_history turn
     await runner.run(
       { actionId: "guided_response", chatId: "chat-1", inputText: "Set tone" },
       "u1",
     );
+    expect(harness.registerInterceptorCalls.length).toBe(2);
+    expect(harness.registeredInterceptors).toHaveLength(0);
     const responseMessages = harness.rawStreamCalls[1]?.messages as LlmMessageDTO[];
     expect(responseMessages.map((m) => m.content)).toEqual([
       "Main Prompt",
@@ -5288,11 +5322,13 @@ describe("audit regression tests (backend)", () => {
       },
     });
     const { runner: swipeNoneRunner } = registerBackend(swipeNoneHarness.api);
-    expect(swipeNoneHarness.registerInterceptorCalls).toHaveLength(1);
+    expect(swipeNoneHarness.registerInterceptorCalls).toHaveLength(0);
     await swipeNoneRunner.run(
       { actionId: "guided_swipe", chatId: "chat-1", inputText: "", backgroundSwipe: false },
       "u1",
     );
+    expect(swipeNoneHarness.registerInterceptorCalls).toHaveLength(1);
+    expect(swipeNoneHarness.registeredInterceptors).toHaveLength(0);
     expect(swipeNoneCapturedLen).toBe(38);
     expect(swipeNoneRequestLen).toBe(38);
     expect(swipeNoneSent.map((m) => `${m.role}:${m.content}`)).toEqual(expectedBaseNone);
@@ -6833,5 +6869,510 @@ describe("non-streaming (_streaming: false) vs streaming generation dispatch", (
     expect(streamHarness.rawStreamCalls[0]?.parameters).toEqual({ temperature: 0.7 });
     expect("_streaming" in ((streamHarness.rawStreamCalls[0]?.parameters as Record<string, unknown>) ?? {})).toBe(false);
     expect(streamParams).toEqual({ _streaming: true, temperature: 0.7 });
+  });
+});
+
+describe("performance optimization regressions (backend)", () => {
+  test("registerBackend does not register an interceptor eagerly at startup or on idle sync", () => {
+    const harness = createSpindleHarness({
+      permissions: { interceptor: true },
+    });
+    const { runner, dispose } = registerBackend(harness.api);
+
+    expect(harness.registerInterceptorCalls).toHaveLength(0);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(0);
+
+    runner.syncInterceptorRegistration();
+    expect(harness.registerInterceptorCalls).toHaveLength(0);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+
+    dispose();
+  });
+
+  test("run_action registers interceptor before dryRun, captures messages, and unregisters in finally on both success and dryRun error", async () => {
+    let shouldFailDryRun = false;
+    let activeDuringDryRun: number[] = [];
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+      interceptorMessagesByChat: {
+        "chat-1": [
+          { role: "system", content: "Captured Main", __isChatHistory: false },
+          {
+            role: "user",
+            content: "Hello",
+            __isChatHistory: true,
+            sourceMessageId: "m1",
+            sourceIndexInChat: 0,
+          },
+          { role: "system", content: "Captured Post", __isChatHistory: false },
+        ],
+      },
+      dryRunImpl: async () => {
+        activeDuringDryRun.push(harness.registeredInterceptors.length);
+        if (shouldFailDryRun) {
+          throw new Error("dryRun boom");
+        }
+        return {
+          messages: [
+            { role: "system", content: "Captured Main" },
+            { role: "user", content: "Hello" },
+            { role: "system", content: "Captured Post" },
+          ],
+          request_messages: [
+            { role: "system", content: "Captured Main" },
+            { role: "user", content: "Hello" },
+            { role: "system", content: "Captured Post" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+    });
+
+    const { handleRpc } = registerBackend(harness.api);
+    expect(harness.registerInterceptorCalls).toHaveLength(0);
+
+    // 1. Success path
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "run-ok",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-1", inputText: "Keep it tense" },
+      },
+      "u1",
+    );
+
+    const okReply = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "run-ok",
+    )?.payload as RpcReplyEnvelope;
+    expect(okReply.error).toBeUndefined();
+    expect(activeDuringDryRun).toEqual([1]);
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(1);
+
+    const sentMsgs = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
+    expect(sentMsgs.map((m) => m.content)).toEqual([
+      "Captured Main",
+      "Hello",
+      "[OOC Guidance for the next response: Keep it tense]",
+      "Captured Post",
+    ]);
+
+    // 2. dryRun error path
+    shouldFailDryRun = true;
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "run-err",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-1", inputText: "Trigger error" },
+      },
+      "u1",
+    );
+
+    const errReply = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "run-err",
+    )?.payload as RpcReplyEnvelope;
+    expect(errReply.error).toContain("dryRun boom");
+    expect(activeDuringDryRun).toEqual([1, 1]);
+    expect(harness.registerInterceptorCalls).toHaveLength(2);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(2);
+  });
+
+  test("concurrent run_action dry-runs on two different chats share 1 interceptor registration and unregister only after both finish", async () => {
+    let resolveEnteredA!: () => void;
+    let resolveReleaseA!: () => void;
+    let resolveEnteredB!: () => void;
+    let resolveReleaseB!: () => void;
+    const enteredA = new Promise<void>((r) => {
+      resolveEnteredA = r;
+    });
+    const releaseA = new Promise<void>((r) => {
+      resolveReleaseA = r;
+    });
+    const enteredB = new Promise<void>((r) => {
+      resolveEnteredB = r;
+    });
+    const releaseB = new Promise<void>((r) => {
+      resolveReleaseB = r;
+    });
+
+    const sentByFirstPrompt: Record<string, string[]> = {};
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-a": [makeMessage({ id: "ma-1", chat_id: "chat-a", role: "user", content: "Hi A" })],
+        "chat-b": [makeMessage({ id: "mb-1", chat_id: "chat-b", role: "user", content: "Hi B" })],
+      },
+      interceptorMessagesByChat: {
+        "chat-a": [
+          { role: "system", content: "Main A", __isChatHistory: false },
+          {
+            role: "user",
+            content: "Hi A",
+            __isChatHistory: true,
+            sourceMessageId: "ma-1",
+            sourceIndexInChat: 0,
+          },
+          { role: "system", content: "Post A", __isChatHistory: false },
+        ],
+      },
+      dryRunImpl: async (input, userId) => {
+        const chatId = String(input.chatId);
+        if (chatId === "chat-a") {
+          resolveEnteredA();
+          await releaseA;
+          return {
+            messages: [
+              { role: "system", content: "Main A" },
+              { role: "user", content: "Hi A" },
+              { role: "system", content: "Post A" },
+            ],
+            request_messages: [
+              { role: "system", content: "Main A" },
+              { role: "user", content: "Hi A" },
+              { role: "system", content: "Post A" },
+            ],
+            parameters: {},
+            model: "gpt-4o",
+            provider: "openai",
+          };
+        }
+        resolveEnteredB();
+        await releaseB;
+        // Invoke the shared interceptor AFTER chat-a has already finished to verify it stayed registered.
+        expect(harness.registeredInterceptors).toHaveLength(1);
+        await harness.registeredInterceptors[0]!(
+          [
+            { role: "system", content: "Main B", __isChatHistory: false } as LlmMessageDTO,
+            {
+              role: "user",
+              content: "Hi B",
+              __isChatHistory: true,
+              sourceMessageId: "mb-1",
+              sourceIndexInChat: 0,
+            } as LlmMessageDTO,
+            { role: "system", content: "Post B", __isChatHistory: false } as LlmMessageDTO,
+          ],
+          {
+            userId: userId ?? "u1",
+            chatId: "chat-b",
+            generationType: (input.generationType as string) ?? "normal",
+            dryRun: true,
+            isDryRun: false,
+            presetId: (input.presetId as string) ?? null,
+          } as unknown as Parameters<InterceptorHandler>[1],
+        );
+        return {
+          messages: [
+            { role: "system", content: "Main B" },
+            { role: "user", content: "Hi B" },
+            { role: "system", content: "Post B" },
+          ],
+          request_messages: [
+            { role: "system", content: "Main B" },
+            { role: "user", content: "Hi B" },
+            { role: "system", content: "Post B" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* (input) {
+        const msgs = (input.messages as LlmMessageDTO[]) ?? [];
+        const contents = msgs.map((m) => String(m.content));
+        if (contents.includes("Main A")) {
+          sentByFirstPrompt["chat-a"] = contents;
+        } else if (contents.includes("Main B")) {
+          sentByFirstPrompt["chat-b"] = contents;
+        }
+        yield { type: "token", token: "OK" };
+        yield { type: "done", content: "OK", finish_reason: "stop" };
+      },
+    });
+
+    const { handleRpc } = registerBackend(harness.api);
+
+    const runA = handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "req-a",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-a", inputText: "Guide A" },
+      },
+      "u1",
+    );
+    await enteredA;
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(1);
+
+    const runB = handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "req-b",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-b", inputText: "Guide B" },
+      },
+      "u1",
+    );
+    await enteredB;
+    // Both concurrent dry-runs share a single interceptor registration.
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(1);
+
+    // Finish chat-a completely while chat-b dry-run is still active.
+    resolveReleaseA();
+    await runA;
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(1);
+    expect(harness.getUnregisterInterceptorCount()).toBe(0);
+
+    // Now finish chat-b; the shared interceptor must unregister.
+    resolveReleaseB();
+    await runB;
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(1);
+
+    expect(sentByFirstPrompt["chat-a"]).toEqual([
+      "Main A",
+      "Hi A",
+      "[OOC Guidance for the next response: Guide A]",
+      "Post A",
+    ]);
+    expect(sentByFirstPrompt["chat-b"]).toEqual([
+      "Main B",
+      "Hi B",
+      "[OOC Guidance for the next response: Guide B]",
+      "Post B",
+    ]);
+  });
+
+  test("permission revocation mid-dryRun unregisters immediately, re-grant while idle does not eagerly register, and dispose guards against late registration", async () => {
+    let resolveEntered!: () => void;
+    let resolveRelease!: () => void;
+    const entered = new Promise<void>((r) => {
+      resolveEntered = r;
+    });
+    const release = new Promise<void>((r) => {
+      resolveRelease = r;
+    });
+    let pauseFirstDryRun = true;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "m1", role: "user", content: "Hello" })],
+      },
+      dryRunImpl: async () => {
+        if (pauseFirstDryRun) {
+          pauseFirstDryRun = false;
+          resolveEntered();
+          await release;
+        }
+        return {
+          messages: [{ role: "user", content: "Hello" }],
+          request_messages: [{ role: "user", content: "Hello", __isChatHistory: true }],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+    });
+
+    const { handleRpc, runner, dispose } = registerBackend(harness.api);
+
+    const runPromise = handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "perm-run-1",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-1", inputText: "Guide 1" },
+      },
+      "u1",
+    );
+
+    await entered;
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(1);
+    const savedHandler = harness.registeredInterceptors[0]!;
+
+    // Revoke interceptor permission mid-dryRun -> must unregister immediately.
+    harness.setPermission("interceptor", false);
+    harness.triggerPermissionsChanged();
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(1);
+
+    // Let dryRun complete; finally must handle already-disposed interceptor cleanly.
+    resolveRelease();
+    await runPromise;
+    const reply1 = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "perm-run-1",
+    )?.payload as RpcReplyEnvelope;
+    expect(reply1.error).toBeUndefined();
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(1);
+
+    // Re-grant interceptor permission while idle -> must NOT eagerly register.
+    harness.setPermission("interceptor", true);
+    harness.triggerPermissionsChanged();
+    expect(harness.registerInterceptorCalls).toHaveLength(1);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+
+    // Next run registers on-demand and unregisters on completion.
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "perm-run-2",
+        action: "run_action",
+        input: { actionId: "guided_response", chatId: "chat-1", inputText: "Guide 2" },
+      },
+      "u1",
+    );
+    expect(harness.registerInterceptorCalls).toHaveLength(2);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    expect(harness.getUnregisterInterceptorCount()).toBe(2);
+
+    // After dispose(), syncInterceptorRegistration and callback pass through safely without registering.
+    dispose();
+    runner.syncInterceptorRegistration();
+    expect(harness.registerInterceptorCalls).toHaveLength(2);
+    expect(harness.registeredInterceptors).toHaveLength(0);
+    const passthrough = await savedHandler(
+      [{ role: "user", content: "Late call" }],
+      { chatId: "chat-1", dryRun: true, isDryRun: true } as unknown as Parameters<
+        InterceptorHandler
+      >[1],
+    );
+    expect(passthrough).toEqual([{ role: "user", content: "Late call" }]);
+  });
+
+  test("CHAT_SWITCHED and CHAT_CHANGED do not register backend listeners or emit gg:changed", () => {
+    const harness = createSpindleHarness();
+    const { dispose } = registerBackend(harness.api);
+
+    expect(harness.getEventHandlerCount("CHAT_SWITCHED")).toBe(0);
+    expect(harness.getEventHandlerCount("CHAT_CHANGED")).toBe(0);
+
+    harness.triggerEvent("CHAT_SWITCHED", { chatId: "chat-1" }, "u1");
+    harness.triggerEvent("CHAT_CHANGED", { chatId: "chat-1" }, "u1");
+
+    const chatChangedPushes = harness.sentFrontend.filter(
+      (m) => (m.payload as BackendPushEvent).type === "gg:changed",
+    );
+    expect(chatChangedPushes).toHaveLength(0);
+
+    // Permissions changes still emit gg:changed.
+    harness.triggerPermissionsChanged();
+    const afterPerms = harness.sentFrontend
+      .filter((m) => (m.payload as BackendPushEvent).type === "gg:changed")
+      .map((m) => (m.payload as BackendPushEvent).reason);
+    expect(afterPerms).toEqual(["permissions"]);
+
+    dispose();
+  });
+
+  test("get_bootstrap skips connections.list and presets.list when includeCatalogs is false, and loads them when omitted or true", async () => {
+    const harness = createSpindleHarness({
+      connections: [
+        {
+          id: "conn-a",
+          name: "Alpha",
+          provider: "openai",
+          model: "gpt-4o",
+          is_default: true,
+        },
+      ],
+      presets: {
+        "preset-a": { id: "preset-a", name: "Preset Alpha" },
+      },
+    });
+    const { handleRpc } = registerBackend(harness.api);
+
+    // 1. includeCatalogs: false -> skips both catalog RPCs
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "boot-no-cat",
+        action: "get_bootstrap",
+        input: { includeCatalogs: false },
+      },
+      "u1",
+    );
+    const noCatReply = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "boot-no-cat",
+    )?.payload as RpcReplyEnvelope;
+    const noCatView = noCatReply.result as ExtensionBootstrapView;
+    expect(harness.connectionListCalls).toHaveLength(0);
+    expect(harness.presetListCalls).toHaveLength(0);
+    expect(noCatView.connections).toEqual([]);
+    expect(noCatView.presets).toEqual([]);
+    expect(noCatView.catalogWarnings).toBeUndefined();
+    expect(noCatView.settings.version).toBeGreaterThan(0);
+    expect(noCatView.permissions.generation).toBe(true);
+
+    // 2. Omitted input -> backwards-compatible default loads catalogs
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "boot-default",
+        action: "get_bootstrap",
+      },
+      "u1",
+    );
+    const defaultReply = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "boot-default",
+    )?.payload as RpcReplyEnvelope;
+    const defaultView = defaultReply.result as ExtensionBootstrapView;
+    expect(harness.connectionListCalls).toHaveLength(1);
+    expect(harness.presetListCalls).toHaveLength(1);
+    expect(defaultView.connections).toHaveLength(1);
+    expect(defaultView.connections[0]?.id).toBe("conn-a");
+    expect(defaultView.presets).toEqual([{ id: "preset-a", name: "Preset Alpha" }]);
+
+    // 3. Explicit includeCatalogs: true -> loads catalogs
+    await handleRpc(
+      {
+        type: "gg:rpc",
+        requestId: "boot-true",
+        action: "get_bootstrap",
+        input: { includeCatalogs: true },
+      },
+      "u1",
+    );
+    const trueReply = harness.sentFrontend.find(
+      (m) => (m.payload as RpcReplyEnvelope).requestId === "boot-true",
+    )?.payload as RpcReplyEnvelope;
+    const trueView = trueReply.result as ExtensionBootstrapView;
+    expect(harness.connectionListCalls).toHaveLength(2);
+    expect(harness.presetListCalls).toHaveLength(2);
+    expect(trueView.connections).toHaveLength(1);
+    expect(trueView.presets).toHaveLength(1);
+
+    // 4. When catalog endpoints throw, includeCatalogs: false omits catalogWarnings without invoking them
+    const failingHarness = createSpindleHarness({
+      connectionsListThrows: true,
+      presetsListThrows: true,
+    });
+    const { buildBootstrapView } = registerBackend(failingHarness.api);
+    const skippedView = await buildBootstrapView("u1", { includeCatalogs: false });
+    expect(failingHarness.connectionListCalls).toHaveLength(0);
+    expect(failingHarness.presetListCalls).toHaveLength(0);
+    expect(skippedView.connections).toEqual([]);
+    expect(skippedView.presets).toEqual([]);
+    expect(skippedView.catalogWarnings).toBeUndefined();
+
+    const loadedView = await buildBootstrapView("u1");
+    expect(failingHarness.connectionListCalls).toHaveLength(1);
+    expect(failingHarness.presetListCalls).toHaveLength(1);
+    expect(loadedView.catalogWarnings).toHaveLength(2);
   });
 });

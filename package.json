@@ -1,10 +1,10 @@
 {
   "name": "lumiverse-guided-generations",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js && bun build src/backend.ts --target bun --outfile dist/backend.js",
+    "build": "bun build src/frontend.ts --target browser --minify --outfile dist/frontend.js && bun build src/backend.ts --target bun --minify --outfile dist/backend.js",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests"
   },

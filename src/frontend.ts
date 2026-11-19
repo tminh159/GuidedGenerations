@@ -144,6 +144,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let isPreChatLaunching = false;
   const launchingChats = new Set<string>();
   let view: ExtensionBootstrapView | null = null;
+  let drawerMounted = false;
+  let catalogsLoaded = false;
+  let stopObservingTabConnection: (() => void) | null = null;
   let activeRun: ActiveRunState | null = null;
   const activeRunsByChat = new Map<string, ActiveRunState>();
   const chatStatusSeq = new Map<string, number>();
@@ -390,6 +393,13 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     drawer.setRecoveryBusy(isChatBusy(chatId));
   }
 
+  function clearTabConnectionObserver(): void {
+    if (stopObservingTabConnection) {
+      stopObservingTabConnection();
+      stopObservingTabConnection = null;
+    }
+  }
+
   function renderToolbar(): void {
     if (destroyed || !view) return;
     const { chatId } = ctx.getActiveChat();
@@ -398,19 +408,30 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       activeRun: getActiveRunForChat(chatId),
       recovery: view.recovery,
       hasActiveChat: Boolean(chatId),
+      chatId,
     });
     syncRecoveryBusy();
   }
 
   async function refresh(options: { onlyIfChanged?: boolean } = {}): Promise<void> {
     if (destroyed) return;
+    if (!drawerMounted && drawer.isTabConnected()) {
+      drawerMounted = true;
+      clearTabConnectionObserver();
+      drawer.render(view);
+    }
+    const includeCatalogs = drawerMounted;
     const myBootstrapSeq = ++bootstrapSeq;
     const startSettingsRevision = settingsRevision;
     const startStatusSeq = statusSeq;
     try {
-      const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap");
+      const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap", {
+        includeCatalogs,
+      });
       if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
-      const next = await withFrontendConnectionFallback(rawNext, ctx);
+      const next = includeCatalogs
+        ? await withFrontendConnectionFallback(rawNext, ctx)
+        : rawNext;
       if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
 
       const resolvedSettings =
@@ -466,44 +487,55 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       syncPrimaryActiveRun();
       const resolvedActiveRun = activeRun;
 
+      const prevView = view;
+      const preserveLoadedCatalogs =
+        !includeCatalogs && catalogsLoaded && prevView !== null;
       const mergedNext: ExtensionBootstrapView = {
         ...next,
         settings: resolvedSettings,
         activeRun: resolvedActiveRun,
+        ...(preserveLoadedCatalogs
+          ? {
+              connections: prevView.connections,
+              presets: prevView.presets,
+              catalogWarnings: prevView.catalogWarnings,
+            }
+          : {}),
       };
 
-      const coreUnchanged =
-        Boolean(options.onlyIfChanged) &&
-        view !== null &&
-        JSON.stringify({
-          settings: view.settings,
-          connections: view.connections,
-          presets: view.presets,
-          permissions: view.permissions,
-          catalogWarnings: view.catalogWarnings ?? [],
-        }) ===
-          JSON.stringify({
-            settings: mergedNext.settings,
-            connections: mergedNext.connections,
-            presets: mergedNext.presets,
-            permissions: mergedNext.permissions,
-            catalogWarnings: mergedNext.catalogWarnings ?? [],
-          });
+      const isInitialCatalogLoad = includeCatalogs && !catalogsLoaded;
+      if (includeCatalogs) {
+        catalogsLoaded = true;
+      }
 
-      const recoveryUnchanged =
+      const shouldDiffDrawer =
+        drawerMounted &&
         Boolean(options.onlyIfChanged) &&
-        view !== null &&
-        JSON.stringify(view.recovery) === JSON.stringify(mergedNext.recovery);
+        !isInitialCatalogLoad &&
+        prevView !== null;
+
+      const coreUnchanged =
+        shouldDiffDrawer &&
+        areJsonValuesEqual(prevView.settings, mergedNext.settings) &&
+        areJsonValuesEqual(prevView.connections, mergedNext.connections) &&
+        areJsonValuesEqual(prevView.presets, mergedNext.presets) &&
+        areJsonValuesEqual(prevView.permissions, mergedNext.permissions) &&
+        areJsonValuesEqual(
+          prevView.catalogWarnings ?? [],
+          mergedNext.catalogWarnings ?? [],
+        );
 
       view = mergedNext;
       activeRun = resolvedActiveRun;
       const currentChatId = ctx.getActiveChat().chatId;
       indicator.sync(getActiveRunForChat(currentChatId));
       chatHeads.syncRuns(activeRunsByChat.values(), currentChatId);
-      if (!coreUnchanged) {
-        drawer.render(view);
-      } else if (!recoveryUnchanged) {
-        drawer.updateRecovery(view.recovery, view.settings);
+      if (drawerMounted) {
+        if (!coreUnchanged) {
+          drawer.render(view);
+        } else if (!areJsonValuesEqual(prevView!.recovery, mergedNext.recovery)) {
+          drawer.updateRecovery(view.recovery, view.settings);
+        }
       }
       renderToolbar();
     } catch (error) {
@@ -775,7 +807,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       if (view) {
         view = { ...view, recovery };
         renderToolbar();
-        drawer.updateRecovery(view.recovery, view.settings);
+        if (drawerMounted) {
+          drawer.updateRecovery(view.recovery, view.settings);
+        }
       }
     } catch (error) {
       if (destroyed) return;
@@ -863,6 +897,27 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     onClearRecovery: () => clearRecoveryHistory(),
   });
 
+  drawerMounted = drawer.isTabConnected();
+
+  function activateDrawer(): void {
+    if (destroyed) return;
+    clearTabConnectionObserver();
+    if (!drawerMounted) {
+      drawerMounted = true;
+      drawer.render(view);
+    }
+    void refresh({ onlyIfChanged: catalogsLoaded });
+  }
+
+  if (!drawerMounted) {
+    stopObservingTabConnection = drawer.observeTabConnection(() => {
+      activateDrawer();
+    });
+    disposers.push(() => {
+      clearTabConnectionObserver();
+    });
+  }
+
   function handleActiveChatChanged(metricsChatId?: string | null): void {
     if (destroyed) return;
     const activeChatId = ctx.getActiveChat().chatId;
@@ -879,7 +934,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   disposers.push(
     drawer.onActivate(() => {
-      if (!destroyed) void refresh({ onlyIfChanged: true });
+      activateDrawer();
     }),
   );
 
@@ -1040,7 +1095,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           if (view && Array.isArray(event.recovery)) {
             view = { ...view, recovery: event.recovery };
             renderToolbar();
-            drawer.updateRecovery(view.recovery, view.settings);
+            if (drawerMounted) {
+              drawer.updateRecovery(view.recovery, view.settings);
+            }
           }
           return;
         }
@@ -1116,7 +1173,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   if (ctx.connections?.subscribe) {
     disposers.push(
       ctx.connections.subscribe(() => {
-        if (!destroyed) void refresh({ onlyIfChanged: true });
+        if (!destroyed && drawerMounted) void refresh({ onlyIfChanged: true });
       }),
     );
   }

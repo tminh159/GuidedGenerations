@@ -8,11 +8,13 @@ import {
   normalizeSettings,
 } from "../src/backend/settings-store";
 import { InputToolbarController } from "../src/frontend/input-toolbar";
+import { PillMetricsController } from "../src/frontend/pill-metrics";
 import {
   formatRecoverySnippet,
   pickRecoveryEntry,
 } from "../src/frontend/recovery-store";
 import { SettingsDrawerController } from "../src/frontend/settings-drawer";
+import { StreamingIndicatorController } from "../src/frontend/streaming-indicator";
 import { GUIDED_GENERATIONS_CSS } from "../src/frontend/styles";
 import { CONTINUE_MENU_ICONS, RECOVERY_MENU_ICONS, TOOLBAR_ICONS } from "../src/frontend/icons";
 import { GuidedGenerationRunner } from "../src/backend/generation-runner";
@@ -331,22 +333,11 @@ describe("InputToolbarController DOM behavior", () => {
 
     drawer.render(view);
 
-    // Model combobox is mounted for each action with initial placeholder from active connection.
+    // Model combobox is mounted for each action with initial placeholder from active connection,
+    // deferring connection binding while the card is collapsed.
     expect(modelComboboxes).toHaveLength(5);
-    expect(modelComboboxes[0]!.options.connection).toEqual({ kind: "llm" });
+    expect(modelComboboxes[0]!.options.connection).toBeUndefined();
     expect(modelComboboxes[0]!.options.placeholder).toBe("Use connection model (gpt-4o)");
-
-    // Switching API Connection Profile updates the Model combobox connection binding & placeholder.
-    const firstConnSelect = selectHandlers.find(
-      (s) => s.ariaLabel === "Guided Response API Connection Profile",
-    )!;
-    firstConnSelect.onChange?.("c2");
-    expect(modelComboboxes[0]!.updates).toEqual([
-      {
-        connection: { kind: "llm", id: "c2" },
-        placeholder: "Leave blank for connection model",
-      },
-    ]);
 
     // Every mounted component target must be attached inside tabRoot immediately (never detached).
     expect(mountedTargets.length).toBeGreaterThan(10);
@@ -362,6 +353,26 @@ describe("InputToolbarController DOM behavior", () => {
     }
     headers[1]!.click();
     expect(headers[1]!.getAttribute("aria-expanded")).toBe("true");
+    expect(modelComboboxes[0]!.updates).toEqual([
+      {
+        connection: { kind: "llm" },
+      },
+    ]);
+
+    // Switching API Connection Profile while expanded updates the Model combobox connection binding & placeholder.
+    const firstConnSelect = selectHandlers.find(
+      (s) => s.ariaLabel === "Guided Response API Connection Profile",
+    )!;
+    firstConnSelect.onChange?.("c2");
+    expect(modelComboboxes[0]!.updates).toEqual([
+      {
+        connection: { kind: "llm" },
+      },
+      {
+        connection: { kind: "llm", id: "c2" },
+        placeholder: "Leave blank for connection model",
+      },
+    ]);
 
     // Switching Bar Placement and moving a button in Toolbar Position & Order persists updates.
     const layoutPlacementSelect = selectHandlers.find(
@@ -2128,6 +2139,263 @@ describe("InputToolbarController DOM behavior", () => {
       (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
       (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
         origClearTimeout;
+    }
+  });
+
+  test("SettingsDrawerController defers mountModelCombobox connection binding on collapsed cards and binds on expand, plus PillMetricsController & StreamingIndicatorController event guards", async () => {
+    const tabRoot = document.createElement("div");
+    document.body.append(tabRoot);
+
+    const selectHandlers: Array<{ ariaLabel?: string; onChange?: (val: string) => void }> = [];
+    const modelComboboxes: Array<{
+      options: { connection?: { kind: string; id?: string }; placeholder?: string };
+      updates: Array<{ connection?: { kind: string; id?: string }; placeholder?: string }>;
+    }> = [];
+
+    const resolveTarget = (target: string | Element) =>
+      typeof target === "string" ? document.querySelector(target)! : target;
+
+    const fakeCtx = {
+      connections: {
+        getActive: () => ({ activeProfileId: "c1", provider: "openai", model: "gpt-4o" }),
+      },
+      ui: {
+        registerDrawerTab: () => ({
+          root: tabRoot,
+          tabId: "gg-deferred-combobox-tab",
+          setTitle: () => {},
+          setShortName: () => {},
+          setBadge: () => {},
+          activate: () => {},
+          destroy: () => {},
+          onActivate: () => () => {},
+        }),
+      },
+      components: {
+        mountSwitch: (target: string | Element) => {
+          const el = resolveTarget(target);
+          return { componentId: "sw", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => true };
+        },
+        mountSelect: (target: string | Element, opts: { ariaLabel?: string; onChange?: (v: string) => void }) => {
+          const el = resolveTarget(target);
+          selectHandlers.push({ ariaLabel: opts.ariaLabel, onChange: opts.onChange });
+          return { componentId: "sel", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "" };
+        },
+        mountModelCombobox: (
+          target: string | Element,
+          opts: { connection?: { kind: string; id?: string }; placeholder?: string },
+        ) => {
+          const el = resolveTarget(target);
+          const entry = {
+            options: opts,
+            updates: [] as Array<{ connection?: { kind: string; id?: string }; placeholder?: string }>,
+          };
+          modelComboboxes.push(entry);
+          return {
+            componentId: "mc",
+            element: el as HTMLElement,
+            update: (patch: { connection?: { kind: string; id?: string }; placeholder?: string }) => {
+              entry.updates.push(patch);
+            },
+            destroy: () => {},
+            getValue: () => "",
+            refresh: () => {},
+          };
+        },
+        mountTextArea: (target: string | Element) => {
+          const el = resolveTarget(target);
+          return { componentId: "ta", element: el as HTMLElement, update: () => {}, destroy: () => {}, getValue: () => "" };
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    let latestSettings = createDefaultSettings();
+    const drawer = new SettingsDrawerController(fakeCtx, {
+      onRefresh: () => {},
+      onSaveSettings: async (next) => {
+        latestSettings = next;
+      },
+      onRestoreEntry: () => {},
+      onClearRecovery: async () => {},
+    });
+
+    try {
+      latestSettings.actions.guided_continue.connectionId = "c2";
+      const view: ExtensionBootstrapView = {
+        settings: latestSettings,
+        connections: [
+          { id: "c1", name: "Main", provider: "openai", model: "gpt-4o", isDefault: true },
+          { id: "c2", name: "Anthropic", provider: "anthropic", model: "claude-sonnet", isDefault: false },
+        ],
+        presets: [{ id: "p1", name: "Default Preset" }],
+        recovery: [],
+        activeRun: null,
+        permissions: {
+          generation: true,
+          chats: true,
+          chat_mutation: true,
+          presets: true,
+          regex_scripts: true,
+          interceptor: true,
+        },
+      };
+
+      drawer.render(view);
+
+      // All 5 action cards start collapsed -> all 5 mountModelCombobox calls receive connection: undefined
+      expect(modelComboboxes).toHaveLength(5);
+      for (const mc of modelComboboxes) {
+        expect(mc.options.connection).toBeUndefined();
+        expect(mc.updates).toEqual([]);
+      }
+
+      const headers = Array.from(tabRoot.querySelectorAll<HTMLButtonElement>(".gg-card-header"));
+      // Expand Guided Response (headers[1]) -> binds default active connection { kind: "llm" }
+      headers[1]!.click();
+      expect(modelComboboxes[0]!.updates).toEqual([{ connection: { kind: "llm" } }]);
+      // Other 4 comboboxes remain unbound
+      for (let i = 1; i < 5; i += 1) {
+        expect(modelComboboxes[i]!.updates).toEqual([]);
+      }
+
+      // Collapsing and re-expanding Guided Response does not fire duplicate connection updates
+      headers[1]!.click();
+      headers[1]!.click();
+      expect(modelComboboxes[0]!.updates).toEqual([{ connection: { kind: "llm" } }]);
+
+      // Changing connectionId on a still-collapsed card (Guided Swipe, index 3) updates only placeholder until expanded
+      const swipeConnSelect = selectHandlers.find(
+        (s) => s.ariaLabel === "Guided Swipe API Connection Profile",
+      )!;
+      swipeConnSelect.onChange?.("c2");
+      expect(modelComboboxes[3]!.updates).toEqual([
+        { placeholder: "Use connection model (claude-sonnet)" },
+      ]);
+      // Expanding Guided Swipe (headers[4]) now binds { kind: "llm", id: "c2" }
+      headers[4]!.click();
+      expect(modelComboboxes[3]!.updates).toEqual([
+        { placeholder: "Use connection model (claude-sonnet)" },
+        { connection: { kind: "llm", id: "c2" } },
+      ]);
+
+      // Re-rendering drawer while Guided Response and Guided Swipe are expanded passes connection at mount time for those two only
+      modelComboboxes.length = 0;
+      drawer.render({ ...view, settings: latestSettings }, { force: true });
+      expect(modelComboboxes).toHaveLength(5);
+      expect(modelComboboxes[0]!.options.connection).toEqual({ kind: "llm" });
+      expect(modelComboboxes[1]!.options.connection).toBeUndefined();
+      expect(modelComboboxes[2]!.options.connection).toBeUndefined();
+      expect(modelComboboxes[3]!.options.connection).toEqual({ kind: "llm", id: "c2" });
+      expect(modelComboboxes[4]!.options.connection).toBeUndefined();
+    } finally {
+      drawer.destroy();
+      tabRoot.remove();
+    }
+
+    // PillMetricsController: skips redundant getMessages on CHAT_CHANGED when latestFallback.swipe_id !== entry.swipeId
+    let getMessagesCalls = 0;
+    let activeSwipe = 0;
+    const pillCtx = {
+      chats: {
+        getMessages: async () => {
+          getMessagesCalls += 1;
+          return {
+            data: [{ id: "m-bg", chat_id: "chat-1", swipe_id: activeSwipe, extra: {} }],
+            total: 1,
+          };
+        },
+        updateMessage: async () => ({}),
+      },
+      getActiveChat: () => ({ chatId: "chat-1", characterId: null }),
+    } as unknown as SpindleFrontendContext;
+
+    const pillCtrl = new PillMetricsController(pillCtx);
+    try {
+      pillCtrl.handleMetricsEvent({
+        type: "gg:generation_metrics",
+        chatId: "chat-1",
+        messageId: "m-bg",
+        swipeId: 2,
+        tokenCount: 120,
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(getMessagesCalls).toBe(1);
+
+      // CHAT_CHANGED while user is still on swipe 0 (latestFallback.swipe_id === 0 !== 2) skips getMessages
+      pillCtrl.onChatChanged("chat-1");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(getMessagesCalls).toBe(1);
+
+      // Swiping to swipe 2 updates latestFallback and flushes
+      activeSwipe = 2;
+      pillCtrl.onMessageEvent({
+        chatId: "chat-1",
+        message: { id: "m-bg", chat_id: "chat-1", swipe_id: 2, extra: {} },
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(getMessagesCalls).toBe(2);
+    } finally {
+      pillCtrl.destroy();
+    }
+
+    // StreamingIndicatorController: skips findMessageElement on message events for unrelated messageIds
+    let findCalls = 0;
+    const eventHandlers = new Map<string, (payload: unknown) => void>();
+    const row = document.createElement("div");
+    const mountBefore = document.createElement("span");
+    mountBefore.setAttribute("data-spindle-mount", "message_body_before");
+    row.append(mountBefore);
+    document.body.append(row);
+
+    const streamCtx = {
+      getActiveChat: () => ({ chatId: "chat-1", characterId: null }),
+      events: {
+        on: (ev: string, fn: (payload: unknown) => void) => {
+          eventHandlers.set(ev, fn);
+          return () => eventHandlers.delete(ev);
+        },
+      },
+      dom: {
+        findMessageElement: (id: string) => {
+          findCalls += 1;
+          return id === "m-target" ? row : null;
+        },
+        inject: (target: Element, html: string, pos: InsertPosition = "beforeend") => {
+          const wrap = document.createElement("div");
+          wrap.innerHTML = html;
+          target.insertAdjacentElement(pos, wrap);
+          return wrap;
+        },
+        uninject: (el: Element) => el.remove(),
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const streamCtrl = new StreamingIndicatorController(streamCtx);
+    try {
+      streamCtrl.sync({
+        runId: "r-1",
+        actionId: "guided_response",
+        chatId: "chat-1",
+        startedAt: 1,
+        messageId: "m-target",
+        swipeId: 0,
+      });
+      expect(findCalls).toBe(1);
+
+      // Unrelated message events must NOT call syncCurrent() / findMessageElement
+      eventHandlers.get("MESSAGE_EDITED")?.({ message: { id: "m-other", content: "unrelated" } });
+      eventHandlers.get("MESSAGE_SWIPED")?.({ messageId: "m-other", swipeId: 1 });
+      eventHandlers.get("MESSAGE_SENT")?.({ message: { id: "m-other" } });
+      expect(findCalls).toBe(1);
+
+      // Event with undefined messageId or matching messageId still calls syncCurrent()
+      eventHandlers.get("MESSAGE_EDITED")?.({});
+      expect(findCalls).toBe(2);
+      eventHandlers.get("MESSAGE_EDITED")?.({ message: { id: "m-target", content: "chunk" } });
+      expect(findCalls).toBe(3);
+    } finally {
+      streamCtrl.destroy();
+      row.remove();
     }
   });
 });

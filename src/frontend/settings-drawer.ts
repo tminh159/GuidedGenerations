@@ -97,6 +97,7 @@ export class SettingsDrawerController {
   private pointerReleaseCleanup: (() => void) | null = null;
   private pointerFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingViewFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private tabConnectionCleanups = new Set<() => void>();
   private noticeText = "";
   private noticeKind: "info" | "warn" | "error" = "info";
   private recoveryBusy = false;
@@ -236,6 +237,60 @@ export class SettingsDrawerController {
 
   onActivate(handler: () => void): () => void {
     return this.tab.onActivate(handler);
+  }
+
+  isTabConnected(): boolean {
+    if (this.destroyed) return false;
+    if (this.tab.root?.isConnected) return true;
+    try {
+      const location = this.ctx.ui?.getTabLocation?.(this.tab.tabId);
+      if (location && location.kind !== "main-drawer") {
+        return true;
+      }
+    } catch {
+      // Ignore missing or inactive getTabLocation on older hosts or mocks
+    }
+    try {
+      const drawerState = this.ctx.ui?.events?.getDrawerState?.();
+      if (drawerState?.open && drawerState.tabId === this.tab.tabId) {
+        return true;
+      }
+    } catch {
+      // Ignore missing or inactive ui.events on older hosts or mocks
+    }
+    return false;
+  }
+
+  observeTabConnection(onConnected: () => void): () => void {
+    if (this.destroyed || typeof IntersectionObserver !== "function") {
+      return () => {};
+    }
+    let active = true;
+    const disconnect = () => {
+      if (!active) return;
+      active = false;
+      this.tabConnectionCleanups.delete(disconnect);
+      observer.disconnect();
+    };
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!active || this.destroyed) {
+          disconnect();
+          return;
+        }
+        if (
+          entries.some((entry) => entry.isIntersecting) ||
+          this.isTabConnected()
+        ) {
+          disconnect();
+          onConnected();
+        }
+      },
+      { threshold: 0 },
+    );
+    this.tabConnectionCleanups.add(disconnect);
+    observer.observe(this.tab.root);
+    return disconnect;
   }
 
   setNotice(text: string, kind: "info" | "warn" | "error" = "info"): void {
@@ -554,6 +609,7 @@ export class SettingsDrawerController {
     title: string,
     badgeText: string | undefined,
     badgeMuted = false,
+    onToggle?: (expanded: boolean) => void,
   ): {
     body: HTMLDivElement;
     setBadge(nextText: string, muted?: boolean): void;
@@ -613,6 +669,7 @@ export class SettingsDrawerController {
       headerBtn.setAttribute("aria-expanded", String(nextExpanded));
       if (nextExpanded) this.expandedSections.add(sectionId);
       else this.expandedSections.delete(sectionId);
+      onToggle?.(nextExpanded);
     });
 
     card.append(headerBtn, bodyWrap);
@@ -812,6 +869,9 @@ export class SettingsDrawerController {
   ): void {
     const meta = ACTION_METADATA[actionId];
     const cfg = settings.actions[actionId];
+    let currentConnectionId: string | null = cfg.connectionId;
+    let modelConnectionBound = this.expandedSections.has(actionId);
+    let modelHandle: SpindleModelComboboxHandle | null = null;
 
     const card = this.createCollapsibleCard(
       parent,
@@ -819,6 +879,14 @@ export class SettingsDrawerController {
       meta.label,
       cfg.enabled ? "Visible" : "Hidden",
       !cfg.enabled,
+      (expanded) => {
+        if (expanded && !modelConnectionBound) {
+          modelConnectionBound = true;
+          modelHandle?.update({
+            connection: buildModelConnectionRef(currentConnectionId),
+          });
+        }
+      },
     );
     const body = card.body;
 
@@ -911,7 +979,6 @@ export class SettingsDrawerController {
     );
 
     const activeConnectionId = getActiveConnectionId(this.ctx);
-    let modelHandle: SpindleModelComboboxHandle | null = null;
 
     // API Connection Profile select
     const connField = createFieldContainer("API Connection Profile");
@@ -923,11 +990,18 @@ export class SettingsDrawerController {
         ariaLabel: `${meta.label} API Connection Profile`,
         onChange: (val) => {
           const nextConnectionId = val || null;
+          currentConnectionId = nextConnectionId;
           savePatch({ connectionId: nextConnectionId });
-          modelHandle?.update({
-            connection: buildModelConnectionRef(nextConnectionId),
-            placeholder: buildModelPlaceholder(nextConnectionId, connections, activeConnectionId),
-          });
+          modelHandle?.update(
+            modelConnectionBound
+              ? {
+                  connection: buildModelConnectionRef(nextConnectionId),
+                  placeholder: buildModelPlaceholder(nextConnectionId, connections, activeConnectionId),
+                }
+              : {
+                  placeholder: buildModelPlaceholder(nextConnectionId, connections, activeConnectionId),
+                },
+          );
         },
       }),
     );
@@ -942,10 +1016,12 @@ export class SettingsDrawerController {
     if (typeof this.ctx.components.mountModelCombobox === "function") {
       modelHandle = this.ctx.components.mountModelCombobox(modelField.slot, {
         value: cfg.model ?? "",
-        connection: buildModelConnectionRef(cfg.connectionId),
+        connection: modelConnectionBound
+          ? buildModelConnectionRef(currentConnectionId)
+          : undefined,
         appearance: "standard",
         autoRefreshOnFocus: true,
-        placeholder: buildModelPlaceholder(cfg.connectionId, connections, activeConnectionId),
+        placeholder: buildModelPlaceholder(currentConnectionId, connections, activeConnectionId),
         onChange: (value) => {
           this.scheduleDebouncedSave(`${actionId}:model`, () => {
             savePatch({ model: value.trim() || null });
@@ -1461,6 +1537,10 @@ export class SettingsDrawerController {
       this.pointerReleaseCleanup = null;
       cleanup();
     }
+    for (const cleanup of [...this.tabConnectionCleanups]) {
+      cleanup();
+    }
+    this.tabConnectionCleanups.clear();
     this.rootEl = null;
     this.headerEl = null;
     this.noticeEl = null;

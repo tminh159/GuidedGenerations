@@ -43,6 +43,7 @@ const STORAGE_POS_KEY = "gg:chatHeadsPos";
 const NATIVE_STORAGE_POS_KEY = "lumiverse:chatHeadsPos";
 const DEFAULT_POS: StoredChatHeadPos = { xPct: 94, yPct: 22 };
 const DRAG_THRESHOLD_PX = 6;
+const HOLD_DISMISS_MS = 450;
 const HEAD_SIZE_PX = 48;
 const HEAD_GAP_PX = 10;
 const ROOT_PAD_PX = 6;
@@ -141,6 +142,7 @@ function boxesOverlap(a: RectBox, b: RectBox, gap = 0): boolean {
  */
 export class ChatHeadController {
   private readonly heads = new Map<string, ChatHeadEntry>();
+  private readonly headItemEls = new Map<string, HTMLDivElement>();
   private readonly characterCache = new Map<string, CachedCharacterMeta>();
   private readonly pendingCharacterFetches = new Set<string>();
   private readonly disposers: Array<() => void> = [];
@@ -149,6 +151,7 @@ export class ChatHeadController {
   private dragCleanup: (() => void) | null = null;
   private suppressClickTimer: ReturnType<typeof setTimeout> | null = null;
   private suppressNextClick = false;
+  private isDragging = false;
   private pos: StoredChatHeadPos;
   private destroyed = false;
 
@@ -303,6 +306,7 @@ export class ChatHeadController {
     }
     this.disposers.length = 0;
     this.heads.clear();
+    this.headItemEls.clear();
     this.pendingCharacterFetches.clear();
     if (this.rootEl) {
       this.rootEl.remove();
@@ -484,12 +488,23 @@ export class ChatHeadController {
     if (visibleEntries.length === 0) {
       this.clearDragSession();
       this.clearResizeListener();
+      this.headItemEls.clear();
       if (this.rootEl) {
         this.rootEl.remove();
         this.rootEl = null;
       }
       return;
     }
+
+    const avoidNative = !this.isDragging;
+    const preReadNativeBox = avoidNative
+      ? (() => {
+          const nativeContainer = this.findNativeChatHeadsContainer();
+          if (!nativeContainer) return null;
+          const { vw, vh } = this.getViewportSize();
+          return this.resolveNativeBounds(nativeContainer, vw, vh);
+        })()
+      : null;
 
     if (!this.rootEl) {
       this.rootEl = document.createElement("div");
@@ -499,9 +514,32 @@ export class ChatHeadController {
       this.ensureResizeListener();
     }
 
-    const items = visibleEntries.map((entry) => this.buildHeadItem(entry));
-    this.rootEl.replaceChildren(...items);
-    this.applyRootPosition(this.rootEl, visibleEntries.length);
+    const visibleIds = new Set(visibleEntries.map((entry) => entry.chatId));
+    for (const [chatId, itemEl] of [...this.headItemEls.entries()]) {
+      if (!visibleIds.has(chatId)) {
+        itemEl.remove();
+        this.headItemEls.delete(chatId);
+      }
+    }
+
+    for (let i = 0; i < visibleEntries.length; i += 1) {
+      const entry = visibleEntries[i]!;
+      let itemEl = this.headItemEls.get(entry.chatId);
+      if (itemEl) {
+        this.updateHeadItem(itemEl, entry);
+      } else {
+        itemEl = this.buildHeadItem(entry);
+        this.headItemEls.set(entry.chatId, itemEl);
+      }
+      if (this.rootEl.children[i] !== itemEl) {
+        this.rootEl.insertBefore(itemEl, this.rootEl.children[i] ?? null);
+      }
+    }
+
+    this.applyRootPosition(this.rootEl, visibleEntries.length, {
+      avoidNative,
+      nativeBox: preReadNativeBox,
+    });
 
     if (!this.rootEl.isConnected) {
       document.body.append(this.rootEl);
@@ -509,24 +547,63 @@ export class ChatHeadController {
   }
 
   private buildHeadItem(entry: ChatHeadEntry): HTMLDivElement {
+    const chatId = entry.chatId;
     const item = document.createElement("div");
     item.className = "gg-chat-head-item";
 
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "gg-chat-head";
-    if (entry.status === "running" || entry.status === "streaming") {
-      btn.classList.add("is-running");
-    }
-    if (entry.status === "streaming") {
-      btn.classList.add("is-streaming");
-    }
-    if (entry.status === "completed") {
-      btn.classList.add("is-completed");
-    }
-
     btn.setAttribute("data-gg-chat-head", "true");
-    btn.setAttribute("data-chat-id", entry.chatId);
+    btn.setAttribute("data-chat-id", chatId);
+
+    const badge = document.createElement("span");
+    badge.className = "gg-chat-head-badge";
+    badge.setAttribute("aria-hidden", "true");
+    btn.append(badge);
+
+    btn.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!this.isDragging && this.heads.get(chatId)?.status === "completed") {
+        this.dismissCompletedHead(chatId);
+      }
+    });
+
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (this.suppressNextClick) {
+        this.suppressNextClick = false;
+        this.clearSuppressClickTimer();
+        return;
+      }
+      this.navigateToChat(chatId, () => {
+        if (this.destroyed) return;
+        const latest = this.heads.get(chatId);
+        if (latest?.status === "completed") {
+          this.heads.delete(chatId);
+          this.render();
+        }
+      });
+    });
+
+    item.append(btn);
+    this.updateHeadItem(item, entry);
+    return item;
+  }
+
+  private updateHeadItem(item: HTMLDivElement, entry: ChatHeadEntry): void {
+    const btn = item.querySelector<HTMLButtonElement>("[data-gg-chat-head]");
+    const badge = btn?.querySelector<HTMLSpanElement>(".gg-chat-head-badge");
+    if (!btn || !badge) return;
+
+    btn.classList.toggle(
+      "is-running",
+      entry.status === "running" || entry.status === "streaming",
+    );
+    btn.classList.toggle("is-streaming", entry.status === "streaming");
+    btn.classList.toggle("is-completed", entry.status === "completed");
     btn.setAttribute("data-status", entry.status);
 
     const displayName = entry.characterName || entry.chatId;
@@ -544,88 +621,88 @@ export class ChatHeadController {
       sanitizeAvatarUrl(entry.avatarUrl) ??
       (entry.characterId ? buildDefaultAvatarUrl(entry.characterId) : undefined);
 
+    const existingImg = btn.querySelector<HTMLImageElement>(".gg-chat-head-avatar");
+    const existingInitials = btn.querySelector<HTMLSpanElement>(".gg-chat-head-initials");
+
     if (effectiveAvatarUrl && !entry.avatarFailed) {
-      const img = document.createElement("img");
-      img.className = "gg-chat-head-avatar";
-      img.src = effectiveAvatarUrl;
-      img.alt = displayName;
-      img.draggable = false;
-      img.addEventListener("error", () => {
-        if (this.destroyed) return;
-        const current = this.heads.get(entry.chatId);
-        if (current) {
-          current.avatarFailed = true;
+      existingInitials?.remove();
+      if (existingImg) {
+        if (existingImg.getAttribute("src") !== effectiveAvatarUrl) {
+          existingImg.src = effectiveAvatarUrl;
         }
-        if (img.isConnected) {
-          const initials = document.createElement("span");
-          initials.className = "gg-chat-head-initials";
-          initials.textContent = computeInitials(displayName);
-          img.replaceWith(initials);
-        }
-      });
-      btn.append(img);
-    } else {
-      const initials = document.createElement("span");
-      initials.className = "gg-chat-head-initials";
-      initials.textContent = computeInitials(displayName);
-      btn.append(initials);
-    }
-
-    const badge = document.createElement("span");
-    badge.className = "gg-chat-head-badge";
-    badge.setAttribute("aria-hidden", "true");
-    btn.append(badge);
-
-    if (entry.status === "completed") {
-      const pip = document.createElement("span");
-      pip.className = "gg-chat-head-pip";
-      pip.setAttribute("aria-hidden", "true");
-      btn.append(pip);
-
-      btn.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.dismissCompletedHead(entry.chatId);
-      });
-    }
-
-    btn.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (this.suppressNextClick) {
-        this.suppressNextClick = false;
-        this.clearSuppressClickTimer();
-        return;
+        existingImg.alt = displayName;
+      } else {
+        const img = document.createElement("img");
+        img.className = "gg-chat-head-avatar";
+        img.src = effectiveAvatarUrl;
+        img.alt = displayName;
+        img.draggable = false;
+        img.addEventListener("error", () => {
+          if (this.destroyed) return;
+          const current = this.heads.get(entry.chatId);
+          if (current) {
+            current.avatarFailed = true;
+          }
+          if (img.isConnected) {
+            const latestName =
+              this.heads.get(entry.chatId)?.characterName || entry.chatId;
+            const initials = document.createElement("span");
+            initials.className = "gg-chat-head-initials";
+            initials.textContent = computeInitials(latestName);
+            img.replaceWith(initials);
+          }
+        });
+        btn.insertBefore(img, badge);
       }
-      this.navigateToChat(entry.chatId, () => {
-        if (this.destroyed) return;
-        const latest = this.heads.get(entry.chatId);
-        if (latest?.status === "completed") {
-          this.heads.delete(entry.chatId);
-          this.render();
-        }
-      });
-    });
-
-    item.append(btn);
-
-    if (entry.status === "completed") {
-      const dismissBtn = document.createElement("button");
-      dismissBtn.type = "button";
-      dismissBtn.className = "gg-chat-head-dismiss";
-      dismissBtn.setAttribute("data-gg-chat-head-dismiss", "true");
-      dismissBtn.setAttribute("aria-label", `Dismiss ${displayName}`);
-      dismissBtn.title = "Dismiss";
-      dismissBtn.textContent = "×";
-      dismissBtn.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.dismissCompletedHead(entry.chatId);
-      });
-      item.append(dismissBtn);
+    } else {
+      existingImg?.remove();
+      const initialsText = computeInitials(displayName);
+      if (existingInitials) {
+        existingInitials.textContent = initialsText;
+      } else {
+        const initials = document.createElement("span");
+        initials.className = "gg-chat-head-initials";
+        initials.textContent = initialsText;
+        btn.insertBefore(initials, badge);
+      }
     }
 
-    return item;
+    const existingPip = btn.querySelector<HTMLSpanElement>(".gg-chat-head-pip");
+    if (entry.status === "completed") {
+      if (!existingPip) {
+        const pip = document.createElement("span");
+        pip.className = "gg-chat-head-pip";
+        pip.setAttribute("aria-hidden", "true");
+        btn.append(pip);
+      }
+    } else {
+      existingPip?.remove();
+    }
+
+    const existingDismiss = item.querySelector<HTMLButtonElement>(
+      "[data-gg-chat-head-dismiss]",
+    );
+    if (entry.status === "completed") {
+      if (existingDismiss) {
+        existingDismiss.setAttribute("aria-label", `Dismiss ${displayName}`);
+      } else {
+        const dismissBtn = document.createElement("button");
+        dismissBtn.type = "button";
+        dismissBtn.className = "gg-chat-head-dismiss";
+        dismissBtn.setAttribute("data-gg-chat-head-dismiss", "true");
+        dismissBtn.setAttribute("aria-label", `Dismiss ${displayName}`);
+        dismissBtn.title = "Dismiss";
+        dismissBtn.textContent = "×";
+        dismissBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.dismissCompletedHead(entry.chatId);
+        });
+        item.append(dismissBtn);
+      }
+    } else {
+      existingDismiss?.remove();
+    }
   }
 
   private dismissCompletedHead(chatId: string): void {
@@ -656,8 +733,10 @@ export class ChatHeadController {
   }
 
   private hasNativeChatHead(chatId: string): boolean {
-    if (typeof document === "undefined" || !document.body) return false;
-    const candidates = document.body.querySelectorAll("[data-chat-id]");
+    if (typeof document === "undefined" || !document.body || !chatId) return false;
+    const candidates = document.body.querySelectorAll(
+      "[data-head-idx][data-chat-id]:not([data-gg-chat-head]), [data-chat-head][data-chat-id]:not([data-gg-chat-head]), body > * > [data-chat-id]:not([data-gg-chat-head])",
+    );
     for (const el of candidates) {
       if (
         el.getAttribute("data-chat-id") === chatId &&
@@ -846,6 +925,9 @@ export class ChatHeadController {
       if (target?.closest?.("[data-gg-chat-head-dismiss]")) {
         return;
       }
+      if (this.isDragging) {
+        return;
+      }
 
       this.clearSuppressClickTimer();
       this.suppressNextClick = false;
@@ -854,8 +936,23 @@ export class ChatHeadController {
       const pointerId = event.pointerId;
       const startX = event.clientX;
       const startY = event.clientY;
-      const startPos = { ...this.pos };
+      const initialCount = this.rootEl?.children.length || this.heads.size || 1;
+      const styleLeftPct = parseFloat(root.style.left);
+      const styleTopPct = parseFloat(root.style.top);
+      const startPos =
+        Number.isFinite(styleLeftPct) && Number.isFinite(styleTopPct)
+          ? { xPct: styleLeftPct, yPct: styleTopPct }
+          : this.clampCenterPos(this.pos, initialCount);
       let moved = false;
+      let finished = false;
+      let holdDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearHoldDismissTimer = () => {
+        if (holdDismissTimer !== null) {
+          clearTimeout(holdDismissTimer);
+          holdDismissTimer = null;
+        }
+      };
 
       const onPointerMove = (moveEvent: PointerEvent) => {
         if (moveEvent.pointerId !== pointerId) return;
@@ -863,7 +960,10 @@ export class ChatHeadController {
         const dy = moveEvent.clientY - startY;
         if (!moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
           moved = true;
+          clearHoldDismissTimer();
+          this.isDragging = true;
           this.suppressNextClick = true;
+          root.classList.add("is-dragging");
           try {
             root.setPointerCapture?.(pointerId);
           } catch {
@@ -887,6 +987,11 @@ export class ChatHeadController {
       };
 
       const finishDrag = () => {
+        if (finished) return;
+        finished = true;
+        clearHoldDismissTimer();
+        this.clearDragSession();
+        root.classList.remove("is-dragging");
         try {
           if (root.hasPointerCapture?.(pointerId)) {
             root.releasePointerCapture?.(pointerId);
@@ -894,7 +999,6 @@ export class ChatHeadController {
         } catch {
           // Ignore release errors
         }
-        this.clearDragSession();
         if (moved) {
           this.savePosition(this.pos);
           if (this.rootEl) {
@@ -909,13 +1013,49 @@ export class ChatHeadController {
         }
       };
 
+      const touchedHeadBtn = target?.closest?.("[data-gg-chat-head]") as HTMLElement | null;
+      const touchedChatId = touchedHeadBtn?.getAttribute("data-chat-id") ?? null;
+      if (
+        event.pointerType === "touch" &&
+        touchedChatId &&
+        this.heads.get(touchedChatId)?.status === "completed"
+      ) {
+        holdDismissTimer = setTimeout(() => {
+          holdDismissTimer = null;
+          if (moved || finished || this.destroyed) return;
+          if (this.heads.get(touchedChatId)?.status !== "completed") return;
+          this.suppressNextClick = true;
+          this.clearSuppressClickTimer();
+          this.suppressClickTimer = setTimeout(() => {
+            this.suppressClickTimer = null;
+            this.suppressNextClick = false;
+          }, SUPPRESS_CLICK_FALLBACK_MS);
+          finishDrag();
+          this.dismissCompletedHead(touchedChatId);
+        }, HOLD_DISMISS_MS);
+      }
+
       const onPointerEnd = (endEvent: PointerEvent) => {
         if (endEvent.pointerId !== pointerId) return;
         finishDrag();
       };
 
+      const onLostPointerCapture = (lostEvent: PointerEvent) => {
+        if (lostEvent.pointerId !== pointerId) return;
+        // Transferring implicit touch capture from a child button to root fires a
+        // bubbling lostpointercapture on the child; only end drag if root lost capture.
+        if (lostEvent.target !== root) return;
+        finishDrag();
+      };
+
       const onWindowBlur = () => {
         finishDrag();
+      };
+
+      const onTouchMove = (touchEvent: TouchEvent) => {
+        if (moved && touchEvent.cancelable) {
+          touchEvent.preventDefault();
+        }
       };
 
       const win =
@@ -924,20 +1064,32 @@ export class ChatHeadController {
       document.addEventListener("pointermove", onPointerMove, true);
       document.addEventListener("pointerup", onPointerEnd, true);
       document.addEventListener("pointercancel", onPointerEnd, true);
-      root.addEventListener("lostpointercapture", onPointerEnd);
+      if (event.pointerType === "touch") {
+        document.addEventListener("touchmove", onTouchMove, {
+          capture: true,
+          passive: false,
+        });
+      }
+      root.addEventListener("lostpointercapture", onLostPointerCapture);
       win?.addEventListener("blur", onWindowBlur);
 
       this.dragCleanup = () => {
+        clearHoldDismissTimer();
         document.removeEventListener("pointermove", onPointerMove, true);
         document.removeEventListener("pointerup", onPointerEnd, true);
         document.removeEventListener("pointercancel", onPointerEnd, true);
-        root.removeEventListener("lostpointercapture", onPointerEnd);
+        if (event.pointerType === "touch") {
+          document.removeEventListener("touchmove", onTouchMove, true);
+        }
+        root.removeEventListener("lostpointercapture", onLostPointerCapture);
         win?.removeEventListener("blur", onWindowBlur);
       };
     });
   }
 
   private clearDragSession(): void {
+    this.isDragging = false;
+    this.rootEl?.classList.remove("is-dragging");
     if (this.dragCleanup) {
       const cleanup = this.dragCleanup;
       this.dragCleanup = null;
@@ -964,7 +1116,9 @@ export class ChatHeadController {
     const onResize = () => {
       if (this.destroyed || !this.rootEl) return;
       const count = this.rootEl.children.length || this.heads.size || 1;
-      this.applyRootPosition(this.rootEl, count);
+      this.applyRootPosition(this.rootEl, count, {
+        avoidNative: !this.isDragging,
+      });
     };
     win.addEventListener("resize", onResize);
     this.resizeCleanup = () => {
@@ -983,7 +1137,7 @@ export class ChatHeadController {
   private applyRootPosition(
     root: HTMLDivElement,
     headCount = this.heads.size || 1,
-    options: { avoidNative?: boolean } = {},
+    options: { avoidNative?: boolean; nativeBox?: RectBox | null } = {},
   ): void {
     const { vw, vh } = this.getViewportSize();
     const { width, height } = this.getStackDimensions(headCount, vh);
@@ -993,10 +1147,15 @@ export class ChatHeadController {
     let cy = (clamped.yPct / 100) * vh;
 
     if (options.avoidNative !== false) {
-      const nativeContainer = this.findNativeChatHeadsContainer();
-      const nativeBox = nativeContainer
-        ? this.resolveNativeBounds(nativeContainer, vw, vh)
-        : null;
+      const nativeBox =
+        options.nativeBox !== undefined
+          ? options.nativeBox
+          : (() => {
+              const nativeContainer = this.findNativeChatHeadsContainer();
+              return nativeContainer
+                ? this.resolveNativeBounds(nativeContainer, vw, vh)
+                : null;
+            })();
       if (nativeBox) {
         const minX = VIEWPORT_PAD_PX + width / 2;
         const maxX = vw - VIEWPORT_PAD_PX - width / 2;

@@ -20,6 +20,15 @@ interface HarnessOptions {
   composerMounted?: boolean;
   composerText?: string;
   throwOnComposerWrite?: boolean;
+  detachDrawerTab?: boolean;
+  tabLocation?: { kind: "main-drawer" } | { kind: "container"; containerId: string };
+  frontendConnectionsFallback?: Array<{
+    id: string;
+    name: string;
+    provider?: string;
+    model?: string;
+    is_default?: boolean;
+  }>;
 }
 
 function makeBootstrapView(
@@ -57,18 +66,39 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
   const toolbarRowMount = document.createElement("div");
   const alertMount = document.createElement("div");
   const tabRoot = document.createElement("div");
-  document.body.append(actionsMount, toolbarRowMount, alertMount, tabRoot);
+  document.body.append(actionsMount, toolbarRowMount, alertMount);
+  if (!opts.detachDrawerTab) {
+    document.body.append(tabRoot);
+  }
+
+  let currentTabLocation:
+    | { kind: "main-drawer" }
+    | { kind: "container"; containerId: string } = opts.tabLocation ?? {
+    kind: "main-drawer",
+  };
 
   const sentRpcs: RpcRequestEnvelope[] = [];
   const backendListeners = new Set<(payload: unknown) => void>();
   const eventListeners = new Map<string, Set<(payload: unknown) => void>>();
   const stateListeners = new Map<string, Set<(payload: unknown) => void>>();
+  const connectionSubscribers = new Set<
+    (value: {
+      activeProfileId: string | null;
+      provider: string | null;
+      model: string | null;
+    }) => void
+  >();
   const activateHandlers = new Set<() => void>();
   const messageElements = new Map<string, Element>();
   const injectedWrappers = new Set<Element>();
 
   let injectCalls = 0;
   let uninjectCalls = 0;
+  let mountSwitchCount = 0;
+  let mountSelectCount = 0;
+  let mountComboboxCount = 0;
+  let mountTextAreaCount = 0;
+  let connectionsListCalls = 0;
   let mountedTextAreaDestroyCount = 0;
   let mountedComboboxDestroyCount = 0;
   let lastTextAreaOnChange: ((val: string) => void) | undefined;
@@ -133,12 +163,14 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
           return () => activateHandlers.delete(h);
         },
       }),
+      getTabLocation: () => currentTabLocation,
     },
     components: {
       mountSwitch: (
         target: string | Element,
         options: { checked?: boolean; ariaLabel?: string; onChange?: (v: boolean) => void },
       ) => {
+        mountSwitchCount += 1;
         const el = typeof target === "string" ? document.querySelector(target)! : target;
         const btn = document.createElement("button");
         btn.setAttribute("role", "switch");
@@ -163,6 +195,7 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
         target: string | Element,
         options: { ariaLabel?: string; onChange?: (v: string) => void },
       ) => {
+        mountSelectCount += 1;
         const el = typeof target === "string" ? document.querySelector(target)! : target;
         const sel = document.createElement("select");
         if (options.ariaLabel) sel.setAttribute("aria-label", options.ariaLabel);
@@ -179,6 +212,7 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
         target: string | Element,
         options: { value?: string; onChange?: (v: string) => void },
       ) => {
+        mountComboboxCount += 1;
         const el = typeof target === "string" ? document.querySelector(target)! : target;
         const input = document.createElement("input");
         input.value = options.value ?? "";
@@ -200,6 +234,7 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
         target: string | Element,
         options: { value?: string; ariaLabel?: string; onChange?: (v: string) => void },
       ) => {
+        mountTextAreaCount += 1;
         const el = typeof target === "string" ? document.querySelector(target)! : target;
         const ta = document.createElement("textarea");
         ta.value = options.value ?? "";
@@ -221,9 +256,21 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
       },
     },
     connections: {
-      list: () => [],
+      list: () => {
+        connectionsListCalls += 1;
+        return opts.frontendConnectionsFallback ?? [];
+      },
       getActive: () => ({ activeProfileId: "c1", provider: "openai", model: "gpt-4o" }),
-      subscribe: () => () => {},
+      subscribe: (
+        handler: (value: {
+          activeProfileId: string | null;
+          provider: string | null;
+          model: string | null;
+        }) => void,
+      ) => {
+        connectionSubscribers.add(handler);
+        return () => connectionSubscribers.delete(handler);
+      },
     },
     chats: {
       getMessages: async (chatId: string, options?: { limit?: number; tail?: boolean }) => {
@@ -369,6 +416,42 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
       textArea: mountedTextAreaDestroyCount,
       combobox: mountedComboboxDestroyCount,
     }),
+    getMountCounts: () => ({
+      switch: mountSwitchCount,
+      select: mountSelectCount,
+      combobox: mountComboboxCount,
+      textArea: mountTextAreaCount,
+    }),
+    getConnectionsListCalls: () => connectionsListCalls,
+    activateDrawer: () => {
+      for (const handler of activateHandlers) {
+        handler();
+      }
+      if (!tabRoot.isConnected) {
+        document.body.append(tabRoot);
+      }
+    },
+    emitConnectionsChange: (
+      value: {
+        activeProfileId: string | null;
+        provider: string | null;
+        model: string | null;
+      } = { activeProfileId: "c2", provider: "anthropic", model: "claude-sonnet" },
+    ) => {
+      for (const handler of connectionSubscribers) {
+        handler(value);
+      }
+    },
+    emitStateChange: (key: string, payload?: unknown) => {
+      for (const handler of stateListeners.get(key) ?? []) {
+        handler(payload);
+      }
+    },
+    setTabLocation: (
+      loc: { kind: "main-drawer" } | { kind: "container"; containerId: string },
+    ) => {
+      currentTabLocation = loc;
+    },
     triggerLastTextAreaChange: (val: string) => lastTextAreaOnChange?.(val),
     triggerLastComboboxChange: (val: string) => lastComboboxOnChange?.(val),
     setChatMessages: (
@@ -4107,6 +4190,1289 @@ describe("frontend orchestration and safety", () => {
       expect(h.getDestroyCounts()).toEqual(afterOptimistic);
     } finally {
       teardown();
+    }
+  });
+
+  test("mobile touch drag: ignores child bubbling lostpointercapture, handles direct root lostpointercapture, prevents touchmove scroll, ignores 2nd touch, preserves button across status updates, uses rendered startPos, and applies mobile CSS", async () => {
+    const win = document.defaultView!;
+    const origInnerWidth = win.innerWidth;
+    const origInnerHeight = win.innerHeight;
+    const origLocalStorage = (globalThis as unknown as { localStorage?: Storage }).localStorage;
+
+    const storeMap = new Map<string, string>();
+    const fakeStorage = {
+      getItem: (k: string) => storeMap.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        storeMap.set(k, v);
+      },
+      removeItem: (k: string) => {
+        storeMap.delete(k);
+      },
+      clear: () => storeMap.clear(),
+      key: (i: number) => Array.from(storeMap.keys())[i] ?? null,
+      get length() {
+        return storeMap.size;
+      },
+    } as Storage;
+    (globalThis as unknown as { localStorage: Storage }).localStorage = fakeStorage;
+
+    Object.defineProperty(win, "innerWidth", { value: 390, configurable: true });
+    Object.defineProperty(win, "innerHeight", { value: 844, configurable: true });
+
+    const navCalls: string[] = [];
+    const headCtx = {
+      getActiveChat: () => ({ chatId: "chat-active" }),
+      events: { on: () => () => {} },
+      host: {
+        surfaces: {
+          invoke: (_ref: unknown, params: { chatId: string }) => {
+            navCalls.push(params.chatId);
+            return Promise.resolve();
+          },
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const controller = new ChatHeadController(headCtx);
+    try {
+      controller.syncRuns(
+        [
+          {
+            runId: "r-touch",
+            actionId: "guided_response",
+            chatId: "chat-touch",
+            startedAt: 100,
+            characterName: "Touch Hero",
+          },
+        ],
+        "chat-active",
+      );
+
+      const rootEl = document.body.querySelector<HTMLDivElement>(".gg-chat-heads-root")!;
+      const btn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-touch"]',
+      )!;
+      const PointerEvt = win.PointerEvent;
+
+      // Narrow mobile viewport (390x844) clamps default 94% right-edge position
+      const initialLeftPct = parseFloat(rootEl.style.left);
+      const initialTopPct = parseFloat(rootEl.style.top);
+      expect(initialLeftPct).toBeLessThan(94);
+
+      const captureCalls: number[] = [];
+      const releaseCalls: number[] = [];
+      let capturedId: number | null = null;
+      let emitChildLossOnCapture = true;
+      rootEl.setPointerCapture = (id: number) => {
+        capturedId = id;
+        captureCalls.push(id);
+        // Simulate implicit touch capture transfer from child button to root
+        if (emitChildLossOnCapture) {
+          btn.dispatchEvent(
+            new PointerEvt("lostpointercapture", {
+              bubbles: true,
+              pointerId: id,
+              pointerType: "touch",
+            }),
+          );
+        }
+      };
+      rootEl.hasPointerCapture = (id: number) => capturedId === id;
+      rootEl.releasePointerCapture = (id: number) => {
+        if (capturedId === id) capturedId = null;
+        releaseCalls.push(id);
+      };
+
+      // 1. Touch pointerdown + move past 6px -> bubbling lostpointercapture must NOT drop drag,
+      //    and rendered startPos avoids dead-zone lag when dragging left from clamped edge
+      btn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          button: 0,
+          clientX: 340,
+          clientY: 185,
+        }),
+      );
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          clientX: 325,
+          clientY: 185,
+        }),
+      );
+      expect(captureCalls).toEqual([11]);
+      expect(releaseCalls).toEqual([]);
+      expect(rootEl.classList.contains("is-dragging")).toBe(true);
+      const afterFirstMoveLeft = parseFloat(rootEl.style.left);
+      expect(afterFirstMoveLeft).toBeLessThan(initialLeftPct);
+
+      // Move further smoothly
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          clientX: 250,
+          clientY: 260,
+        }),
+      );
+      const afterSecondMoveLeft = parseFloat(rootEl.style.left);
+      const afterSecondMoveTop = parseFloat(rootEl.style.top);
+      expect(afterSecondMoveLeft).toBeLessThan(afterFirstMoveLeft);
+      expect(afterSecondMoveTop).toBeGreaterThan(initialTopPct);
+
+      // Cancelable touchmove is prevented mid-drag
+      const touchMoveEv = new win.Event("touchmove", { bubbles: true, cancelable: true });
+      document.dispatchEvent(touchMoveEv);
+      expect(touchMoveEv.defaultPrevented).toBe(true);
+
+      // Second finger touch pointerdown does not abort pointer 11's drag
+      btn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 12,
+          pointerType: "touch",
+          button: 0,
+          clientX: 240,
+          clientY: 265,
+        }),
+      );
+      expect(rootEl.classList.contains("is-dragging")).toBe(true);
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          clientX: 180,
+          clientY: 340,
+        }),
+      );
+      const afterMultiTouchLeft = parseFloat(rootEl.style.left);
+      const afterMultiTouchTop = parseFloat(rootEl.style.top);
+      expect(afterMultiTouchLeft).toBeLessThan(afterSecondMoveLeft);
+      expect(afterMultiTouchTop).toBeGreaterThan(afterSecondMoveTop);
+
+      // Status transitions (running -> streaming -> completed) preserve button identity and keep drag alive
+      controller.handleStatusEvent(
+        {
+          type: "gg:status",
+          chatId: "chat-touch",
+          run: {
+            runId: "r-touch",
+            actionId: "guided_response",
+            chatId: "chat-touch",
+            startedAt: 100,
+            hasContentOutput: true,
+            characterName: "Touch Hero",
+          },
+        },
+        "chat-active",
+      );
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-touch"]')).toBe(btn);
+      expect(btn.classList.contains("is-streaming")).toBe(true);
+
+      controller.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-touch", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-touch"]')).toBe(btn);
+      expect(btn.classList.contains("is-completed")).toBe(true);
+
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          clientX: 120,
+          clientY: 420,
+        }),
+      );
+      const beforeUpLeft = parseFloat(rootEl.style.left);
+      const beforeUpTop = parseFloat(rootEl.style.top);
+      expect(beforeUpLeft).toBeLessThan(afterMultiTouchLeft);
+      expect(beforeUpTop).toBeGreaterThan(afterMultiTouchTop);
+
+      // Pointerup finishes drag cleanly, persists position, and suppresses trailing click
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 11,
+          pointerType: "touch",
+          clientX: 120,
+          clientY: 420,
+        }),
+      );
+      expect(releaseCalls).toEqual([11]);
+      expect(rootEl.classList.contains("is-dragging")).toBe(false);
+      const persistedAfterUp = JSON.parse(storeMap.get("gg:chatHeadsPos") ?? "null");
+      expect(persistedAfterUp).toEqual({
+        xPct: expect.any(Number),
+        yPct: expect.any(Number),
+      });
+      expect(persistedAfterUp.xPct).toBeCloseTo(beforeUpLeft, 3);
+      expect(persistedAfterUp.yPct).toBeCloseTo(beforeUpTop, 3);
+
+      btn.click();
+      await flushMicrotasks();
+      expect(navCalls).toEqual([]);
+
+      // 2. Direct lostpointercapture on rootEl (target === rootEl) ends drag cleanly and persists position
+      emitChildLossOnCapture = false;
+      btn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 21,
+          pointerType: "touch",
+          button: 0,
+          clientX: 120,
+          clientY: 420,
+        }),
+      );
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 21,
+          pointerType: "touch",
+          clientX: 210,
+          clientY: 460,
+        }),
+      );
+      expect(rootEl.classList.contains("is-dragging")).toBe(true);
+      const leftBeforeRootLoss = parseFloat(rootEl.style.left);
+      expect(leftBeforeRootLoss).toBeGreaterThan(persistedAfterUp.xPct);
+
+      rootEl.dispatchEvent(
+        new PointerEvt("lostpointercapture", {
+          bubbles: true,
+          pointerId: 21,
+          pointerType: "touch",
+        }),
+      );
+      expect(rootEl.classList.contains("is-dragging")).toBe(false);
+      const persistedAfterLoss = JSON.parse(storeMap.get("gg:chatHeadsPos") ?? "null");
+      expect(persistedAfterLoss.xPct).toBeCloseTo(leftBeforeRootLoss, 3);
+
+      // 3. Mobile CSS declarations check
+      const rootCssMatch = GUIDED_GENERATIONS_CSS.match(/(?:^|\n)\.gg-chat-heads-root\s*\{([^}]*)\}/);
+      const headCssMatch = GUIDED_GENERATIONS_CSS.match(/(?:^|\n)\.gg-chat-head\s*\{([^}]*)\}/);
+      expect(rootCssMatch?.[1]).toContain("overflow: visible;");
+      expect(rootCssMatch?.[1]).not.toContain("overflow-y: auto");
+      expect(headCssMatch?.[1]).toContain("touch-action: none;");
+      expect(headCssMatch?.[1]).toContain("-webkit-touch-callout: none;");
+    } finally {
+      controller.destroy();
+      Object.defineProperty(win, "innerWidth", { value: origInnerWidth, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: origInnerHeight, configurable: true });
+      if (origLocalStorage === undefined) {
+        delete (globalThis as unknown as { localStorage?: Storage }).localStorage;
+      } else {
+        (globalThis as unknown as { localStorage: Storage }).localStorage = origLocalStorage;
+      }
+    }
+  });
+
+  test("lazy settings drawer (detached tabRoot): defers component mounts and catalogs until activateDrawer(), ignores connections.subscribe while unmounted, and buffers notice/busy/recovery safely", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      detachDrawerTab: true,
+      composerMounted: true,
+      composerText: "",
+      frontendConnectionsFallback: [
+        {
+          id: "fb-1",
+          name: "Fallback Profile",
+          provider: "openai",
+          model: "gpt-4o-mini",
+          is_default: true,
+        },
+      ],
+    });
+    const teardown = setup(h.ctx);
+    try {
+      expect(h.tabRoot.isConnected).toBe(false);
+
+      // Startup refresh requests get_bootstrap with { includeCatalogs: false }
+      const startupBootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(startupBootstraps).toHaveLength(1);
+      expect(startupBootstraps[0]!.input).toEqual({ includeCatalogs: false });
+
+      h.resolveLastRpc(
+        makeBootstrapView({ connections: [], presets: [], recovery: [] }),
+        "get_bootstrap",
+      );
+      await flushMicrotasks();
+
+      // Zero drawer components mounted and frontend connections fallback NOT invoked
+      expect(h.getMountCounts()).toEqual({
+        switch: 0,
+        select: 0,
+        combobox: 0,
+        textArea: 0,
+      });
+      expect(h.tabRoot.children.length).toBe(0);
+      expect(h.getConnectionsListCalls()).toBe(0);
+
+      // Toolbar IS still rendered and functional while drawer is unmounted
+      expect(h.actionsMount.querySelectorAll("button")).toHaveLength(6);
+
+      // connections.subscribe is ignored while drawer is unmounted
+      h.emitConnectionsChange();
+      await flushMicrotasks();
+      expect(h.sentRpcs.filter((r) => r.action === "get_bootstrap")).toHaveLength(1);
+
+      // Buffer notice (empty guided_response), busy state (activeRun), and recovery entry while unmounted
+      const responseBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+      responseBtn.click();
+      await flushMicrotasks();
+      expect(h.alertMount.textContent).toContain("Type guidance");
+
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: {
+          runId: "run-busy",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+        },
+      });
+      const recEntry: RecoveryEntry = {
+        id: "rec-buffered",
+        text: "Buffered draft while unmounted",
+        actionId: "guided_response",
+        chatId: "chat-a",
+        createdAt: 42,
+      };
+      h.emitFromBackend({
+        type: "gg:recovery-updated",
+        recovery: [recEntry],
+      });
+      await flushMicrotasks();
+
+      // Still 0 drawer component mounts
+      expect(h.getMountCounts()).toEqual({
+        switch: 0,
+        select: 0,
+        combobox: 0,
+        textArea: 0,
+      });
+      expect(h.tabRoot.children.length).toBe(0);
+
+      // Opening drawer mounts synchronously with buffered notice, recovery, and busy state,
+      // AND immediately requests get_bootstrap({ includeCatalogs: true })
+      h.activateDrawer();
+
+      expect(h.getMountCounts()).toEqual({
+        switch: 16,
+        select: 21,
+        combobox: 5,
+        textArea: 5,
+      });
+      expect(h.tabRoot.querySelector(".gg-notice")?.textContent).toContain("Type guidance");
+      const restoreBtn = h.tabRoot.querySelector<HTMLButtonElement>(".gg-recovery-item button");
+      expect(restoreBtn).not.toBeNull();
+      expect(restoreBtn!.disabled).toBe(true);
+      const clearBtn = h.tabRoot.querySelector<HTMLButtonElement>(
+        'button[data-gg-focus-key="clear-recovery"]',
+      )!;
+      expect(clearBtn.disabled).toBe(true);
+
+      const postActivateBootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(postActivateBootstraps).toHaveLength(2);
+      expect(postActivateBootstraps[1]!.input).toEqual({ includeCatalogs: true });
+
+      // Resolving the catalog bootstrap triggers frontend connection fallback and re-renders with catalogs
+      const catalogView = makeBootstrapView({
+        connections: [],
+        presets: [{ id: "p-fresh", name: "Fresh Preset" }],
+        recovery: [recEntry],
+      });
+      h.resolveLastRpc(catalogView, "get_bootstrap");
+      await flushMicrotasks();
+      expect(h.getConnectionsListCalls()).toBe(1);
+
+      // Re-activating drawer when nothing changed uses onlyIfChanged + areJsonValuesEqual (zero teardown)
+      const destroysAfterCatalogLoad = h.getDestroyCounts();
+      h.activateDrawer();
+      const thirdBootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(thirdBootstraps).toHaveLength(3);
+      expect(thirdBootstraps[2]!.input).toEqual({ includeCatalogs: true });
+      h.resolveLastRpc(catalogView, "get_bootstrap");
+      await flushMicrotasks();
+      expect(h.getDestroyCounts()).toEqual(destroysAfterCatalogLoad);
+
+      // Once drawer is mounted, connections.subscribe DOES trigger catalog refresh
+      h.emitConnectionsChange();
+      const fourthBootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(fourthBootstraps).toHaveLength(4);
+      expect(fourthBootstraps[3]!.input).toEqual({ includeCatalogs: true });
+    } finally {
+      teardown();
+    }
+  });
+
+  test("lazy settings drawer edge cases: pre-bootstrap activation renders loading state cleanly, and custom-docked containers mount via getTabLocation or IntersectionObserver", async () => {
+    // 1. Activating before initial get_bootstrap resolves shows loading UI synchronously
+    //    and supersedes stale { includeCatalogs: false } response
+    const h1 = createFrontendHarness({ initialChatId: "chat-a", detachDrawerTab: true });
+    const teardown1 = setup(h1.ctx);
+    try {
+      const req1 = h1.sentRpcs.filter((r) => r.action === "get_bootstrap")[0]!;
+      expect(req1.input).toEqual({ includeCatalogs: false });
+
+      h1.activateDrawer();
+      expect(h1.tabRoot.textContent).toContain("Loading Guided Generations settings");
+      expect(h1.getMountCounts()).toEqual({ switch: 0, select: 0, combobox: 0, textArea: 0 });
+
+      const req2 = h1.sentRpcs.filter((r) => r.action === "get_bootstrap")[1]!;
+      expect(req2.input).toEqual({ includeCatalogs: true });
+
+      // Stale req1 resolves -> ignored
+      h1.emitFromBackend({
+        type: "gg:reply",
+        requestId: req1.requestId,
+        result: makeBootstrapView({ connections: [], presets: [] }),
+      });
+      await flushMicrotasks();
+      expect(h1.getMountCounts()).toEqual({ switch: 0, select: 0, combobox: 0, textArea: 0 });
+
+      // Fresh req2 resolves -> mounts full drawer
+      h1.emitFromBackend({
+        type: "gg:reply",
+        requestId: req2.requestId,
+        result: makeBootstrapView(),
+      });
+      await flushMicrotasks();
+      expect(h1.getMountCounts()).toEqual({
+        switch: 16,
+        select: 21,
+        combobox: 5,
+        textArea: 5,
+      });
+    } finally {
+      teardown1();
+    }
+
+    // 2. Tab already docked into a custom container at startup (getTabLocation !== main-drawer)
+    const h2 = createFrontendHarness({
+      initialChatId: "chat-a",
+      detachDrawerTab: true,
+      tabLocation: { kind: "container", containerId: "canvas-dock" },
+    });
+    const teardown2 = setup(h2.ctx);
+    try {
+      const req = h2.sentRpcs.filter((r) => r.action === "get_bootstrap")[0]!;
+      expect(req.input).toEqual({ includeCatalogs: true });
+      h2.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+      expect(h2.getMountCounts()).toEqual({
+        switch: 16,
+        select: 21,
+        combobox: 5,
+        textArea: 5,
+      });
+    } finally {
+      teardown2();
+    }
+
+    // 3. Tab starts detached in main-drawer and is later docked into a custom container
+    //    observed via IntersectionObserver without onActivate ever firing
+    const origIntersectionObserver = (
+      globalThis as unknown as { IntersectionObserver?: typeof IntersectionObserver }
+    ).IntersectionObserver;
+    const observerState: {
+      callback: ((entries: Array<{ isIntersecting: boolean }>) => void) | null;
+      observedTarget: Element | null;
+      disconnectCalls: number;
+    } = {
+      callback: null,
+      observedTarget: null,
+      disconnectCalls: 0,
+    };
+
+    (globalThis as unknown as { IntersectionObserver: unknown }).IntersectionObserver = class {
+      constructor(cb: (entries: Array<{ isIntersecting: boolean }>) => void) {
+        observerState.callback = cb;
+      }
+      observe(target: Element) {
+        observerState.observedTarget = target;
+      }
+      disconnect() {
+        observerState.disconnectCalls += 1;
+      }
+    };
+
+    const h3 = createFrontendHarness({ initialChatId: "chat-a", detachDrawerTab: true });
+    const teardown3 = setup(h3.ctx);
+    try {
+      expect(observerState.observedTarget).toBe(h3.tabRoot);
+      expect(h3.sentRpcs.filter((r) => r.action === "get_bootstrap")[0]!.input).toEqual({
+        includeCatalogs: false,
+      });
+      h3.resolveLastRpc(makeBootstrapView({ connections: [], presets: [] }), "get_bootstrap");
+      await flushMicrotasks();
+
+      // Initial non-intersecting delivery while detached must keep drawer unmounted
+      observerState.callback?.([{ isIntersecting: false }]);
+      expect(h3.getMountCounts()).toEqual({ switch: 0, select: 0, combobox: 0, textArea: 0 });
+      expect(observerState.disconnectCalls).toBe(0);
+
+      // ContainerTabContent appends tabRoot into a visible container -> observer fires
+      document.body.append(h3.tabRoot);
+      observerState.callback?.([{ isIntersecting: true }]);
+
+      expect(observerState.disconnectCalls).toBe(1);
+      expect(h3.getMountCounts()).toEqual({
+        switch: 16,
+        select: 21,
+        combobox: 5,
+        textArea: 5,
+      });
+      const postDockReq = h3.sentRpcs.filter((r) => r.action === "get_bootstrap")[1]!;
+      expect(postDockReq.input).toEqual({ includeCatalogs: true });
+
+      // 4. Direct SettingsDrawerController.destroy() disconnects any active observeTabConnection observer
+      //    even if caller never invokes the returned disposer
+      const directDisconnectBefore = observerState.disconnectCalls;
+      const directTabRoot = document.createElement("div");
+      const directDrawer = new SettingsDrawerController(
+        {
+          ui: {
+            registerDrawerTab: () => ({
+              root: directTabRoot,
+              tabId: "gg-direct-tab",
+              setTitle: () => {},
+              setShortName: () => {},
+              setBadge: () => {},
+              activate: () => {},
+              destroy: () => {},
+              onActivate: () => () => {},
+            }),
+          },
+        } as unknown as SpindleFrontendContext,
+        {
+          onRefresh: () => {},
+          onSaveSettings: async () => {},
+          onRestoreEntry: () => {},
+          onClearRecovery: async () => {},
+        },
+      );
+      directDrawer.observeTabConnection(() => {});
+      directDrawer.destroy();
+      expect(observerState.disconnectCalls).toBe(directDisconnectBefore + 1);
+    } finally {
+      teardown3();
+      if (origIntersectionObserver === undefined) {
+        delete (globalThis as unknown as { IntersectionObserver?: unknown }).IntersectionObserver;
+      } else {
+        (globalThis as unknown as { IntersectionObserver: typeof IntersectionObserver }).IntersectionObserver =
+          origIntersectionObserver;
+      }
+    }
+
+    // 5. Auto-detected tab connection inside refresh() renders drawer synchronously so an RPC failure
+    //    displays its error notice inside the connected tab instead of leaving the tab blank
+    const h4 = createFrontendHarness({ initialChatId: "chat-a", detachDrawerTab: true });
+    const teardown4 = setup(h4.ctx);
+    try {
+      h4.resolveLastRpc(makeBootstrapView({ connections: [], presets: [] }), "get_bootstrap");
+      await flushMicrotasks();
+      expect(h4.tabRoot.children.length).toBe(0);
+
+      // Tab becomes connected without onActivate (e.g. host container reparent), then gg:changed triggers refresh()
+      document.body.append(h4.tabRoot);
+      h4.emitFromBackend({ type: "gg:changed", reason: "permissions" });
+      const failedReq = h4.sentRpcs.filter((r) => r.action === "get_bootstrap")[1]!;
+      expect(failedReq.input).toEqual({ includeCatalogs: true });
+
+      // Drawer already mounted synchronously before RPC settles
+      expect(h4.tabRoot.querySelector(".gg-drawer")).not.toBeNull();
+
+      // If get_bootstrap rejects, the error notice renders inside the connected tab (never blank)
+      h4.rejectRpc(failedReq.requestId, "Bootstrap RPC failed");
+      await flushMicrotasks();
+      const drawerErrorNotice = h4.tabRoot.querySelector<HTMLElement>(".gg-notice.is-error");
+      expect(drawerErrorNotice).not.toBeNull();
+      expect(drawerErrorNotice!.textContent).toContain("Bootstrap RPC failed");
+    } finally {
+      teardown4();
+    }
+  });
+
+  test("InputToolbarController.render() memoization preserves exact button DOM nodes on unchanged toolbar state and updates on toolbar-relevant changes", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const getButtons = () =>
+        Array.from(h.actionsMount.querySelectorAll<HTMLButtonElement>("button"));
+      const initialButtons = getButtons();
+      expect(initialButtons).toHaveLength(6);
+
+      const expectSameButtonRefs = (expected: HTMLButtonElement[]) => {
+        const current = getButtons();
+        expect(current).toHaveLength(expected.length);
+        for (let i = 0; i < expected.length; i += 1) {
+          expect(current[i]).toBe(expected[i]);
+        }
+      };
+
+      // 1. Same-chat CHAT_CHANGED and duplicate chat.active preserve exact DOM button references
+      h.emitEvent("CHAT_CHANGED", { chatId: "chat-a" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      h.emitStateChange("chat.active", { chatId: "chat-a" });
+      expectSameButtonRefs(initialButtons);
+
+      // 2. Background-chat gg:status lifecycle (start -> streaming -> complete) preserves exact DOM nodes
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-b",
+        run: {
+          runId: "bg-1",
+          actionId: "guided_response",
+          chatId: "chat-b",
+          startedAt: 100,
+        },
+      });
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-b",
+        run: {
+          runId: "bg-1",
+          actionId: "guided_response",
+          chatId: "chat-b",
+          startedAt: 100,
+          hasContentOutput: true,
+        },
+      });
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-b",
+        run: null,
+        done: true,
+      });
+      expectSameButtonRefs(initialButtons);
+
+      // 3. Unrelated setting edit (instructionTemplate) preserves exact toolbar DOM nodes
+      h.triggerLastTextAreaChange("Updated unrelated instruction template {{input}}");
+      const firstTextarea = h.tabRoot.querySelector("textarea")!;
+      firstTextarea.dispatchEvent(
+        new (document.defaultView!.FocusEvent)("focusout", { bubbles: true }),
+      );
+      await flushMicrotasks();
+      expect(h.sentRpcs.filter((r) => r.action === "save_settings").length).toBeGreaterThanOrEqual(
+        1,
+      );
+      expectSameButtonRefs(initialButtons);
+
+      // 4. Active run start updates toolbar DOM; non-toolbar progress fields (hasContentOutput/messageId) preserve running DOM nodes
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: {
+          runId: "fg-1",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: 200,
+        },
+      });
+      const runningButtons = getButtons();
+      const continueRunningBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_continue"]',
+      )!;
+      expect(continueRunningBtn.classList.contains("is-running")).toBe(true);
+      expect(continueRunningBtn).not.toBe(initialButtons[1]);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: {
+          runId: "fg-1",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: 200,
+          hasContentOutput: true,
+          messageId: "msg-1",
+          swipeId: 0,
+        },
+      });
+      expectSameButtonRefs(runningButtons);
+
+      // Finish run -> idle buttons restored
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        run: null,
+        done: true,
+      });
+      const idleButtons = getButtons();
+      expect(
+        h.actionsMount
+          .querySelector<HTMLButtonElement>('[data-gg-action="guided_continue"]')!
+          .classList.contains("is-running"),
+      ).toBe(false);
+
+      // 5. Chat switch between two idle chats closes open Continue menu without tearing down buttons
+      const continueBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_continue"]',
+      )!;
+      continueBtn.dispatchEvent(
+        new (document.defaultView!.MouseEvent)("click", {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+        }),
+      );
+      expect(document.body.querySelector(".gg-dropup-menu")).not.toBeNull();
+
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+      expectSameButtonRefs(idleButtons);
+
+      // 6. hasActiveChat change (chat-b -> null -> chat-a) updates disabled state properly
+      h.setChat(null, { mounted: false, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: null });
+      expect(
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_response"]')!
+          .disabled,
+      ).toBe(true);
+
+      h.setChat("chat-a", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      expect(
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_response"]')!
+          .disabled,
+      ).toBe(false);
+
+      // 7. Recovery updates: empty -> populated updates aria-label/title; adding older entry preserves button DOM
+      //    while refreshing an open recovery History menu live; changing latest entry or emptying updates button DOM
+      const rec1: RecoveryEntry = {
+        id: "rec-1",
+        text: "First saved draft",
+        actionId: "guided_response",
+        chatId: "chat-a",
+        createdAt: 100,
+      };
+      const rec2: RecoveryEntry = {
+        id: "rec-2",
+        text: "Older saved draft",
+        actionId: "guided_swipe",
+        chatId: "chat-a",
+        createdAt: 50,
+      };
+      const rec3: RecoveryEntry = {
+        id: "rec-3",
+        text: "Newest saved draft",
+        actionId: "guided_continue",
+        chatId: "chat-a",
+        createdAt: 200,
+      };
+
+      h.emitFromBackend({ type: "gg:recovery-updated", recovery: [rec1] });
+      const recBtnAfterFirst = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="input_recovery"]',
+      )!;
+      expect(recBtnAfterFirst.getAttribute("aria-label")).toBe("Restore last input");
+      expect(recBtnAfterFirst.title).toContain("First saved draft");
+
+      const buttonsWithRec1 = getButtons();
+      recBtnAfterFirst.dispatchEvent(
+        new (document.defaultView!.MouseEvent)("click", {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+        }),
+      );
+      document.body
+        .querySelector<HTMLButtonElement>('.gg-dropup-menu [data-gg-menu-action="history"]')!
+        .click();
+      expect(document.body.querySelectorAll('.gg-dropup-menu [role="menuitem"]')).toHaveLength(1);
+
+      // Adding an older entry keeps recovery[0] identical -> toolbar buttons stay ===, open History menu updates live!
+      h.emitFromBackend({ type: "gg:recovery-updated", recovery: [rec1, rec2] });
+      expectSameButtonRefs(buttonsWithRec1);
+      const liveHistoryItems = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>('.gg-dropup-menu [role="menuitem"]'),
+      );
+      expect(liveHistoryItems.map((el) => el.getAttribute("data-gg-recovery-id"))).toEqual([
+        "rec-1",
+        "rec-2",
+      ]);
+
+      // Changing latest entry updates recovery button title
+      h.emitFromBackend({ type: "gg:recovery-updated", recovery: [rec3, rec1, rec2] });
+      expect(
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!.title,
+      ).toContain("Newest saved draft");
+
+      // Emptying recovery updates aria-label back to Clear current input
+      h.emitFromBackend({ type: "gg:recovery-updated", recovery: [] });
+      expect(
+        h.actionsMount
+          .querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!
+          .getAttribute("aria-label"),
+      ).toBe("Clear current input");
+    } finally {
+      teardown();
+    }
+
+    // 8. Direct InputToolbarController checks for enabled, buttonOrder, placement/alignment,
+    //    activeRun.runId swap, and external host detach recovery
+    const abortedRunIds: string[] = [];
+    const actionsMount = document.createElement("div");
+    const rowMount = document.createElement("div");
+    document.body.append(actionsMount, rowMount);
+
+    const toolbar = new InputToolbarController(
+      {
+        ui: {
+          mount: (point: string) => (point === "chat_toolbar" ? rowMount : actionsMount),
+        },
+      } as unknown as SpindleFrontendContext,
+      {
+        onTriggerAction: () => {},
+        onAbortAction: (runId) => abortedRunIds.push(runId),
+        onRestoreLatest: () => {},
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      },
+    );
+
+    try {
+      const settings = createDefaultSettings();
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      const snap1 = Array.from(actionsMount.querySelectorAll<HTMLButtonElement>("button"));
+
+      // Same state -> exact DOM refs preserved
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(Array.from(actionsMount.querySelectorAll<HTMLButtonElement>("button"))).toEqual(snap1);
+      expect(actionsMount.querySelectorAll("button")[0]).toBe(snap1[0]);
+
+      // Toggling action enabled updates buttons
+      settings.actions.guided_swipe.enabled = false;
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(actionsMount.querySelector('[data-gg-action="guided_swipe"]')).toBeNull();
+      expect(actionsMount.querySelectorAll("button")).toHaveLength(5);
+
+      // Toggling inputRecovery.enabled updates buttons
+      settings.inputRecovery.enabled = false;
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(actionsMount.querySelector('[data-gg-action="input_recovery"]')).toBeNull();
+      expect(actionsMount.querySelectorAll("button")).toHaveLength(4);
+
+      // Reordering buttonOrder updates DOM order
+      settings.buttonOrder = [
+        "guided_impersonate",
+        "guided_regenerate",
+        "guided_continue",
+        "guided_response",
+        "guided_swipe",
+        "input_recovery",
+      ];
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(
+        Array.from(actionsMount.querySelectorAll("button")).map((b) =>
+          b.getAttribute("data-gg-action"),
+        ),
+      ).toEqual([
+        "guided_impersonate",
+        "guided_regenerate",
+        "guided_continue",
+        "guided_response",
+      ]);
+
+      // Placement / alignment changes update classes and mount host
+      settings.toolbarPlacement = "before_native";
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(actionsMount.classList.contains("is-before-native")).toBe(true);
+
+      settings.toolbarPlacement = "right";
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(actionsMount.classList.contains("is-right")).toBe(true);
+      expect(actionsMount.classList.contains("is-before-native")).toBe(false);
+
+      settings.toolbarPlacement = "below_bar";
+      toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
+      expect(rowMount.classList.contains("gg-actions-host--row")).toBe(true);
+      expect(rowMount.querySelectorAll("button")).toHaveLength(4);
+
+      // Swapping activeRun.runId for same actionId rebinds Stop button click handler
+      toolbar.render({
+        settings,
+        activeRun: { runId: "run-1", actionId: "guided_response", chatId: "c1", startedAt: 1 },
+        recovery: [],
+        hasActiveChat: true,
+      });
+      toolbar.render({
+        settings,
+        activeRun: { runId: "run-2", actionId: "guided_response", chatId: "c1", startedAt: 2 },
+        recovery: [],
+        hasActiveChat: true,
+      });
+      rowMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_response"]')!.click();
+      expect(abortedRunIds).toEqual(["run-2"]);
+
+      // External detach from target mount recovers cleanly on next render even with identical state
+      rowMount.replaceChildren();
+      expect(rowMount.querySelectorAll("button")).toHaveLength(0);
+      toolbar.render({
+        settings,
+        activeRun: { runId: "run-2", actionId: "guided_response", chatId: "c1", startedAt: 2 },
+        recovery: [],
+        hasActiveChat: true,
+      });
+      expect(rowMount.querySelectorAll("button")).toHaveLength(4);
+    } finally {
+      toolbar.destroy();
+      actionsMount.remove();
+      rowMount.remove();
+    }
+  });
+
+  test("mobile touch UX & CSS optimizations: 450ms touch hold dismisses completed chat head (cancelled on >6px drag), touch pointerleave keeps toolbar hold alive, drop-up menu repositions on visualViewport/window resize, and CSS has coarse-pointer dismiss + prefers-reduced-motion + compositor pulses", async () => {
+    const win = document.defaultView!;
+    const PointerEvt = win.PointerEvent;
+    const MouseEvt = win.MouseEvent;
+    const origInnerWidth = win.innerWidth;
+    const origInnerHeight = win.innerHeight;
+    const origVisualViewport = Object.getOwnPropertyDescriptor(win, "visualViewport");
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origDateNow = Date.now;
+
+    let fakeNow = 70_000;
+    const holdTimers = new Map<number, () => void>();
+    let nextTimerId = 120_000;
+
+    Date.now = () => fakeNow;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 450) {
+        const id = ++nextTimerId;
+        holdTimers.set(id, () => fn(...args));
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const num = Number(id);
+      if (holdTimers.has(num)) {
+        holdTimers.delete(num);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    const fireHoldTimers = () => {
+      for (const [id, fn] of [...holdTimers.entries()]) {
+        if (!holdTimers.has(id)) continue;
+        holdTimers.delete(id);
+        fn();
+      }
+    };
+
+    const navCalls: string[] = [];
+    const headCtx = {
+      getActiveChat: () => ({ chatId: "chat-active" }),
+      events: { on: () => () => {} },
+      host: {
+        surfaces: {
+          invoke: (_ref: unknown, params: { chatId: string }) => {
+            navCalls.push(params.chatId);
+            return Promise.resolve();
+          },
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const headController = new ChatHeadController(headCtx);
+    const actionsMount = document.createElement("div");
+    document.body.append(actionsMount);
+    const triggeredActions: Array<{ actionId: string; backgroundSwipe?: boolean }> = [];
+    const toolbar = new InputToolbarController(
+      {
+        ui: { mount: () => actionsMount },
+      } as unknown as SpindleFrontendContext,
+      {
+        onTriggerAction: (actionId, opts) => {
+          triggeredActions.push({ actionId, backgroundSwipe: opts?.backgroundSwipe });
+        },
+        onAbortAction: () => {},
+        onRestoreLatest: () => {},
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      },
+    );
+
+    try {
+      Object.defineProperty(win, "innerWidth", { value: 390, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: 844, configurable: true });
+
+      // (a) Completed Chat Head 450ms touch long-press dismissal & >6px drag cancellation
+      headController.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-done-1", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+      headController.handleStatusEvent(
+        { type: "gg:status", chatId: "chat-done-2", run: null, done: true, aborted: false },
+        "chat-active",
+      );
+
+      const doneBtn1 = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-done-1"]',
+      )!;
+      const doneBtn2 = document.body.querySelector<HTMLButtonElement>(
+        '.gg-chat-head[data-chat-id="chat-done-2"]',
+      )!;
+      expect(doneBtn1.classList.contains("is-completed")).toBe(true);
+      expect(doneBtn2.classList.contains("is-completed")).toBe(true);
+
+      // Dragging > 6px cancels the 450ms hold-dismiss timer
+      doneBtn1.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 31,
+          pointerType: "touch",
+          button: 0,
+          clientX: 330,
+          clientY: 180,
+        }),
+      );
+      expect(holdTimers.size).toBe(1);
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 31,
+          pointerType: "touch",
+          clientX: 300,
+          clientY: 180,
+        }),
+      );
+      expect(holdTimers.size).toBe(0);
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 31,
+          pointerType: "touch",
+          clientX: 300,
+          clientY: 180,
+        }),
+      );
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-done-1"]')).toBe(
+        doneBtn1,
+      );
+
+      // Stationary 450ms touch hold on completed chat head dismisses it and suppresses trailing click
+      doneBtn1.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 32,
+          pointerType: "touch",
+          button: 0,
+          clientX: 300,
+          clientY: 180,
+        }),
+      );
+      expect(holdTimers.size).toBe(1);
+      fakeNow += 450;
+      fireHoldTimers();
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-done-1"]')).toBeNull();
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-done-2"]')).toBe(
+        doneBtn2,
+      );
+
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 32,
+          pointerType: "touch",
+          clientX: 300,
+          clientY: 180,
+        }),
+      );
+      doneBtn1.click();
+      await flushMicrotasks();
+      expect(navCalls).toEqual([]);
+
+      // (b) Toolbar long-press: touch pointerleave within 10px does NOT cancel hold, while mouse pointerleave DOES cancel
+      toolbar.render({
+        settings: createDefaultSettings(),
+        activeRun: null,
+        recovery: [],
+        hasActiveChat: true,
+      });
+
+      const swipeBtn = actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_swipe"]',
+      )!;
+
+      // Mouse pointerleave cancels hold
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 40,
+          clientY: 40,
+        }),
+      );
+      expect(holdTimers.size).toBe(1);
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointerleave", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "mouse",
+          clientX: 42,
+          clientY: 42,
+        }),
+      );
+      expect(holdTimers.size).toBe(0);
+      expect(swipeBtn.classList.contains("is-holding")).toBe(false);
+
+      // Touch pointerleave within 10px tolerance keeps hold alive and fires after 450ms
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 40,
+          clientY: 40,
+        }),
+      );
+      expect(holdTimers.size).toBe(1);
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 45,
+          clientY: 46,
+        }),
+      );
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointerleave", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 45,
+          clientY: 46,
+        }),
+      );
+      expect(holdTimers.size).toBe(1);
+      expect(swipeBtn.classList.contains("is-holding")).toBe(true);
+
+      fakeNow += 450;
+      fireHoldTimers();
+      expect(triggeredActions).toEqual([{ actionId: "guided_swipe", backgroundSwipe: true }]);
+      swipeBtn.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          isPrimary: true,
+          pointerType: "touch",
+          clientX: 45,
+          clientY: 46,
+        }),
+      );
+
+      // (c) Drop-up menu repositions on visualViewport & window resize instead of closing
+      const vpTarget = new win.EventTarget();
+      const fakeVisualViewport = Object.assign(vpTarget, {
+        width: 390,
+        height: 844,
+      });
+      Object.defineProperty(win, "visualViewport", {
+        value: fakeVisualViewport,
+        configurable: true,
+      });
+
+      const continueBtn = actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_continue"]',
+      )!;
+      let anchorTop = 760;
+      continueBtn.getBoundingClientRect = () =>
+        ({
+          left: 60,
+          right: 88,
+          top: anchorTop,
+          bottom: anchorTop + 26,
+          width: 28,
+          height: 26,
+          x: 60,
+          y: anchorTop,
+          toJSON: () => ({}),
+        }) as DOMRect;
+
+      continueBtn.dispatchEvent(
+        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      const menuEl = document.body.querySelector<HTMLDivElement>(".gg-dropup-menu")!;
+      expect(menuEl).not.toBeNull();
+      expect(menuEl.style.bottom).toBe("90px"); // (844 - 760) + 6
+
+      // Simulate mobile virtual keyboard opening: visualViewport.height shrinks to 480 and anchor moves up to 420
+      fakeVisualViewport.height = 480;
+      anchorTop = 420;
+      fakeVisualViewport.dispatchEvent(new win.Event("resize"));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBe(menuEl);
+      expect(menuEl.style.bottom).toBe("66px"); // (480 - 420) + 6
+
+      // Window resize (e.g. URL bar collapse) also keeps menu open and repositions
+      Object.defineProperty(win, "innerHeight", { value: 800, configurable: true });
+      fakeVisualViewport.height = 800;
+      anchorTop = 700;
+      win.dispatchEvent(new win.Event("resize"));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBe(menuEl);
+      expect(menuEl.style.bottom).toBe("106px"); // (800 - 700) + 6
+
+      // Disabling anchor button and firing resize closes the menu cleanly
+      continueBtn.disabled = true;
+      fakeVisualViewport.dispatchEvent(new win.Event("resize"));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+
+      // (d) CSS includes coarse-pointer dismiss visibility, prefers-reduced-motion, and compositor pseudo-element animations
+      expect(GUIDED_GENERATIONS_CSS).toContain("@media (hover: none), (pointer: coarse)");
+      expect(GUIDED_GENERATIONS_CSS).toContain("@media (prefers-reduced-motion: reduce)");
+      expect(GUIDED_GENERATIONS_CSS).toContain(".gg-btn.is-running::after");
+      expect(GUIDED_GENERATIONS_CSS).toContain(".gg-chat-head.is-running::after");
+      const btnCss = GUIDED_GENERATIONS_CSS.match(/(?:^|\n)\.gg-btn\s*\{([^}]*)\}/)?.[1] ?? "";
+      expect(btnCss).toContain("position: relative;");
+      expect(btnCss).toContain("touch-action: manipulation;");
+      expect(btnCss).toContain("-webkit-touch-callout: none;");
+    } finally {
+      headController.destroy();
+      toolbar.destroy();
+      actionsMount.remove();
+      Object.defineProperty(win, "innerWidth", { value: origInnerWidth, configurable: true });
+      Object.defineProperty(win, "innerHeight", { value: origInnerHeight, configurable: true });
+      if (origVisualViewport) {
+        Object.defineProperty(win, "visualViewport", origVisualViewport);
+      } else {
+        delete (win as unknown as { visualViewport?: unknown }).visualViewport;
+      }
+      Date.now = origDateNow;
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
     }
   });
 });

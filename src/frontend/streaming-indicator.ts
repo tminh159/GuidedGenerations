@@ -178,6 +178,13 @@ export class StreamingIndicatorController {
           ? payload.messageId
           : undefined;
 
+    if (
+      eventMessageId !== undefined &&
+      eventMessageId !== this.currentRun.messageId
+    ) {
+      return;
+    }
+
     if (eventMessageId === this.currentRun.messageId) {
       const nextSwipeId =
         typeof msg?.swipe_id === "number"

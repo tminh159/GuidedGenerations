@@ -38,6 +38,79 @@ export interface ToolbarRenderState {
   activeRun: ActiveRunState | null;
   recovery: readonly RecoveryEntry[];
   hasActiveChat: boolean;
+  chatId?: string | null;
+}
+
+interface ToolbarRenderSignature {
+  placement: ToolbarPlacement;
+  order: readonly ToolbarOptionId[];
+  enabledMask: number;
+  hasActiveChat: boolean;
+  hasActiveRun: boolean;
+  activeRunId: string | null;
+  activeRunActionId: GuidedActionId | null;
+  hasRecovery: boolean;
+  latestRecoveryPreview: string;
+}
+
+function formatLatestRecoveryPreview(recovery: readonly RecoveryEntry[]): string {
+  return recovery[0]?.text
+    ? ` ("${recovery[0].text.replace(/\s+/g, " ").trim().slice(0, 48)}")`
+    : "";
+}
+
+function buildToolbarRenderSignature(
+  state: ToolbarRenderState,
+): ToolbarRenderSignature {
+  const placement = normalizeToolbarPlacement(state.settings.toolbarPlacement);
+  const order = normalizeButtonOrder(state.settings.buttonOrder);
+  let enabledMask = 0;
+  if (state.settings.actions.guided_response?.enabled) enabledMask |= 1 << 0;
+  if (state.settings.actions.guided_continue?.enabled) enabledMask |= 1 << 1;
+  if (state.settings.actions.guided_regenerate?.enabled) enabledMask |= 1 << 2;
+  if (state.settings.actions.guided_swipe?.enabled) enabledMask |= 1 << 3;
+  if (state.settings.actions.guided_impersonate?.enabled) enabledMask |= 1 << 4;
+  if (state.settings.inputRecovery.enabled) enabledMask |= 1 << 5;
+
+  const recoveryEnabled = Boolean(state.settings.inputRecovery.enabled);
+  const hasRecovery = recoveryEnabled && state.recovery.length > 0;
+
+  return {
+    placement,
+    order,
+    enabledMask,
+    hasActiveChat: Boolean(state.hasActiveChat),
+    hasActiveRun: Boolean(state.activeRun),
+    activeRunId: state.activeRun?.runId ?? null,
+    activeRunActionId: state.activeRun?.actionId ?? null,
+    hasRecovery,
+    latestRecoveryPreview: hasRecovery
+      ? formatLatestRecoveryPreview(state.recovery)
+      : "",
+  };
+}
+
+function areToolbarSignaturesEqual(
+  a: ToolbarRenderSignature,
+  b: ToolbarRenderSignature,
+): boolean {
+  if (
+    a.placement !== b.placement ||
+    a.enabledMask !== b.enabledMask ||
+    a.hasActiveChat !== b.hasActiveChat ||
+    a.hasActiveRun !== b.hasActiveRun ||
+    a.activeRunId !== b.activeRunId ||
+    a.activeRunActionId !== b.activeRunActionId ||
+    a.hasRecovery !== b.hasRecovery ||
+    a.latestRecoveryPreview !== b.latestRecoveryPreview ||
+    a.order.length !== b.order.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < a.order.length; i += 1) {
+    if (a.order[i] !== b.order[i]) return false;
+  }
+  return true;
 }
 
 const HOST_CLASSES = [
@@ -55,10 +128,12 @@ const POST_RELEASE_SUPPRESS_MS = 0;
 const POST_RELEASE_MAX_WINDOW_MS = 250;
 
 interface ContinueMenuSession {
+  kind: "continue" | "recovery";
   menuEl: HTMLDivElement;
   anchorBtn: HTMLButtonElement;
   items: HTMLButtonElement[];
   cleanup: () => void;
+  refreshRecovery?: () => void;
 }
 
 export class InputToolbarController {
@@ -76,6 +151,8 @@ export class InputToolbarController {
   private postHoldCleanup: (() => void) | null = null;
   private continueMenu: ContinueMenuSession | null = null;
   private latestRecovery: readonly RecoveryEntry[] = [];
+  private lastRenderSignature: ToolbarRenderSignature | null = null;
+  private lastChatId: string | null | undefined = undefined;
   private destroyed = false;
   private readonly onKeyDown: (event: KeyboardEvent) => void;
   private readonly onFocusIn: (event: FocusEvent) => void;
@@ -113,6 +190,40 @@ export class InputToolbarController {
 
   render(state: ToolbarRenderState): void {
     if (this.destroyed) return;
+
+    const chatChanged =
+      state.chatId !== undefined &&
+      this.lastChatId !== undefined &&
+      state.chatId !== this.lastChatId;
+    if (state.chatId !== undefined) {
+      this.lastChatId = state.chatId;
+    }
+
+    const nextSignature = buildToolbarRenderSignature(state);
+    const targetMount =
+      nextSignature.placement === "below_bar"
+        ? this.toolbarMountRoot
+        : this.actionsMountRoot;
+    const isAttachedToTarget =
+      targetMount !== null &&
+      this.toolbarEl.parentElement === targetMount &&
+      this.toolbarEl.childElementCount === this.buttons.length;
+
+    if (
+      this.lastRenderSignature !== null &&
+      isAttachedToTarget &&
+      areToolbarSignaturesEqual(this.lastRenderSignature, nextSignature)
+    ) {
+      this.latestRecovery = state.recovery;
+      if (chatChanged) {
+        this.closeContinueMenu({ restoreFocus: false });
+        this.clearActiveHold();
+      } else if (this.continueMenu?.kind === "recovery") {
+        this.continueMenu.refreshRecovery?.();
+      }
+      return;
+    }
+
     const activeEl = typeof document !== "undefined" ? document.activeElement : null;
     const focusedActionId =
       activeEl && this.toolbarEl.contains(activeEl)
@@ -123,9 +234,8 @@ export class InputToolbarController {
     this.clearActiveHold();
     this.latestRecovery = state.recovery;
     const buttons: HTMLButtonElement[] = [];
-    const order = normalizeButtonOrder(state.settings.buttonOrder);
 
-    for (const optionId of order) {
+    for (const optionId of nextSignature.order) {
       const btn =
         optionId === "input_recovery"
           ? this.buildRecoveryButton(state)
@@ -138,8 +248,8 @@ export class InputToolbarController {
     this.applyRovingTabIndex();
 
     const visible = buttons.length > 0;
-    const placement = normalizeToolbarPlacement(state.settings.toolbarPlacement);
-    this.applyPlacement(placement, visible);
+    this.applyPlacement(nextSignature.placement, visible);
+    this.lastRenderSignature = nextSignature;
 
     if (focusedActionId) {
       const matchingBtn = this.buttons.find(
@@ -467,7 +577,10 @@ export class InputToolbarController {
 
     btn.addEventListener("pointerup", cancelHold);
     btn.addEventListener("pointercancel", cancelHold);
-    btn.addEventListener("pointerleave", cancelHold);
+    btn.addEventListener("pointerleave", (event) => {
+      if (event.pointerType === "touch") return;
+      cancelHold();
+    });
 
     btn.addEventListener("contextmenu", (event) => {
       if (hold.timer !== undefined || hold.fired || this.isHoldClickSuppressed(btn)) {
@@ -673,8 +786,34 @@ export class InputToolbarController {
       this.closeContinueMenu({ restoreFocus: false });
     };
 
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    const visualVp = win?.visualViewport ?? null;
+    let lastVw = win?.innerWidth;
+    let lastVh = win?.innerHeight;
+
+    const handleViewportResize = (fromVisualViewport: boolean) => {
+      if (!anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
+        this.closeContinueMenu({ restoreFocus: false });
+        return;
+      }
+      const nextVw = win?.innerWidth;
+      const nextVh = win?.innerHeight;
+      const dimensionsChanged = nextVw !== lastVw || nextVh !== lastVh;
+      lastVw = nextVw;
+      lastVh = nextVh;
+      if (!fromVisualViewport && !visualVp && !dimensionsChanged) {
+        this.closeContinueMenu({ restoreFocus: false });
+        return;
+      }
+      this.positionContinueMenu(menuEl, anchorBtn);
+    };
+
     const onViewportResize = () => {
-      this.closeContinueMenu({ restoreFocus: false });
+      handleViewportResize(false);
+    };
+
+    const onVisualViewportResize = () => {
+      handleViewportResize(true);
     };
 
     const onViewportScroll = (event: Event) => {
@@ -683,7 +822,6 @@ export class InputToolbarController {
       this.closeContinueMenu({ restoreFocus: false });
     };
 
-    const win = typeof window !== "undefined" ? window : document.defaultView;
     menuEl.addEventListener("keydown", onMenuKeyDown);
     document.addEventListener("keydown", onDocumentKeyDown, true);
     document.addEventListener("pointerdown", onOutsidePointerDown, true);
@@ -693,6 +831,7 @@ export class InputToolbarController {
       win.addEventListener("resize", onViewportResize);
       win.addEventListener("scroll", onViewportScroll, true);
     }
+    visualVp?.addEventListener("resize", onVisualViewportResize);
 
     const cleanup = () => {
       menuEl.removeEventListener("keydown", onMenuKeyDown);
@@ -704,10 +843,11 @@ export class InputToolbarController {
         win.removeEventListener("resize", onViewportResize);
         win.removeEventListener("scroll", onViewportScroll, true);
       }
+      visualVp?.removeEventListener("resize", onVisualViewportResize);
       menuEl.remove();
     };
 
-    this.continueMenu = { menuEl, anchorBtn, items, cleanup };
+    this.continueMenu = { kind: "continue", menuEl, anchorBtn, items, cleanup };
     items[0]?.focus();
   }
 
@@ -736,14 +876,31 @@ export class InputToolbarController {
           : Number.isFinite(varScale) && varScale > 0 && varScale !== 1
             ? varScale
             : 1;
-    const vw =
+    const rawVw =
       win && typeof win.innerWidth === "number"
         ? win.innerWidth
         : document.documentElement?.clientWidth || 1024;
-    const vh =
+    const rawVh =
       win && typeof win.innerHeight === "number"
         ? win.innerHeight
         : document.documentElement?.clientHeight || 768;
+    const visualVp = win?.visualViewport;
+    const vw =
+      visualVp &&
+      typeof visualVp.width === "number" &&
+      Number.isFinite(visualVp.width) &&
+      visualVp.width > 0 &&
+      visualVp.width < rawVw
+        ? visualVp.width
+        : rawVw;
+    const vh =
+      visualVp &&
+      typeof visualVp.height === "number" &&
+      Number.isFinite(visualVp.height) &&
+      visualVp.height > 0 &&
+      visualVp.height < rawVh
+        ? visualVp.height
+        : rawVh;
 
     menuEl.style.maxHeight = "";
     menuEl.style.overflowY = "";
@@ -812,9 +969,7 @@ export class InputToolbarController {
 
     const hasRecovery = state.recovery.length > 0;
     const disabled = Boolean(state.activeRun);
-    const latestPreview = state.recovery[0]?.text
-      ? ` ("${state.recovery[0].text.replace(/\s+/g, " ").trim().slice(0, 48)}")`
-      : "";
+    const latestPreview = formatLatestRecoveryPreview(state.recovery);
 
     const recoverBtn = document.createElement("button");
     recoverBtn.type = "button";
@@ -891,8 +1046,33 @@ export class InputToolbarController {
     const items: HTMLButtonElement[] = [];
     let inHistoryView = false;
 
-    const renderRootOptions = () => {
+    const snapshotRecovery = () =>
+      this.latestRecovery.map((entry) => ({
+        id: entry.id,
+        text: entry.text,
+        actionId: entry.actionId,
+      }));
+    let renderedRecovery = snapshotRecovery();
+
+    const hasRecoveryChanged = (): boolean => {
+      if (renderedRecovery.length !== this.latestRecovery.length) return true;
+      for (let i = 0; i < renderedRecovery.length; i += 1) {
+        const prev = renderedRecovery[i]!;
+        const next = this.latestRecovery[i]!;
+        if (
+          prev.id !== next.id ||
+          prev.text !== next.text ||
+          prev.actionId !== next.actionId
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const renderRootOptions = (focusFirst = true) => {
       inHistoryView = false;
+      renderedRecovery = snapshotRecovery();
       items.length = 0;
       menuEl.replaceChildren();
       menuEl.setAttribute("aria-label", "Input Recovery options");
@@ -947,12 +1127,15 @@ export class InputToolbarController {
 
       if (menuEl.isConnected) {
         this.positionContinueMenu(menuEl, anchorBtn);
-        items[0]?.focus();
+        if (focusFirst) {
+          items[0]?.focus();
+        }
       }
     };
 
-    const renderHistoryView = () => {
+    const renderHistoryView = (focusInitial = true) => {
       inHistoryView = true;
+      renderedRecovery = snapshotRecovery();
       items.length = 0;
       menuEl.replaceChildren();
       menuEl.setAttribute("aria-label", "Input Recovery History");
@@ -1039,8 +1222,48 @@ export class InputToolbarController {
 
       if (menuEl.isConnected) {
         this.positionContinueMenu(menuEl, anchorBtn);
-        const initialFocusItem = this.latestRecovery.length > 0 ? items[1] ?? items[0] : items[0];
-        initialFocusItem?.focus();
+        if (focusInitial) {
+          const initialFocusItem = this.latestRecovery.length > 0 ? items[1] ?? items[0] : items[0];
+          initialFocusItem?.focus();
+        }
+      }
+    };
+
+    const refreshRecovery = () => {
+      if (!hasRecoveryChanged()) return;
+      const active = typeof document !== "undefined" ? document.activeElement : null;
+      const hadFocusInMenu = Boolean(active && menuEl.contains(active));
+      const focusedRecoveryId = hadFocusInMenu
+        ? (active as Element).getAttribute?.("data-gg-recovery-id")
+        : null;
+      const focusedMenuAction = hadFocusInMenu
+        ? (active as Element).getAttribute?.("data-gg-menu-action")
+        : null;
+
+      if (inHistoryView) {
+        renderHistoryView(false);
+      } else {
+        renderRootOptions(false);
+      }
+
+      if (hadFocusInMenu) {
+        const nextFocus =
+          (focusedRecoveryId
+            ? items.find(
+                (el) =>
+                  !el.disabled &&
+                  el.getAttribute("data-gg-recovery-id") === focusedRecoveryId,
+              )
+            : undefined) ??
+          (focusedMenuAction
+            ? items.find(
+                (el) =>
+                  !el.disabled &&
+                  el.getAttribute("data-gg-menu-action") === focusedMenuAction,
+              )
+            : undefined) ??
+          items.find((el) => !el.disabled);
+        nextFocus?.focus();
       }
     };
 
@@ -1125,8 +1348,34 @@ export class InputToolbarController {
       this.closeContinueMenu({ restoreFocus: false });
     };
 
+    const win = typeof window !== "undefined" ? window : document.defaultView;
+    const visualVp = win?.visualViewport ?? null;
+    let lastVw = win?.innerWidth;
+    let lastVh = win?.innerHeight;
+
+    const handleViewportResize = (fromVisualViewport: boolean) => {
+      if (!anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
+        this.closeContinueMenu({ restoreFocus: false });
+        return;
+      }
+      const nextVw = win?.innerWidth;
+      const nextVh = win?.innerHeight;
+      const dimensionsChanged = nextVw !== lastVw || nextVh !== lastVh;
+      lastVw = nextVw;
+      lastVh = nextVh;
+      if (!fromVisualViewport && !visualVp && !dimensionsChanged) {
+        this.closeContinueMenu({ restoreFocus: false });
+        return;
+      }
+      this.positionContinueMenu(menuEl, anchorBtn);
+    };
+
     const onViewportResize = () => {
-      this.closeContinueMenu({ restoreFocus: false });
+      handleViewportResize(false);
+    };
+
+    const onVisualViewportResize = () => {
+      handleViewportResize(true);
     };
 
     const onViewportScroll = (event: Event) => {
@@ -1135,7 +1384,6 @@ export class InputToolbarController {
       this.closeContinueMenu({ restoreFocus: false });
     };
 
-    const win = typeof window !== "undefined" ? window : document.defaultView;
     menuEl.addEventListener("keydown", onMenuKeyDown);
     document.addEventListener("keydown", onDocumentKeyDown, true);
     document.addEventListener("pointerdown", onOutsidePointerDown, true);
@@ -1145,6 +1393,7 @@ export class InputToolbarController {
       win.addEventListener("resize", onViewportResize);
       win.addEventListener("scroll", onViewportScroll, true);
     }
+    visualVp?.addEventListener("resize", onVisualViewportResize);
 
     const cleanup = () => {
       menuEl.removeEventListener("keydown", onMenuKeyDown);
@@ -1156,10 +1405,18 @@ export class InputToolbarController {
         win.removeEventListener("resize", onViewportResize);
         win.removeEventListener("scroll", onViewportScroll, true);
       }
+      visualVp?.removeEventListener("resize", onVisualViewportResize);
       menuEl.remove();
     };
 
-    this.continueMenu = { menuEl, anchorBtn, items, cleanup };
+    this.continueMenu = {
+      kind: "recovery",
+      menuEl,
+      anchorBtn,
+      items,
+      cleanup,
+      refreshRecovery,
+    };
     items[0]?.focus();
   }
 
@@ -1213,6 +1470,8 @@ export class InputToolbarController {
     this.toolbarEl.removeEventListener("focusin", this.onFocusIn);
     this.buttons = [];
     this.activeActionId = null;
+    this.lastRenderSignature = null;
+    this.lastChatId = undefined;
     this.toolbarEl.replaceChildren();
     this.resetHostElement(this.actionsMountRoot, true);
     if (this.toolbarMountRoot) {

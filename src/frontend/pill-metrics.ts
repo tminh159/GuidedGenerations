@@ -238,6 +238,9 @@ export class PillMetricsController {
       if (chatId && entry.chatId !== chatId) continue;
 
       if (activeSwipeId !== undefined && activeSwipeId !== entry.swipeId) {
+        if (eventFallback !== null) {
+          entry.latestFallback = eventFallback;
+        }
         continue;
       }
 
@@ -256,6 +259,13 @@ export class PillMetricsController {
 
     for (const [key, entry] of [...this.pending.entries()]) {
       if (entry.chatId !== targetChatId) continue;
+      if (
+        entry.latestFallback &&
+        typeof entry.latestFallback.swipe_id === "number" &&
+        entry.latestFallback.swipe_id !== entry.swipeId
+      ) {
+        continue;
+      }
       entry.attempts = 0;
       this.enqueueFlush(key);
     }
@@ -454,7 +464,8 @@ export class PillMetricsController {
       return;
     }
     if (target.swipe_id !== snapshot.swipeId) {
-      // User is currently viewing a different swipe; keep queued until swiped back.
+      // User is currently viewing a different swipe; cache latest known swipe and keep queued until swiped back.
+      latestBeforeWrite.latestFallback = target;
       return;
     }
 

@@ -201,6 +201,7 @@ export class GuidedGenerationRunner {
   private readonly activeRuns = new Map<string, Map<string, InternalRun>>();
   private readonly pendingUsers = new Map<string, PendingRun[]>();
   private interceptorDisposer: InterceptorDisposer | null = null;
+  private disposed = false;
   private readonly pendingDryRunCaptures = new Map<string, PendingDryRunCapture>();
   private readonly chatDryRunQueues = new Map<string, Promise<unknown>>();
 
@@ -211,6 +212,7 @@ export class GuidedGenerationRunner {
   ) {}
 
   dispose(): void {
+    this.disposed = true;
     for (const userRuns of this.activeRuns.values()) {
       for (const run of userRuns.values()) {
         run.controller.abort();
@@ -228,29 +230,38 @@ export class GuidedGenerationRunner {
     this.pendingDryRunCaptures.clear();
     this.chatDryRunQueues.clear();
 
-    if (this.interceptorDisposer) {
+    this.disposeInterceptor();
+  }
+
+  private disposeInterceptor(): void {
+    if (!this.interceptorDisposer) return;
+    try {
       this.interceptorDisposer();
+    } finally {
       this.interceptorDisposer = null;
     }
   }
 
+  private releaseInterceptorIfIdle(): void {
+    if (this.pendingDryRunCaptures.size === 0 && this.interceptorDisposer) {
+      this.disposeInterceptor();
+    }
+  }
+
   syncInterceptorRegistration(): void {
-    if (!this.spindle.permissions?.has?.("interceptor")) {
-      if (this.interceptorDisposer) {
-        this.interceptorDisposer();
-        this.interceptorDisposer = null;
-      }
+    if (this.disposed || !this.spindle.permissions?.has?.("interceptor")) {
+      this.disposeInterceptor();
       return;
     }
-    this.ensureInterceptorRegistered();
+    if (this.pendingDryRunCaptures.size > 0) {
+      this.ensureInterceptorRegistered();
+    }
   }
 
   private ensureInterceptorRegistered(): void {
+    if (this.disposed) return;
     if (!this.spindle.permissions?.has?.("interceptor")) {
-      if (this.interceptorDisposer) {
-        this.interceptorDisposer();
-        this.interceptorDisposer = null;
-      }
+      this.disposeInterceptor();
       return;
     }
     if (this.interceptorDisposer) return;
@@ -258,6 +269,9 @@ export class GuidedGenerationRunner {
 
     try {
       this.interceptorDisposer = this.spindle.registerInterceptor(async (messages, context) => {
+        if (this.disposed) {
+          return messages;
+        }
         if (this.spindle.permissions?.has && !this.spindle.permissions.has("interceptor")) {
           return messages;
         }
@@ -312,13 +326,15 @@ export class GuidedGenerationRunner {
     capturedMessages?: AssembledLlmMessageDTO[];
   }> {
     return this.enqueueChatDryRun(chatId, async () => {
-      this.ensureInterceptorRegistered();
       const capture: PendingDryRunCapture = {
         userId,
         generationType: dryRunInput.generationType ?? "normal",
         presetId: dryRunInput.presetId ?? null,
       };
-      this.pendingDryRunCaptures.set(chatId, capture);
+      if (!this.disposed) {
+        this.pendingDryRunCaptures.set(chatId, capture);
+        this.ensureInterceptorRegistered();
+      }
       try {
         const result = (await this.spindle.generate.dryRun(
           dryRunInput,
@@ -329,6 +345,7 @@ export class GuidedGenerationRunner {
         if (this.pendingDryRunCaptures.get(chatId) === capture) {
           this.pendingDryRunCaptures.delete(chatId);
         }
+        this.releaseInterceptorIfIdle();
       }
     });
   }

@@ -57,12 +57,20 @@ export function registerBackend(api: SpindleAPI) {
   }
 
   const runner = new GuidedGenerationRunner(api, store, emitFrontend);
-  runner.syncInterceptorRegistration();
 
-  async function buildBootstrapView(userId?: string): Promise<ExtensionBootstrapView> {
+  async function buildBootstrapView(
+    userId?: string,
+    options?: { includeCatalogs?: boolean },
+  ): Promise<ExtensionBootstrapView> {
+    const includeCatalogs = options?.includeCatalogs !== false;
+    const emptyCatalogs: Awaited<ReturnType<SettingsStore["loadCatalogs"]>> = {
+      connections: [],
+      presets: [],
+      warnings: [],
+    };
     const [settings, catalogs, recovery] = await Promise.all([
       store.getSettings(userId),
-      store.loadCatalogs(userId),
+      includeCatalogs ? store.loadCatalogs(userId) : Promise.resolve(emptyCatalogs),
       store.getRecovery(userId),
     ]);
 
@@ -99,7 +107,9 @@ export function registerBackend(api: SpindleAPI) {
     try {
       switch (req.action) {
         case "get_bootstrap": {
-          reply(await buildBootstrapView(userId));
+          const includeCatalogs =
+            isRecord(req.input) && req.input.includeCatalogs === false ? false : true;
+          reply(await buildBootstrapView(userId, { includeCatalogs }));
           return;
         }
         case "save_settings": {
@@ -225,14 +235,6 @@ export function registerBackend(api: SpindleAPI) {
       emitFrontend({ type: "gg:changed", reason: "permissions" }, userId);
     }),
   );
-
-  for (const eventName of ["CHAT_SWITCHED", "CHAT_CHANGED"]) {
-    disposers.push(
-      api.on(eventName, (_payload, userId) => {
-        emitFrontend({ type: "gg:changed", reason: eventName.toLowerCase() }, userId);
-      }),
-    );
-  }
 
   return {
     store,

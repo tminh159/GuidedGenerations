@@ -35,6 +35,7 @@ export const GUIDED_GENERATIONS_CSS = `
 }
 
 .gg-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -47,6 +48,10 @@ export const GUIDED_GENERATIONS_CSS = `
   background: transparent;
   color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.45));
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
   transition:
     color var(--lcs-transition-fast, 120ms cubic-bezier(0.4, 0, 0.2, 1)),
     background var(--lcs-transition-fast, 120ms cubic-bezier(0.4, 0, 0.2, 1)),
@@ -72,6 +77,17 @@ export const GUIDED_GENERATIONS_CSS = `
 .gg-btn.is-running {
   background: rgba(239, 68, 68, 0.2);
   color: #fecaca;
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35);
+}
+
+.gg-btn.is-running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid rgba(248, 113, 113, 0.45);
+  pointer-events: none;
+  will-change: transform, opacity;
   animation: gg-pulse 1.3s ease-in-out infinite;
 }
 
@@ -95,8 +111,14 @@ export const GUIDED_GENERATIONS_CSS = `
 }
 
 @keyframes gg-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.35); }
-  50% { box-shadow: 0 0 0 4px rgba(248, 113, 113, 0); }
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.75;
+  }
+  50% {
+    transform: scale(1.22);
+    opacity: 0;
+  }
 }
 
 /* Settings Drawer */
@@ -449,6 +471,10 @@ export const GUIDED_GENERATIONS_CSS = `
   text-align: left;
   white-space: nowrap;
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
   transition:
     background 120ms ease,
     color 120ms ease;
@@ -496,6 +522,10 @@ export const GUIDED_GENERATIONS_CSS = `
   font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
 }
 
 .gg-dropup-back:hover {
@@ -597,16 +627,25 @@ export const GUIDED_GENERATIONS_CSS = `
   align-items: center;
   gap: 10px;
   padding: 6px;
-  max-height: calc(100vh - 24px);
-  overflow-y: auto;
-  scrollbar-width: none;
+  overflow: visible;
   transform: translate(-50%, -50%);
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   touch-action: none;
+  cursor: grab;
 }
 
-.gg-chat-heads-root::-webkit-scrollbar {
-  display: none;
+.gg-chat-heads-root.is-dragging {
+  cursor: grabbing;
+}
+
+.gg-chat-heads-root.is-dragging .gg-chat-head {
+  cursor: grabbing;
+}
+
+.gg-chat-heads-root.is-dragging .gg-chat-head:active {
+  transform: none;
 }
 
 .gg-chat-head-item {
@@ -615,6 +654,10 @@ export const GUIDED_GENERATIONS_CSS = `
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
 }
 
 .gg-chat-head-dismiss {
@@ -634,6 +677,7 @@ export const GUIDED_GENERATIONS_CSS = `
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  touch-action: manipulation;
   opacity: 0;
   transform: scale(0.85);
   transition: opacity 140ms ease, transform 140ms ease, background 140ms ease;
@@ -652,6 +696,18 @@ export const GUIDED_GENERATIONS_CSS = `
   color: #fff;
 }
 
+@media (hover: none), (pointer: coarse) {
+  .gg-chat-head-dismiss {
+    opacity: 1;
+    transform: scale(1);
+    width: 22px;
+    height: 22px;
+    top: -5px;
+    left: -5px;
+    font-size: 12px;
+  }
+}
+
 .gg-chat-head {
   position: relative;
   display: inline-flex;
@@ -668,6 +724,10 @@ export const GUIDED_GENERATIONS_CSS = `
     0 8px 24px rgba(0, 0, 0, 0.45),
     0 2px 6px rgba(0, 0, 0, 0.28);
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
   transition:
     transform 140ms ease,
     border-color 160ms ease,
@@ -687,6 +747,16 @@ export const GUIDED_GENERATIONS_CSS = `
   box-shadow:
     0 0 0 3px rgba(245, 158, 11, 0.24),
     0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.gg-chat-head.is-running::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  border: 2px solid rgba(139, 92, 246, 0.45);
+  pointer-events: none;
+  will-change: transform, opacity;
   animation: gg-chat-head-pulse 1.5s ease-in-out infinite;
 }
 
@@ -710,6 +780,7 @@ export const GUIDED_GENERATIONS_CSS = `
   border-radius: 50%;
   object-fit: cover;
   pointer-events: none;
+  -webkit-user-drag: none;
   display: block;
 }
 
@@ -755,14 +826,26 @@ export const GUIDED_GENERATIONS_CSS = `
 
 @keyframes gg-chat-head-pulse {
   0%, 100% {
-    box-shadow:
-      0 0 0 2px rgba(139, 92, 246, 0.22),
-      0 8px 24px rgba(0, 0, 0, 0.45);
+    transform: scale(1);
+    opacity: 0.75;
   }
   50% {
-    box-shadow:
-      0 0 0 6px rgba(139, 92, 246, 0.08),
-      0 8px 24px rgba(0, 0, 0, 0.45);
+    transform: scale(1.16);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gg-btn,
+  .gg-btn.is-running::after,
+  .gg-streaming-dot,
+  .gg-chat-head,
+  .gg-chat-head.is-running::after,
+  .gg-chat-head-dismiss,
+  .gg-card-chevron,
+  .gg-dropup-item {
+    animation: none !important;
+    transition: none !important;
   }
 }
 `;

@@ -136,11 +136,18 @@ interface ContinueMenuSession {
   refreshRecovery?: () => void;
 }
 
+interface ToolbarButtonEntry {
+  btn: HTMLButtonElement;
+  iconKey: string;
+}
+
 export class InputToolbarController {
   private readonly actionsMountRoot: Element;
   private toolbarMountRoot: Element | null = null;
   private readonly toolbarEl: HTMLDivElement;
   private buttons: HTMLButtonElement[] = [];
+  private buttonPool = new Map<ToolbarOptionId, ToolbarButtonEntry>();
+  private latestState: ToolbarRenderState | null = null;
   private activeActionId: ToolbarOptionId | null = null;
   private activeHoldCancel: (() => void) | null = null;
   private suppressNextHoldClick = false;
@@ -191,6 +198,8 @@ export class InputToolbarController {
   render(state: ToolbarRenderState): void {
     if (this.destroyed) return;
 
+    this.latestState = state;
+
     const chatChanged =
       state.chatId !== undefined &&
       this.lastChatId !== undefined &&
@@ -224,42 +233,71 @@ export class InputToolbarController {
       return;
     }
 
+    this.closeContinueMenu({ restoreFocus: false });
+    this.clearActiveHold();
+    this.latestRecovery = state.recovery;
+
+    const visibleIds: ToolbarOptionId[] = [];
+    for (const optionId of nextSignature.order) {
+      const enabled =
+        optionId === "input_recovery"
+          ? Boolean(state.settings.inputRecovery.enabled)
+          : Boolean(state.settings.actions[optionId]?.enabled);
+      if (enabled) visibleIds.push(optionId);
+    }
+
+    const canUpdateInPlace =
+      this.buttons.length === visibleIds.length &&
+      this.toolbarEl.childElementCount === visibleIds.length &&
+      this.buttons.every(
+        (btn, index) => btn.getAttribute("data-gg-action") === visibleIds[index],
+      );
+
+    if (canUpdateInPlace) {
+      for (const optionId of visibleIds) {
+        const entry = this.buttonPool.get(optionId);
+        if (entry) {
+          this.syncOptionButton(entry, optionId, state);
+        }
+      }
+      this.applyRovingTabIndex();
+      this.applyPlacement(nextSignature.placement, visibleIds.length > 0);
+      this.lastRenderSignature = nextSignature;
+      return;
+    }
+
     const activeEl = typeof document !== "undefined" ? document.activeElement : null;
     const focusedActionId =
       activeEl && this.toolbarEl.contains(activeEl)
         ? ((activeEl as Element).getAttribute?.("data-gg-action") as ToolbarOptionId | null)
         : null;
 
-    this.closeContinueMenu({ restoreFocus: false });
-    this.clearActiveHold();
-    this.latestRecovery = state.recovery;
     const buttons: HTMLButtonElement[] = [];
-
-    for (const optionId of nextSignature.order) {
-      const btn =
-        optionId === "input_recovery"
-          ? this.buildRecoveryButton(state)
-          : this.buildActionButton(optionId, state);
-      if (btn) buttons.push(btn);
+    for (const optionId of visibleIds) {
+      const entry = this.getOrCreateOptionButton(optionId);
+      this.syncOptionButton(entry, optionId, state);
+      buttons.push(entry.btn);
     }
 
     this.buttons = buttons;
     this.toolbarEl.replaceChildren(...buttons);
+
+    const matchingBtn = focusedActionId
+      ? this.buttons.find(
+          (btn) => !btn.disabled && btn.getAttribute("data-gg-action") === focusedActionId,
+        )
+      : undefined;
+    if (matchingBtn && focusedActionId) {
+      this.activeActionId = focusedActionId;
+    }
     this.applyRovingTabIndex();
 
     const visible = buttons.length > 0;
     this.applyPlacement(nextSignature.placement, visible);
     this.lastRenderSignature = nextSignature;
 
-    if (focusedActionId) {
-      const matchingBtn = this.buttons.find(
-        (btn) => !btn.disabled && btn.getAttribute("data-gg-action") === focusedActionId,
-      );
-      if (matchingBtn) {
-        this.activeActionId = focusedActionId;
-        this.applyRovingTabIndex();
-        matchingBtn.focus();
-      }
+    if (matchingBtn) {
+      matchingBtn.focus();
     }
   }
 
@@ -326,28 +364,73 @@ export class InputToolbarController {
     nextBtn.focus();
   }
 
-  private buildActionButton(
+  private getOrCreateOptionButton(optionId: ToolbarOptionId): ToolbarButtonEntry {
+    const existing = this.buttonPool.get(optionId);
+    if (existing) return existing;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "gg-btn";
+    btn.setAttribute("data-gg-action", optionId);
+
+    const entry: ToolbarButtonEntry = { btn, iconKey: "" };
+    if (optionId === "input_recovery") {
+      entry.iconKey = "input_recovery";
+      btn.innerHTML = TOOLBAR_ICONS.input_recovery;
+      this.attachRecoveryHoldHandlers(btn);
+    } else if (optionId === "guided_swipe") {
+      this.attachSwipeHoldHandlers(btn);
+    } else if (optionId === "guided_continue") {
+      this.attachContinueHoldHandlers(btn);
+    } else {
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const activeRun = this.latestState?.activeRun;
+        if (activeRun?.actionId === optionId) {
+          this.handlers.onAbortAction(activeRun.runId);
+        } else {
+          this.handlers.onTriggerAction(optionId);
+        }
+      });
+    }
+
+    this.buttonPool.set(optionId, entry);
+    return entry;
+  }
+
+  private syncOptionButton(
+    entry: ToolbarButtonEntry,
+    optionId: ToolbarOptionId,
+    state: ToolbarRenderState,
+  ): void {
+    if (optionId === "input_recovery") {
+      this.syncRecoveryButton(entry, state);
+      return;
+    }
+    this.syncActionButton(entry, optionId, state);
+  }
+
+  private syncActionButton(
+    entry: ToolbarButtonEntry,
     actionId: GuidedActionId,
     state: ToolbarRenderState,
-  ): HTMLButtonElement | null {
-    const config = state.settings.actions[actionId];
-    if (!config?.enabled) return null;
-
+  ): void {
+    const { btn } = entry;
     const meta = ACTION_METADATA[actionId];
     const isThisRunning = state.activeRun?.actionId === actionId;
     const isOtherRunning = Boolean(state.activeRun) && !isThisRunning;
     const disabled = !state.hasActiveChat || isOtherRunning;
 
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "gg-btn";
-    if (isThisRunning) btn.classList.add("is-running");
-    if (disabled) btn.classList.add("is-dimmed");
+    btn.classList.toggle("is-running", isThisRunning);
+    btn.classList.toggle("is-dimmed", disabled);
     btn.disabled = disabled;
-    btn.setAttribute("data-gg-action", actionId);
     btn.setAttribute("aria-label", isThisRunning ? `Stop ${meta.label}` : meta.label);
+
     if (actionId === "guided_swipe" && !isThisRunning) {
       btn.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
+      btn.removeAttribute("aria-haspopup");
+      btn.removeAttribute("aria-expanded");
       btn.title =
         "Guided Swipe — click to swipe, hold (or Ctrl+Click) to swipe in background";
     } else if (actionId === "guided_continue" && !isThisRunning) {
@@ -356,27 +439,17 @@ export class InputToolbarController {
       btn.setAttribute("aria-keyshortcuts", "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter");
       btn.title = "Guided Continue — click to continue, hold for continue options";
     } else {
+      btn.removeAttribute("aria-keyshortcuts");
+      btn.removeAttribute("aria-haspopup");
+      btn.removeAttribute("aria-expanded");
       btn.title = isThisRunning ? `Stop ${meta.label}` : meta.tooltip;
     }
-    btn.innerHTML = isThisRunning ? STOP_ICON_SVG : TOOLBAR_ICONS[actionId];
 
-    if (actionId === "guided_swipe") {
-      this.attachSwipeHoldHandlers(btn, state, isThisRunning, disabled);
-    } else if (actionId === "guided_continue") {
-      this.attachContinueHoldHandlers(btn, state, isThisRunning, disabled);
-    } else {
-      btn.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (isThisRunning && state.activeRun) {
-          this.handlers.onAbortAction(state.activeRun.runId);
-        } else {
-          this.handlers.onTriggerAction(actionId);
-        }
-      });
+    const nextIconKey = isThisRunning ? "stop" : actionId;
+    if (entry.iconKey !== nextIconKey) {
+      entry.iconKey = nextIconKey;
+      btn.innerHTML = isThisRunning ? STOP_ICON_SVG : TOOLBAR_ICONS[actionId];
     }
-
-    return btn;
   }
 
   private clearActiveHold(): void {
@@ -484,9 +557,7 @@ export class InputToolbarController {
 
   private attachLongPressHandlers(
     btn: HTMLButtonElement,
-    state: ToolbarRenderState,
-    isThisRunning: boolean,
-    disabled: boolean,
+    actionId: ToolbarOptionId,
     options: {
       onClick: (event: MouseEvent) => void;
       onHold: () => void;
@@ -537,7 +608,7 @@ export class InputToolbarController {
     };
 
     btn.addEventListener("pointerdown", (event) => {
-      if (disabled || state.activeRun) return;
+      if (btn.disabled || this.latestState?.activeRun) return;
       if (!event.isPrimary) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
 
@@ -599,15 +670,16 @@ export class InputToolbarController {
       }
       event.preventDefault();
       event.stopPropagation();
-      if (isThisRunning && state.activeRun) {
-        this.handlers.onAbortAction(state.activeRun.runId);
+      const activeRun = this.latestState?.activeRun;
+      if (actionId !== "input_recovery" && activeRun?.actionId === actionId) {
+        this.handlers.onAbortAction(activeRun.runId);
       } else {
         options.onClick(event);
       }
     });
 
     btn.addEventListener("keydown", (event) => {
-      if (disabled || isThisRunning || state.activeRun) return;
+      if (btn.disabled || this.latestState?.activeRun) return;
       if (options.onShortcutKeyDown(event)) {
         event.preventDefault();
         event.stopPropagation();
@@ -615,13 +687,8 @@ export class InputToolbarController {
     });
   }
 
-  private attachSwipeHoldHandlers(
-    btn: HTMLButtonElement,
-    state: ToolbarRenderState,
-    isThisRunning: boolean,
-    disabled: boolean,
-  ): void {
-    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+  private attachSwipeHoldHandlers(btn: HTMLButtonElement): void {
+    this.attachLongPressHandlers(btn, "guided_swipe", {
       onClick: (event) => {
         this.handlers.onTriggerAction("guided_swipe", {
           backgroundSwipe: Boolean(event.ctrlKey || event.metaKey),
@@ -640,13 +707,8 @@ export class InputToolbarController {
     });
   }
 
-  private attachContinueHoldHandlers(
-    btn: HTMLButtonElement,
-    state: ToolbarRenderState,
-    isThisRunning: boolean,
-    disabled: boolean,
-  ): void {
-    this.attachLongPressHandlers(btn, state, isThisRunning, disabled, {
+  private attachContinueHoldHandlers(btn: HTMLButtonElement): void {
+    this.attachLongPressHandlers(btn, "guided_continue", {
       onClick: (event) => {
         if (this.continueMenu !== null && this.continueMenu.anchorBtn === btn) {
           this.closeContinueMenu({ restoreFocus: true });
@@ -723,33 +785,56 @@ export class InputToolbarController {
     anchorBtn.setAttribute("aria-expanded", "true");
     this.positionContinueMenu(menuEl, anchorBtn);
 
+    const cleanup = this.attachDropupMenuLifecycle({
+      menuEl,
+      anchorBtn,
+      items,
+    });
+
+    this.continueMenu = { kind: "continue", menuEl, anchorBtn, items, cleanup };
+    items[0]?.focus();
+  }
+
+  private attachDropupMenuLifecycle(options: {
+    menuEl: HTMLDivElement;
+    anchorBtn: HTMLButtonElement;
+    items: HTMLButtonElement[];
+    onBackKey?: () => boolean;
+  }): () => void {
+    const { menuEl, anchorBtn, items, onBackKey } = options;
     const openedAt = Date.now();
 
     const onMenuKeyDown = (event: KeyboardEvent) => {
-      const activeIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+      const focusable = items.filter((el) => !el.disabled);
+      const activeIdx = focusable.indexOf(document.activeElement as HTMLButtonElement);
       if (event.key === "ArrowDown") {
         event.preventDefault();
         event.stopPropagation();
-        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % items.length;
-        items[nextIdx]?.focus();
+        if (focusable.length === 0) return;
+        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % focusable.length;
+        focusable[nextIdx]?.focus();
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
         event.stopPropagation();
-        const nextIdx = activeIdx <= 0 ? items.length - 1 : activeIdx - 1;
-        items[nextIdx]?.focus();
+        if (focusable.length === 0) return;
+        const nextIdx = activeIdx <= 0 ? focusable.length - 1 : activeIdx - 1;
+        focusable[nextIdx]?.focus();
       } else if (event.key === "Home") {
         event.preventDefault();
         event.stopPropagation();
-        items[0]?.focus();
+        focusable[0]?.focus();
       } else if (event.key === "End") {
         event.preventDefault();
         event.stopPropagation();
-        items[items.length - 1]?.focus();
-      } else if (event.key === "Escape") {
+        focusable[focusable.length - 1]?.focus();
+      } else if (
+        onBackKey &&
+        (event.key === "ArrowLeft" || event.key === "Backspace") &&
+        onBackKey()
+      ) {
         event.preventDefault();
         event.stopPropagation();
-        this.closeContinueMenu({ restoreFocus: true });
-      } else if (event.key === "Tab") {
+      } else if (event.key === "Escape" || event.key === "Tab") {
         event.preventDefault();
         event.stopPropagation();
         this.closeContinueMenu({ restoreFocus: true });
@@ -780,7 +865,10 @@ export class InputToolbarController {
       if (this.isHoldClickSuppressed(anchorBtn)) return;
       if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS) return;
       const target = event.target as Node | null;
-      if (target && (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))) {
+      if (
+        target &&
+        (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))
+      ) {
         return;
       }
       this.closeContinueMenu({ restoreFocus: false });
@@ -790,6 +878,22 @@ export class InputToolbarController {
     const visualVp = win?.visualViewport ?? null;
     let lastVw = win?.innerWidth;
     let lastVh = win?.innerHeight;
+    let resizeRafId: number | null = null;
+
+    const scheduleReposition = () => {
+      if (typeof requestAnimationFrame === "function") {
+        if (resizeRafId !== null) return;
+        resizeRafId = requestAnimationFrame(() => {
+          resizeRafId = null;
+          if (this.destroyed || !anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
+            return;
+          }
+          this.positionContinueMenu(menuEl, anchorBtn);
+        });
+      } else {
+        this.positionContinueMenu(menuEl, anchorBtn);
+      }
+    };
 
     const handleViewportResize = (fromVisualViewport: boolean) => {
       if (!anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
@@ -805,7 +909,7 @@ export class InputToolbarController {
         this.closeContinueMenu({ restoreFocus: false });
         return;
       }
-      this.positionContinueMenu(menuEl, anchorBtn);
+      scheduleReposition();
     };
 
     const onViewportResize = () => {
@@ -826,32 +930,42 @@ export class InputToolbarController {
     document.addEventListener("keydown", onDocumentKeyDown, true);
     document.addEventListener("pointerdown", onOutsidePointerDown, true);
     document.addEventListener("click", onOutsideClick, true);
-    document.addEventListener("scroll", onViewportScroll, true);
-    if (win) {
-      win.addEventListener("resize", onViewportResize);
-      win.addEventListener("scroll", onViewportScroll, true);
-    }
+    document.addEventListener("scroll", onViewportScroll, { capture: true, passive: true });
+    win?.addEventListener("resize", onViewportResize);
     visualVp?.addEventListener("resize", onVisualViewportResize);
 
-    const cleanup = () => {
+    return () => {
+      if (resizeRafId !== null) {
+        if (typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(resizeRafId);
+        }
+        resizeRafId = null;
+      }
       menuEl.removeEventListener("keydown", onMenuKeyDown);
       document.removeEventListener("keydown", onDocumentKeyDown, true);
       document.removeEventListener("pointerdown", onOutsidePointerDown, true);
       document.removeEventListener("click", onOutsideClick, true);
-      document.removeEventListener("scroll", onViewportScroll, true);
-      if (win) {
-        win.removeEventListener("resize", onViewportResize);
-        win.removeEventListener("scroll", onViewportScroll, true);
-      }
+      document.removeEventListener("scroll", onViewportScroll, { capture: true });
+      win?.removeEventListener("resize", onViewportResize);
       visualVp?.removeEventListener("resize", onVisualViewportResize);
       menuEl.remove();
     };
-
-    this.continueMenu = { kind: "continue", menuEl, anchorBtn, items, cleanup };
-    items[0]?.focus();
   }
 
   private positionContinueMenu(menuEl: HTMLDivElement, anchorBtn: HTMLButtonElement): void {
+    const historyListEl = menuEl.querySelector<HTMLElement>(".gg-dropup-history-list");
+    const headerEl = historyListEl
+      ? menuEl.querySelector<HTMLElement>(".gg-dropup-header")
+      : null;
+
+    // Reset any prior height constraints before measuring natural dimensions.
+    if (menuEl.style.maxHeight) menuEl.style.maxHeight = "";
+    if (menuEl.style.overflowY) menuEl.style.overflowY = "";
+    if (historyListEl && historyListEl.style.maxHeight) {
+      historyListEl.style.maxHeight = "";
+    }
+
+    // Batch all DOM/layout reads before writing styles to avoid forced synchronous reflows.
     const rect = anchorBtn.getBoundingClientRect();
     const win = typeof window !== "undefined" ? window : document.defaultView;
     const getStyle =
@@ -902,49 +1016,54 @@ export class InputToolbarController {
         ? visualVp.height
         : rawVh;
 
-    menuEl.style.maxHeight = "";
-    menuEl.style.overflowY = "";
-    const historyListEl = menuEl.querySelector<HTMLElement>(".gg-dropup-history-list");
-    if (historyListEl) {
-      historyListEl.style.maxHeight = "";
-    }
+    const rawMenuWidth = menuEl.offsetWidth;
+    const rawMenuHeight = menuEl.offsetHeight;
+    const rawHistoryListHeight = historyListEl ? historyListEl.offsetHeight : 0;
+    const rawHeaderHeight = headerEl ? headerEl.offsetHeight : 0;
 
-    const menuWidth = menuEl.offsetWidth * uiScale;
-    const menuHeight = menuEl.offsetHeight * uiScale;
+    // Compute layout coordinates purely in JS.
+    const menuWidth = rawMenuWidth * uiScale;
+    const menuHeight = rawMenuHeight * uiScale;
     const gapPx = 6;
     const edgePadding = 8;
 
     const maxLeft = Math.max(edgePadding, vw - menuWidth - edgePadding);
     const clampedLeft = Math.max(edgePadding, Math.min(rect.left, maxLeft));
-    menuEl.style.left = `${clampedLeft / uiScale}px`;
 
     const spaceAbove = rect.top;
     const spaceBelow = vh - rect.bottom;
     const neededHeight = menuHeight + gapPx * uiScale + edgePadding;
+    const flipBelow = spaceAbove < neededHeight && spaceBelow > spaceAbove;
 
+    let topCss = "";
+    let bottomCss = "";
     let availableViewportPx: number;
-    if (spaceAbove < neededHeight && spaceBelow > spaceAbove) {
-      const topCss = Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx);
-      menuEl.style.top = `${topCss}px`;
-      menuEl.style.bottom = "";
-      availableViewportPx = Math.max(0, vh - topCss * uiScale - edgePadding);
+    if (flipBelow) {
+      const topVal = Math.max(edgePadding / uiScale, rect.bottom / uiScale + gapPx);
+      topCss = `${topVal}px`;
+      availableViewportPx = Math.max(0, vh - topVal * uiScale - edgePadding);
     } else {
-      menuEl.style.bottom = `${(vh - rect.top) / uiScale + gapPx}px`;
-      menuEl.style.top = "";
+      bottomCss = `${(vh - rect.top) / uiScale + gapPx}px`;
       availableViewportPx = Math.max(0, spaceAbove - gapPx * uiScale - edgePadding);
     }
 
     const maxMenuHeightCss = Math.max(0, Math.floor(availableViewportPx / uiScale));
+    let listMaxCss: number | null = null;
+    if (historyListEl) {
+      const chromeHeightCss =
+        rawHistoryListHeight > 0 && rawMenuHeight >= rawHistoryListHeight
+          ? rawMenuHeight - rawHistoryListHeight
+          : (rawHeaderHeight || 32) + 12;
+      listMaxCss = Math.min(220, Math.max(0, maxMenuHeightCss - chromeHeightCss));
+    }
+
+    // Batch all style writes together.
+    menuEl.style.left = `${clampedLeft / uiScale}px`;
+    menuEl.style.top = topCss;
+    menuEl.style.bottom = bottomCss;
     menuEl.style.maxHeight = `${maxMenuHeightCss}px`;
     menuEl.style.overflowY = "auto";
-
-    if (historyListEl) {
-      const headerEl = menuEl.querySelector<HTMLElement>(".gg-dropup-header");
-      const chromeHeightCss =
-        historyListEl.offsetHeight > 0 && menuEl.offsetHeight >= historyListEl.offsetHeight
-          ? menuEl.offsetHeight - historyListEl.offsetHeight
-          : (headerEl?.offsetHeight || 32) + 12;
-      const listMaxCss = Math.min(220, Math.max(0, maxMenuHeightCss - chromeHeightCss));
+    if (historyListEl && listMaxCss !== null) {
       historyListEl.style.maxHeight = `${listMaxCss}px`;
     }
   }
@@ -964,47 +1083,40 @@ export class InputToolbarController {
     }
   }
 
-  private buildRecoveryButton(state: ToolbarRenderState): HTMLButtonElement | null {
-    if (!state.settings.inputRecovery.enabled) return null;
-
+  private syncRecoveryButton(
+    entry: ToolbarButtonEntry,
+    state: ToolbarRenderState,
+  ): void {
+    const { btn } = entry;
     const hasRecovery = state.recovery.length > 0;
     const disabled = Boolean(state.activeRun);
     const latestPreview = formatLatestRecoveryPreview(state.recovery);
 
-    const recoverBtn = document.createElement("button");
-    recoverBtn.type = "button";
-    recoverBtn.className = "gg-btn";
-    if (disabled) recoverBtn.classList.add("is-dimmed");
-    recoverBtn.disabled = disabled;
-    recoverBtn.setAttribute("data-gg-action", "input_recovery");
-    recoverBtn.setAttribute(
+    btn.classList.toggle("is-dimmed", disabled);
+    btn.disabled = disabled;
+    btn.setAttribute(
       "aria-label",
       hasRecovery ? "Restore last input" : "Clear current input",
     );
     if (!disabled) {
-      recoverBtn.setAttribute("aria-haspopup", "menu");
-      recoverBtn.setAttribute("aria-expanded", "false");
-      recoverBtn.setAttribute(
+      btn.setAttribute("aria-haspopup", "menu");
+      btn.setAttribute("aria-expanded", "false");
+      btn.setAttribute(
         "aria-keyshortcuts",
         "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter",
       );
+    } else {
+      btn.removeAttribute("aria-haspopup");
+      btn.removeAttribute("aria-expanded");
+      btn.removeAttribute("aria-keyshortcuts");
     }
-    recoverBtn.title = hasRecovery
+    btn.title = hasRecovery
       ? `Restore last cleared input${latestPreview}`
       : "Input Recovery — clear current input";
-    recoverBtn.innerHTML = TOOLBAR_ICONS.input_recovery;
-
-    this.attachRecoveryHoldHandlers(recoverBtn, state, disabled);
-
-    return recoverBtn;
   }
 
-  private attachRecoveryHoldHandlers(
-    btn: HTMLButtonElement,
-    state: ToolbarRenderState,
-    disabled: boolean,
-  ): void {
-    this.attachLongPressHandlers(btn, state, false, disabled, {
+  private attachRecoveryHoldHandlers(btn: HTMLButtonElement): void {
+    this.attachLongPressHandlers(btn, "input_recovery", {
       onClick: (event) => {
         if (this.continueMenu !== null && this.continueMenu.anchorBtn === btn) {
           this.closeContinueMenu({ restoreFocus: true });
@@ -1272,142 +1384,16 @@ export class InputToolbarController {
     anchorBtn.setAttribute("aria-expanded", "true");
     this.positionContinueMenu(menuEl, anchorBtn);
 
-    const openedAt = Date.now();
-
-    const onMenuKeyDown = (event: KeyboardEvent) => {
-      const focusable = items.filter((el) => !el.disabled);
-      const activeIdx = focusable.indexOf(document.activeElement as HTMLButtonElement);
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        event.stopPropagation();
-        if (focusable.length === 0) return;
-        const nextIdx = activeIdx === -1 ? 0 : (activeIdx + 1) % focusable.length;
-        focusable[nextIdx]?.focus();
-      } else if (event.key === "ArrowUp") {
-        event.preventDefault();
-        event.stopPropagation();
-        if (focusable.length === 0) return;
-        const nextIdx = activeIdx <= 0 ? focusable.length - 1 : activeIdx - 1;
-        focusable[nextIdx]?.focus();
-      } else if (event.key === "Home") {
-        event.preventDefault();
-        event.stopPropagation();
-        focusable[0]?.focus();
-      } else if (event.key === "End") {
-        event.preventDefault();
-        event.stopPropagation();
-        focusable[focusable.length - 1]?.focus();
-      } else if (
-        inHistoryView &&
-        (event.key === "ArrowLeft" || event.key === "Backspace")
-      ) {
-        event.preventDefault();
-        event.stopPropagation();
+    const cleanup = this.attachDropupMenuLifecycle({
+      menuEl,
+      anchorBtn,
+      items,
+      onBackKey: () => {
+        if (!inHistoryView) return false;
         renderRootOptions();
-      } else if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        this.closeContinueMenu({ restoreFocus: true });
-      } else if (event.key === "Tab") {
-        event.preventDefault();
-        event.stopPropagation();
-        this.closeContinueMenu({ restoreFocus: true });
-      }
-    };
-
-    const onDocumentKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        this.closeContinueMenu({ restoreFocus: true });
-      }
-    };
-
-    const onOutsidePointerDown = (event: Event) => {
-      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS) return;
-      const target = event.target as Node | null;
-      if (
-        target &&
-        (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))
-      ) {
-        return;
-      }
-      this.closeContinueMenu({ restoreFocus: false });
-    };
-
-    const onOutsideClick = (event: Event) => {
-      if (this.isHoldClickSuppressed(anchorBtn)) return;
-      if (Date.now() - openedAt < MENU_DISMISS_GRACE_MS) return;
-      const target = event.target as Node | null;
-      if (
-        target &&
-        (menuEl.contains(target) || target === anchorBtn || anchorBtn.contains(target))
-      ) {
-        return;
-      }
-      this.closeContinueMenu({ restoreFocus: false });
-    };
-
-    const win = typeof window !== "undefined" ? window : document.defaultView;
-    const visualVp = win?.visualViewport ?? null;
-    let lastVw = win?.innerWidth;
-    let lastVh = win?.innerHeight;
-
-    const handleViewportResize = (fromVisualViewport: boolean) => {
-      if (!anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
-        this.closeContinueMenu({ restoreFocus: false });
-        return;
-      }
-      const nextVw = win?.innerWidth;
-      const nextVh = win?.innerHeight;
-      const dimensionsChanged = nextVw !== lastVw || nextVh !== lastVh;
-      lastVw = nextVw;
-      lastVh = nextVh;
-      if (!fromVisualViewport && !visualVp && !dimensionsChanged) {
-        this.closeContinueMenu({ restoreFocus: false });
-        return;
-      }
-      this.positionContinueMenu(menuEl, anchorBtn);
-    };
-
-    const onViewportResize = () => {
-      handleViewportResize(false);
-    };
-
-    const onVisualViewportResize = () => {
-      handleViewportResize(true);
-    };
-
-    const onViewportScroll = (event: Event) => {
-      const target = event.target as Node | null;
-      if (target && menuEl.contains(target)) return;
-      this.closeContinueMenu({ restoreFocus: false });
-    };
-
-    menuEl.addEventListener("keydown", onMenuKeyDown);
-    document.addEventListener("keydown", onDocumentKeyDown, true);
-    document.addEventListener("pointerdown", onOutsidePointerDown, true);
-    document.addEventListener("click", onOutsideClick, true);
-    document.addEventListener("scroll", onViewportScroll, true);
-    if (win) {
-      win.addEventListener("resize", onViewportResize);
-      win.addEventListener("scroll", onViewportScroll, true);
-    }
-    visualVp?.addEventListener("resize", onVisualViewportResize);
-
-    const cleanup = () => {
-      menuEl.removeEventListener("keydown", onMenuKeyDown);
-      document.removeEventListener("keydown", onDocumentKeyDown, true);
-      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
-      document.removeEventListener("click", onOutsideClick, true);
-      document.removeEventListener("scroll", onViewportScroll, true);
-      if (win) {
-        win.removeEventListener("resize", onViewportResize);
-        win.removeEventListener("scroll", onViewportScroll, true);
-      }
-      visualVp?.removeEventListener("resize", onVisualViewportResize);
-      menuEl.remove();
-    };
+        return true;
+      },
+    });
 
     this.continueMenu = {
       kind: "recovery",
@@ -1469,6 +1455,8 @@ export class InputToolbarController {
     this.toolbarEl.removeEventListener("keydown", this.onKeyDown);
     this.toolbarEl.removeEventListener("focusin", this.onFocusIn);
     this.buttons = [];
+    this.buttonPool.clear();
+    this.latestState = null;
     this.activeActionId = null;
     this.lastRenderSignature = null;
     this.lastChatId = undefined;

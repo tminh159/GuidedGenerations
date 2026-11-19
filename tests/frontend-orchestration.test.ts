@@ -65,8 +65,9 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
   const actionsMount = document.createElement("div");
   const toolbarRowMount = document.createElement("div");
   const alertMount = document.createElement("div");
+  const streamAfterMount = document.createElement("div");
   const tabRoot = document.createElement("div");
-  document.body.append(actionsMount, toolbarRowMount, alertMount);
+  document.body.append(actionsMount, toolbarRowMount, alertMount, streamAfterMount);
   if (!opts.detachDrawerTab) {
     document.body.append(tabRoot);
   }
@@ -91,6 +92,7 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
   const activateHandlers = new Set<() => void>();
   const messageElements = new Map<string, Element>();
   const injectedWrappers = new Set<Element>();
+  let latestMessageId: string | null = null;
 
   let injectCalls = 0;
   let uninjectCalls = 0;
@@ -148,6 +150,7 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
         if (point === "chat_actions") return actionsMount;
         if (point === "chat_toolbar") return toolbarRowMount;
         if (point === "chat_composer_above") return alertMount;
+        if (point === "chat_stream_after") return streamAfterMount;
         return document.createElement("div");
       },
       registerDrawerTab: () => ({
@@ -322,6 +325,9 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
       },
     },
     getActiveChat: () => ({ chatId: activeChatId, characterId: "char-1" }),
+    messages: {
+      getLatestMessageId: () => latestMessageId,
+    },
     composer: {
       getState: () => ({
         mounted: composerMounted,
@@ -375,9 +381,13 @@ function createFrontendHarness(opts: HarnessOptions = {}) {
     actionsMount,
     toolbarRowMount,
     alertMount,
+    streamAfterMount,
     tabRoot,
     sentRpcs,
     emitFromBackend,
+    setLatestMessageId: (id: string | null) => {
+      latestMessageId = id;
+    },
     emitEvent: (event: string, payload: unknown) => {
       for (const handler of eventListeners.get(event) ?? []) {
         handler(payload);
@@ -1445,7 +1455,7 @@ describe("frontend orchestration and safety", () => {
         },
       });
       const replacementBtn = getSwipeBtn();
-      expect(replacementBtn).not.toBe(oldBtnBeforeStatus);
+      expect(replacementBtn).toBe(oldBtnBeforeStatus);
       expect(replacementBtn.classList.contains("is-running")).toBe(true);
 
       // Synthesized release pointerup + click on replacement button must NOT abort
@@ -1561,6 +1571,13 @@ describe("frontend orchestration and safety", () => {
       runRpcs = h.sentRpcs.filter((r) => r.action === "run_action");
       expect(runRpcs).toHaveLength(6);
       expect("backgroundSwipe" in (runRpcs[5]!.input as Record<string, unknown>)).toBe(false);
+
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runRpcs[5]!.requestId,
+        result: { runId: "r-4", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
 
       // 5. Teardown during an active hold clears the hold timer
       getSwipeBtn().dispatchEvent(
@@ -1751,11 +1768,12 @@ describe("frontend orchestration and safety", () => {
       getMenuItem("regenerate_last_continue").click();
       await flushMicrotasks();
 
-      // Attempt second regenerate while isLaunching is true -> blocked
+      // Attempt second regenerate while isLaunching/running -> button is in Stop mode and menu cannot open
+      expect(continueBtn.classList.contains("is-running")).toBe(true);
       continueBtn.dispatchEvent(
-        new MouseEvt("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+        new KeyEvt("keydown", { key: "ArrowUp", altKey: true, bubbles: true, cancelable: true }),
       );
-      getMenuItem("regenerate_last_continue").click();
+      expect(getMenu()).toBeNull();
       await flushMicrotasks();
 
       const regenRpcs = h.sentRpcs.filter((r) => r.action === "regenerate_last_continue");
@@ -4893,7 +4911,7 @@ describe("frontend orchestration and safety", () => {
         '[data-gg-action="guided_continue"]',
       )!;
       expect(continueRunningBtn.classList.contains("is-running")).toBe(true);
-      expect(continueRunningBtn).not.toBe(initialButtons[1]);
+      expect(continueRunningBtn).toBe(initialButtons[1]);
 
       h.emitFromBackend({
         type: "gg:status",
@@ -5473,6 +5491,830 @@ describe("frontend orchestration and safety", () => {
       (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
       (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
         origClearTimeout;
+    }
+  });
+
+  test("optimistic toolbar Stop state at t=0ms for triggerAction & regenerateLastContinue, abort via chatId during pending phase, reconciliation, error rollback, and chat switch", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Steer the scene",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const getBtn = (action: string) =>
+        h.actionsMount.querySelector<HTMLButtonElement>(`[data-gg-action="${action}"]`)!;
+
+      // 1. Clicking guided_response immediately flips to Stop state synchronously at t=0ms (before gg:status)
+      getBtn("guided_response").click();
+      const respBtnRunning = getBtn("guided_response");
+      expect(respBtnRunning.classList.contains("is-running")).toBe(true);
+      expect(respBtnRunning.getAttribute("aria-label")).toBe("Stop Guided Response");
+      expect(getBtn("guided_continue").disabled).toBe(true);
+      expect(getBtn("guided_regenerate").disabled).toBe(true);
+      expect(h.sentRpcs.filter((r) => r.action === "run_action")).toHaveLength(1);
+
+      // 2. Clicking Stop during optimistic phase aborts cleanly via { chatId } and immediately restores toolbar
+      respBtnRunning.click();
+      const abortRpcs1 = h.sentRpcs.filter((r) => r.action === "abort_action");
+      expect(abortRpcs1).toHaveLength(1);
+      expect(abortRpcs1[0]!.input).toEqual({ chatId: "chat-a" });
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
+      expect(getBtn("guided_continue").disabled).toBe(false);
+
+      // Settle aborted run_action RPC
+      const runReq1 = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq1.requestId,
+        result: { runId: "r-1", actionId: "guided_response", chatId: "chat-a", aborted: true },
+      });
+      await flushMicrotasks();
+
+      // 3. Reconciles cleanly when real gg:status arrives; subsequent Stop sends { runId }
+      h.setComposerState({ text: "Second prompt" });
+      getBtn("guided_response").click();
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(true);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "real-run-2",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+        },
+      });
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(true);
+
+      getBtn("guided_response").click();
+      const abortRpcs2 = h.sentRpcs.filter((r) => r.action === "abort_action");
+      expect(abortRpcs2).toHaveLength(2);
+      expect(abortRpcs2[1]!.input).toEqual({ runId: "real-run-2" });
+
+      h.emitFromBackend({ type: "gg:status", chatId: "chat-a", run: null, aborted: true });
+      const runReq2 = h.sentRpcs.filter((r) => r.action === "run_action")[1]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq2.requestId,
+        result: { runId: "real-run-2", actionId: "guided_response", chatId: "chat-a", aborted: true },
+      });
+      await flushMicrotasks();
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
+
+      // 4. RPC rejection before gg:status rolls back optimistic toolbar AND restores cleared composer input
+      h.setComposerState({ text: "Restore me on error" });
+      getBtn("guided_response").click();
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(true);
+      expect(h.getComposerText()).toBe("");
+
+      const runReq3 = h.sentRpcs.filter((r) => r.action === "run_action")[2]!;
+      h.rejectRpc(runReq3.requestId, "Backend unavailable");
+      await flushMicrotasks();
+
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
+      expect(getBtn("guided_continue").disabled).toBe(false);
+      expect(h.getComposerText()).toBe("Restore me on error");
+
+      // 5. Chat switch during optimistic phase immediately unlocks new chat's toolbar and never leaks stuck pending runs
+      h.setComposerState({ text: "Chat A guidance" });
+      getBtn("guided_response").click();
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(true);
+
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
+      expect(getBtn("guided_continue").disabled).toBe(false);
+
+      // Settle Chat A's RPC without gg:status and switch back -> must NOT have leaked pending run
+      const runReq4 = h.sentRpcs.filter((r) => r.action === "run_action")[3]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq4.requestId,
+        result: { runId: "r-4", actionId: "guided_response", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+      h.setChat("chat-a", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
+
+      // 6. regenerate_last_continue enters optimistic Stop state at t=0ms, supports pending abort, and rolls back on error
+      const Win = document.defaultView!;
+      getBtn("guided_continue").dispatchEvent(
+        new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      const regenMenuItem = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="regenerate_last_continue"]',
+      )!;
+      expect(regenMenuItem).not.toBeNull();
+      regenMenuItem.click();
+
+      expect(getBtn("guided_continue").classList.contains("is-running")).toBe(true);
+      expect(getBtn("guided_response").disabled).toBe(true);
+
+      // Abort during pending regenerate_last_continue
+      getBtn("guided_continue").click();
+      const abortRpcs3 = h.sentRpcs.filter((r) => r.action === "abort_action");
+      expect(abortRpcs3).toHaveLength(3);
+      expect(abortRpcs3[2]!.input).toEqual({ chatId: "chat-a" });
+      expect(getBtn("guided_continue").classList.contains("is-running")).toBe(false);
+
+      const regenReq1 = h.sentRpcs.filter((r) => r.action === "regenerate_last_continue")[0]!;
+      h.rejectRpc(regenReq1.requestId, "No continue history");
+      await flushMicrotasks();
+      expect(getBtn("guided_continue").classList.contains("is-running")).toBe(false);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("optimistic 3-dot indicator via chat_stream_after for guided_response & guided_regenerate hands off on row mount and cleans up on error, abort, chat switch, and excludes impersonate/background swipe", async () => {
+    const origRaf = globalThis.requestAnimationFrame;
+    const origCancelRaf = globalThis.cancelAnimationFrame;
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    let nextRafId = 1;
+    (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = (
+      cb: FrameRequestCallback,
+    ) => {
+      const id = nextRafId++;
+      rafQueue.set(id, cb);
+      return id;
+    };
+    (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = (
+      id: number,
+    ) => {
+      rafQueue.delete(id);
+    };
+    const flushRaf = () => {
+      const entries = [...rafQueue.entries()];
+      rafQueue.clear();
+      for (const [, cb] of entries) cb(16);
+    };
+
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Write next beat",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const getBtn = (action: string) =>
+        h.actionsMount.querySelector<HTMLButtonElement>(`[data-gg-action="${action}"]`)!;
+
+      // 1. guided_response mounts optimistic 3-dot indicator in chat_stream_after synchronously at t=0ms
+      getBtn("guided_response").click();
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-dot")).toHaveLength(3);
+
+      // First gg:status before dryRun finishes (messageId still undefined) keeps optimistic indicator mounted
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "resp-1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+        },
+      });
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+
+      // Second gg:status sets messageId before DOM row mounts -> keeps optimistic indicator while rAF retries
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "resp-1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-new-resp",
+          swipeId: 0,
+        },
+      });
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+      expect(rafQueue.size).toBe(1);
+
+      // Real message row mounts -> rAF mounts real in-row indicator AND unmounts chat_stream_after indicator
+      const newRow = document.createElement("div");
+      const mountBefore = document.createElement("span");
+      mountBefore.setAttribute("data-spindle-mount", "message_body_before");
+      newRow.append(mountBefore);
+      document.body.append(newRow);
+      h.setMessageElement("m-new-resp", newRow);
+      flushRaf();
+
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(0);
+      expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // Clean finish
+      h.emitFromBackend({ type: "gg:status", chatId: "chat-a", run: null, done: true });
+      const runReq1 = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq1.requestId,
+        result: { runId: "resp-1", actionId: "guided_response", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+      expect(mountBefore.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 2. guided_regenerate mounts in chat_stream_after at t=0ms and unmounts on RPC error
+      getBtn("guided_regenerate").click();
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+      const runReq2 = h.sentRpcs.filter((r) => r.action === "run_action")[1]!;
+      h.rejectRpc(runReq2.requestId, "Regen failed");
+      await flushMicrotasks();
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 3. guided_regenerate unmounts optimistic indicator immediately on CHAT_SWITCHED
+      getBtn("guided_regenerate").click();
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      const runReq3 = h.sentRpcs.filter((r) => r.action === "run_action")[2]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq3.requestId,
+        result: { runId: "regen-3", actionId: "guided_regenerate", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 4. guided_impersonate does NOT show optimistic indicator
+      getBtn("guided_impersonate").click();
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.getInjectCounts().activeInjections).toBe(0);
+      const runReq4 = h.sentRpcs.filter((r) => r.action === "run_action")[3]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq4.requestId,
+        result: { runId: "imp-1", actionId: "guided_impersonate", chatId: "chat-b", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 5. background guided_swipe (Ctrl+Click) does NOT show optimistic indicator
+      const Win = document.defaultView!;
+      getBtn("guided_swipe").dispatchEvent(
+        new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.getInjectCounts().activeInjections).toBe(0);
+      const runReq5 = h.sentRpcs.filter((r) => r.action === "run_action")[4]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq5.requestId,
+        result: { runId: "bg-swipe-1", actionId: "guided_swipe", chatId: "chat-b", aborted: false },
+      });
+      await flushMicrotasks();
+    } finally {
+      teardown();
+      (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = origRaf;
+      (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = origCancelRaf;
+    }
+  });
+
+  test("optimistic 3-dot indicator attaches immediately to latest message row for guided_continue & foreground guided_swipe via getLatestMessageId(), hands off seamlessly, and falls back gracefully when absent", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const getBtn = (action: string) =>
+        h.actionsMount.querySelector<HTMLButtonElement>(`[data-gg-action="${action}"]`)!;
+
+      // Create latest message row with MessageContent
+      const latestRow = document.createElement("div");
+      const contentWrap = document.createElement("div");
+      const messageContent = document.createElement("div");
+      messageContent.setAttribute("data-component", "MessageContent");
+      messageContent.textContent = "Existing assistant text";
+      contentWrap.append(messageContent);
+      latestRow.append(contentWrap);
+      document.body.append(latestRow);
+      h.setMessageElement("m-latest", latestRow);
+      h.setLatestMessageId("m-latest");
+
+      // 1. guided_continue attaches immediately to m-latest at t=0ms
+      getBtn("guided_continue").click();
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      const injectCountAfterOptimistic = h.getInjectCounts().injectCalls;
+      expect(injectCountAfterOptimistic).toBe(1);
+
+      // Real gg:status confirms m-latest -> smooth handoff with ZERO redundant uninject/re-inject
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "cont-real-1",
+          actionId: "guided_continue",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-latest",
+          swipeId: 0,
+        },
+      });
+      expect(h.getInjectCounts().injectCalls).toBe(injectCountAfterOptimistic);
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      h.emitFromBackend({ type: "gg:status", chatId: "chat-a", run: null, done: true });
+      const runReq1 = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq1.requestId,
+        result: { runId: "cont-real-1", actionId: "guided_continue", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 2. Foreground guided_swipe attaches immediately to m-latest at t=0ms, then hands off to confirmed swipeId
+      getBtn("guided_swipe").click();
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "swipe-real-1",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          messageId: "m-latest",
+          swipeId: 1,
+          backgroundSwipe: false,
+        },
+      });
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      h.emitFromBackend({ type: "gg:status", chatId: "chat-a", run: null, done: true });
+      const runReq2 = h.sentRpcs.filter((r) => r.action === "run_action")[1]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq2.requestId,
+        result: { runId: "swipe-real-1", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 3. Background guided_swipe does NOT attach optimistic indicator to m-latest
+      const Win = document.defaultView!;
+      getBtn("guided_swipe").dispatchEvent(
+        new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }),
+      );
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      const runReq3 = h.sentRpcs.filter((r) => r.action === "run_action")[2]!;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: runReq3.requestId,
+        result: { runId: "swipe-bg-1", actionId: "guided_swipe", chatId: "chat-a", aborted: false },
+      });
+      await flushMicrotasks();
+
+      // 4. Graceful fallback when ctx.messages.getLatestMessageId is unavailable (older host)
+      delete (h.ctx as unknown as { messages?: unknown }).messages;
+      getBtn("guided_continue").click();
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+
+      const runReq4 = h.sentRpcs.filter((r) => r.action === "run_action")[3]!;
+      h.rejectRpc(runReq4.requestId, "Continue failed");
+      await flushMicrotasks();
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("Phase 3 & 4 perf: PillMetricsController prefers getSingleMessage, coalesces per-chat tail reads, uses authoritative eventFallback, and bounds pending entries", async () => {
+    // 1. getSingleMessage-first avoids 50-message tail fetch completely
+    let singleReads = 0;
+    let tailReads = 0;
+    const singleUpdates: Array<{ chatId: string; messageId: string; input: Record<string, unknown> }> = [];
+    const singleCtx = {
+      messages: {
+        get: async (messageId: string) => {
+          singleReads += 1;
+          return {
+            id: messageId,
+            chat_id: "chat-single",
+            swipe_id: 0,
+            extra: { existing: "yes" },
+          };
+        },
+      },
+      chats: {
+        getMessages: async () => {
+          tailReads += 1;
+          return { data: [], total: 0 };
+        },
+        updateMessage: async (
+          chatId: string,
+          messageId: string,
+          input: Record<string, unknown>,
+        ) => {
+          singleUpdates.push({ chatId, messageId, input });
+          return {};
+        },
+      },
+      getActiveChat: () => ({ chatId: "chat-single", characterId: null }),
+    } as unknown as SpindleFrontendContext;
+
+    const singleCtrl = new PillMetricsController(singleCtx);
+    singleCtrl.handleMetricsEvent({
+      type: "gg:generation_metrics",
+      chatId: "chat-single",
+      messageId: "m-single",
+      swipeId: 0,
+      tokenCount: 88,
+    });
+    await flushMicrotasks();
+    expect(singleReads).toBe(1);
+    expect(tailReads).toBe(0);
+    expect(singleUpdates).toEqual([
+      {
+        chatId: "chat-single",
+        messageId: "m-single",
+        input: { extra: { existing: "yes", tokenCount: 88 } },
+      },
+    ]);
+    singleCtrl.destroy();
+
+    // 2. Per-chat tail read coalescing on onChatChanged with multiple pending entries
+    let coalescedTailReads = 0;
+    let resolveTail!: (val: unknown) => void;
+    const coalescedUpdates: Array<{ messageId: string; input: Record<string, unknown> }> = [];
+    const coalesceCtx = {
+      chats: {
+        getMessages: async (_chatId: string, _opts?: { limit?: number; tail?: boolean }) => {
+          coalescedTailReads += 1;
+          if (coalescedTailReads <= 2) {
+            // Initial flushes see truncated page so entries remain pending for onChatChanged
+            return { data: [], total: 500 };
+          }
+          return new Promise((resolve) => {
+            resolveTail = resolve;
+          });
+        },
+        updateMessage: async (
+          _chatId: string,
+          messageId: string,
+          input: Record<string, unknown>,
+        ) => {
+          coalescedUpdates.push({ messageId, input });
+          return {};
+        },
+      },
+      getActiveChat: () => ({ chatId: "chat-coal", characterId: null }),
+    } as unknown as SpindleFrontendContext;
+
+    const coalCtrl = new PillMetricsController(coalesceCtx);
+    coalCtrl.handleMetricsEvent({
+      type: "gg:generation_metrics",
+      chatId: "chat-coal",
+      messageId: "m-1",
+      swipeId: 0,
+      tokenCount: 11,
+    });
+    coalCtrl.handleMetricsEvent({
+      type: "gg:generation_metrics",
+      chatId: "chat-coal",
+      messageId: "m-2",
+      swipeId: 0,
+      tokenCount: 22,
+    });
+    await flushMicrotasks();
+    await flushMicrotasks();
+    expect(coalescedUpdates).toHaveLength(0);
+
+    const readsBeforeChatChange = coalescedTailReads;
+    coalCtrl.onChatChanged("chat-coal");
+    await Promise.resolve();
+    await Promise.resolve();
+    // Both pending entries share ONE in-flight getMessages("chat-coal", { limit: 50, tail: true })
+    expect(coalescedTailReads).toBe(readsBeforeChatChange + 1);
+
+    resolveTail({
+      data: [
+        { id: "m-1", chat_id: "chat-coal", swipe_id: 0, extra: {} },
+        { id: "m-2", chat_id: "chat-coal", swipe_id: 0, extra: {} },
+      ],
+      total: 2,
+    });
+    await flushMicrotasks();
+    expect(coalescedUpdates).toHaveLength(2);
+    coalCtrl.destroy();
+
+    // 3. Authoritative eventFallback (non-empty extra + matching swipe_id) skips IPC reads
+    let fallbackReads = 0;
+    const fallbackUpdates: Array<{ messageId: string; input: Record<string, unknown> }> = [];
+    const fallbackCtx = {
+      messages: {
+        get: async () => {
+          fallbackReads += 1;
+          return { id: "m-fb", chat_id: "chat-fb", swipe_id: 0, extra: {} };
+        },
+      },
+      chats: {
+        getMessages: async () => {
+          fallbackReads += 1;
+          return { data: [], total: 0 };
+        },
+        updateMessage: async (
+          _chatId: string,
+          messageId: string,
+          input: Record<string, unknown>,
+        ) => {
+          fallbackUpdates.push({ messageId, input });
+          return {};
+        },
+      },
+      getActiveChat: () => ({ chatId: "chat-fb", characterId: null }),
+    } as unknown as SpindleFrontendContext;
+
+    const fbCtrl = new PillMetricsController(fallbackCtx);
+    fbCtrl.handleMetricsEvent({
+      type: "gg:generation_metrics",
+      chatId: "chat-fb",
+      messageId: "m-fb",
+      swipeId: 1,
+      tokenCount: 64,
+    });
+    await flushMicrotasks();
+    expect(fallbackReads).toBe(1);
+    expect(fallbackUpdates).toHaveLength(0);
+
+    // Swipe onto swipe 1 with authoritative extra -> writes directly without another read
+    fbCtrl.onMessageEvent({
+      chatId: "chat-fb",
+      message: {
+        id: "m-fb",
+        chat_id: "chat-fb",
+        swipe_id: 1,
+        extra: { spindle_metadata: { fromEvent: true } },
+      },
+    });
+    await flushMicrotasks();
+    expect(fallbackReads).toBe(1);
+    expect(fallbackUpdates).toEqual([
+      {
+        messageId: "m-fb",
+        input: { extra: { spindle_metadata: { fromEvent: true }, tokenCount: 64 } },
+      },
+    ]);
+    fbCtrl.destroy();
+  });
+
+  test("Phase 3 & 4 perf: ChatHeadController performs single-pass querySelectorAll per render, caches head child refs, and throttles drag/resize via rAF", async () => {
+    const win = document.defaultView!;
+    const origRaf = (globalThis as unknown as { requestAnimationFrame?: typeof requestAnimationFrame }).requestAnimationFrame;
+    const origCaf = (globalThis as unknown as { cancelAnimationFrame?: typeof cancelAnimationFrame }).cancelAnimationFrame;
+
+    // Add a native chat head for chat-native to verify single-pass filtering + container detection
+    const nativeContainer = document.createElement("div");
+    const nativeBtn = document.createElement("button");
+    nativeBtn.setAttribute("data-head-idx", "0");
+    nativeBtn.setAttribute("data-chat-id", "chat-native");
+    nativeContainer.append(nativeBtn);
+    document.body.append(nativeContainer);
+
+    const headCtx = {
+      getActiveChat: () => ({ chatId: "chat-active" }),
+      events: { on: () => () => {} },
+    } as unknown as SpindleFrontendContext;
+
+    const controller = new ChatHeadController(headCtx);
+    const origQsa = document.body.querySelectorAll.bind(document.body);
+    let qsaCalls = 0;
+    document.body.querySelectorAll = ((selector: string) => {
+      qsaCalls += 1;
+      return origQsa(selector);
+    }) as typeof document.body.querySelectorAll;
+
+    try {
+      controller.syncRuns(
+        [
+          { runId: "r1", actionId: "guided_response", chatId: "chat-1", startedAt: 1, characterName: "One" } as never,
+          { runId: "r2", actionId: "guided_response", chatId: "chat-2", startedAt: 2, characterName: "Two" } as never,
+          { runId: "r3", actionId: "guided_response", chatId: "chat-3", startedAt: 3, characterName: "Three" } as never,
+          { runId: "r4", actionId: "guided_response", chatId: "chat-native", startedAt: 4, characterName: "Native" } as never,
+        ],
+        "chat-active",
+      );
+
+      // Single document.body.querySelectorAll per render regardless of head count (4 heads -> 1 scan)
+      expect(qsaCalls).toBe(1);
+      expect(origQsa(".gg-chat-head")).toHaveLength(3);
+      expect(origQsa('.gg-chat-head[data-chat-id="chat-native"]')).toHaveLength(0);
+
+      // Updating an existing head item uses cached child DOM refs (0 item.querySelector calls)
+      const firstItem = origQsa(".gg-chat-head-item")[0] as HTMLDivElement;
+      let itemQsCalls = 0;
+      const origItemQs = firstItem.querySelector.bind(firstItem);
+      firstItem.querySelector = ((sel: string) => {
+        itemQsCalls += 1;
+        return origItemQs(sel);
+      }) as typeof firstItem.querySelector;
+
+      controller.handleStatusEvent(
+        {
+          type: "gg:status",
+          chatId: "chat-1",
+          run: {
+            runId: "r1",
+            actionId: "guided_response",
+            chatId: "chat-1",
+            startedAt: 1,
+            hasContentOutput: true,
+          },
+        },
+        "chat-active",
+      );
+      expect(qsaCalls).toBe(2);
+      expect(itemQsCalls).toBe(0);
+      expect(origQsa('.gg-chat-head[data-chat-id="chat-1"]')[0]!.classList.contains("is-streaming")).toBe(true);
+
+      // RAF-throttled pointermove coalesces multiple moves into 1 frame and flushes on pointerup
+      const rafCallbacks = new Map<number, FrameRequestCallback>();
+      let nextRafId = 1;
+      (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = (
+        cb: FrameRequestCallback,
+      ) => {
+        const id = nextRafId++;
+        rafCallbacks.set(id, cb);
+        return id;
+      };
+      (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = (
+        id: number,
+      ) => {
+        rafCallbacks.delete(id);
+      };
+
+      const rootEl = origQsa(".gg-chat-heads-root")[0] as HTMLDivElement;
+      const firstBtn = origQsa('.gg-chat-head[data-chat-id="chat-1"]')[0] as HTMLButtonElement;
+      const PointerEvt = win.PointerEvent;
+      const leftBeforeDrag = rootEl.style.left;
+
+      firstBtn.dispatchEvent(
+        new PointerEvt("pointerdown", {
+          bubbles: true,
+          pointerId: 5,
+          pointerType: "mouse",
+          button: 0,
+          clientX: 900,
+          clientY: 200,
+        }),
+      );
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 5,
+          pointerType: "mouse",
+          clientX: 850,
+          clientY: 220,
+        }),
+      );
+      document.dispatchEvent(
+        new PointerEvt("pointermove", {
+          bubbles: true,
+          pointerId: 5,
+          pointerType: "mouse",
+          clientX: 760,
+          clientY: 260,
+        }),
+      );
+      // Both moves coalesced into a single scheduled rAF
+      expect(rafCallbacks.size).toBe(1);
+      expect(rootEl.style.left).toBe(leftBeforeDrag);
+
+      // Flush the rAF -> applies latest coordinates
+      const [rafId, rafFn] = [...rafCallbacks.entries()][0]!;
+      rafCallbacks.delete(rafId);
+      rafFn(16);
+      expect(parseFloat(rootEl.style.left)).toBeLessThan(parseFloat(leftBeforeDrag));
+
+      document.dispatchEvent(
+        new PointerEvt("pointerup", {
+          bubbles: true,
+          pointerId: 5,
+          pointerType: "mouse",
+          clientX: 760,
+          clientY: 260,
+        }),
+      );
+    } finally {
+      document.body.querySelectorAll = origQsa;
+      if (origRaf === undefined) {
+        delete (globalThis as unknown as { requestAnimationFrame?: typeof requestAnimationFrame }).requestAnimationFrame;
+      } else {
+        (globalThis as unknown as { requestAnimationFrame: typeof requestAnimationFrame }).requestAnimationFrame = origRaf;
+      }
+      if (origCaf === undefined) {
+        delete (globalThis as unknown as { cancelAnimationFrame?: typeof cancelAnimationFrame }).cancelAnimationFrame;
+      } else {
+        (globalThis as unknown as { cancelAnimationFrame: typeof cancelAnimationFrame }).cancelAnimationFrame = origCaf;
+      }
+      controller.destroy();
+      nativeContainer.remove();
+    }
+  });
+
+  test("Phase 3 & 4 perf: frontend.ts deduplicates back-to-back chat switches, coalesces concurrent refresh(), gates includeCatalogs when drawer is closed, and reduces composer.getState() on impersonate chunks", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    let getStateCalls = 0;
+    const origGetState = (h.ctx as unknown as { composer: { getState: () => unknown } }).composer.getState;
+    (h.ctx as unknown as { composer: { getState: () => unknown } }).composer.getState = () => {
+      getStateCalls += 1;
+      return origGetState();
+    };
+
+    const teardown = setup(h.ctx);
+    try {
+      // 1. Coalescing concurrent refresh() calls (gg:changed burst while get_bootstrap is in flight)
+      expect(h.sentRpcs.filter((r) => r.action === "get_bootstrap")).toHaveLength(1);
+      h.emitFromBackend({ type: "gg:changed" });
+      h.emitFromBackend({ type: "gg:changed" });
+      h.emitFromBackend({ type: "gg:changed" });
+      // No overlapping get_bootstrap RPCs sent while first is still in flight
+      expect(h.sentRpcs.filter((r) => r.action === "get_bootstrap")).toHaveLength(1);
+
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+      // Exactly 1 trailing follow-up refresh runs after the first settles
+      expect(h.sentRpcs.filter((r) => r.action === "get_bootstrap")).toHaveLength(2);
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 2. When drawer tab is detached (closed) after catalogsLoaded, gg:changed sends includeCatalogs: false
+      h.tabRoot.remove();
+      h.emitFromBackend({ type: "gg:changed" });
+      const closedDrawerReq = h.sentRpcs[h.sentRpcs.length - 1]!;
+      expect(closedDrawerReq.action).toBe("get_bootstrap");
+      expect(closedDrawerReq.input).toEqual({ includeCatalogs: false });
+      h.resolveLastRpc(makeBootstrapView({ connections: [], presets: [] }), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 3. Deduplicating back-to-back CHAT_SWITCHED + CHAT_CHANGED + chat.active for the same chat
+      h.setCustomGetMessages(async () => ({ data: [], total: 100 }));
+      h.emitFromBackend({
+        type: "gg:generation_metrics",
+        chatId: "chat-b",
+        messageId: "m-b",
+        swipeId: 0,
+        tokenCount: 50,
+      });
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      h.setCustomGetMessages(async () => ({
+        data: [{ id: "m-b", chat_id: "chat-b", swipe_id: 0, extra: {} }],
+        total: 1,
+      }));
+      const getMsgCountBefore = h.getGetMessagesCalls().length;
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      h.emitEvent("CHAT_CHANGED", { chatId: "chat-b" });
+      h.emitStateChange("chat.active", { chatId: "chat-b" });
+      await flushMicrotasks();
+      expect(h.getGetMessagesCalls().length - getMsgCountBefore).toBe(1);
+
+      // 4. gg:impersonate-chunk: 0 getState() calls for background chat, 1 getState() call for foreground chunk (even with done: true)
+      getStateCalls = 0;
+      h.emitFromBackend({
+        type: "gg:impersonate-chunk",
+        chatId: "chat-a",
+        text: "Background draft",
+        done: true,
+      });
+      expect(getStateCalls).toBe(0);
+
+      h.emitFromBackend({
+        type: "gg:impersonate-chunk",
+        chatId: "chat-b",
+        text: "Foreground draft",
+        done: true,
+      });
+      expect(getStateCalls).toBe(1);
+      expect(h.getComposerText()).toBe("Foreground draft");
+    } finally {
+      teardown();
     }
   });
 });

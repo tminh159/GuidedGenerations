@@ -35,7 +35,9 @@ type MatchActionType = "move_top" | "move_bottom" | "repeat_back";
 const MAX_REGEX_MATCHES = 5_000;
 const MAX_REGEX_PATTERN_LENGTH = 50_000;
 const REGEX_SCRIPT_TIME_BUDGET_MS = 500;
-const VALID_REGEX_FLAGS = new Set(["d", "g", "i", "m", "s", "u", "v", "y"]);
+const COMPILED_REGEX_CACHE_MAX = 512;
+const BRACE_QUANTIFIER_AT_RE = /\{(\d+)(?:,(\d*))?\}/y;
+const WILD_CLASS_AT_RE = /\[(?:\\s\\S|\\S\\s|\\d\\D|\\D\\d|\\w\\W|\\W\\w)\]/y;
 
 interface MacroTokenSpan {
   start: number;
@@ -216,13 +218,37 @@ function extractMatchActions(script: RegexScriptDTO): Set<MatchActionType> {
   return actions;
 }
 
+function flagBit(ch: string): number {
+  switch (ch) {
+    case "d":
+      return 1;
+    case "g":
+      return 2;
+    case "i":
+      return 4;
+    case "m":
+      return 8;
+    case "s":
+      return 16;
+    case "u":
+      return 32;
+    case "v":
+      return 64;
+    case "y":
+      return 128;
+    default:
+      return 0;
+  }
+}
+
 function validateFlags(flags: string): boolean {
-  const seen = new Set<string>();
-  for (const ch of flags) {
-    if (!VALID_REGEX_FLAGS.has(ch) || seen.has(ch)) {
+  let seen = 0;
+  for (let i = 0; i < flags.length; i += 1) {
+    const bit = flagBit(flags[i]!);
+    if (bit === 0 || (seen & bit) !== 0) {
       return false;
     }
-    seen.add(ch);
+    seen |= bit;
   }
   return true;
 }
@@ -233,15 +259,16 @@ function hasOverlappingAlternationBranches(
   hasCharClassOrShorthandOverlap: boolean,
 ): boolean {
   if (hasEmptyBranch || hasCharClassOrShorthandOverlap) return true;
+  if (branches.length < 2) {
+    return branches.length === 1 && !branches[0];
+  }
   for (let i = 0; i < branches.length; i += 1) {
-    const a = branches[i]!;
-    if (!a) return true;
-    for (let j = i + 1; j < branches.length; j += 1) {
-      const b = branches[j]!;
-      if (!b) return true;
-      if (a.startsWith(b) || b.startsWith(a)) {
-        return true;
-      }
+    if (!branches[i]) return true;
+  }
+  const sorted = [...branches].sort();
+  for (let i = 0; i + 1 < sorted.length; i += 1) {
+    if (sorted[i + 1]!.startsWith(sorted[i]!)) {
+      return true;
     }
   }
   return false;
@@ -281,6 +308,7 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
 
   const stack: GroupFrame[] = [createFrame()];
   let inCharClass = false;
+  let pendingWildClass = false;
   let lastWasQuantifiableAtom = false;
   let lastWasWildcard = false;
   let lastAtomIsUnboundedQuantifiedWildcard = false;
@@ -301,7 +329,8 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
       return { end, min: 0, maxMoreThanOne: false, unbounded: false };
     }
     if (ch === "{") {
-      const m = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(idx));
+      BRACE_QUANTIFIER_AT_RE.lastIndex = idx;
+      const m = BRACE_QUANTIFIER_AT_RE.exec(pattern);
       if (!m) return null;
       const min = Number.parseInt(m[1]!, 10);
       const maxStr = m[2];
@@ -358,7 +387,11 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
       if (ch === "]") {
         inCharClass = false;
         lastWasQuantifiableAtom = true;
-        lastWasWildcard = false;
+        lastWasWildcard = pendingWildClass;
+        if (!pendingWildClass) {
+          lastAtomIsUnboundedQuantifiedWildcard = false;
+        }
+        pendingWildClass = false;
         top.mandatoryCount += 1;
         if (top.currentBranchOpen && top.currentBranchPrefix.length === 0) {
           top.classLikeBranches += 1;
@@ -371,9 +404,10 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
 
     if (ch === "[") {
       inCharClass = true;
-      const rest = pattern.slice(i);
-      const isWildClass = /^\[(?:\\s\\S|\\S\\s|\\d\\D|\\D\\d|\\w\\W|\\W\\w)\]/.test(rest);
-      lastWasWildcard = isWildClass;
+      WILD_CLASS_AT_RE.lastIndex = i;
+      const isWildClass = WILD_CLASS_AT_RE.test(pattern);
+      pendingWildClass = isWildClass;
+      lastWasWildcard = false;
       if (isWildClass) top.hasWildcard = true;
       i += 1;
       continue;
@@ -597,22 +631,89 @@ function getRequiredTerminalLiteral(pattern: string): string | null {
   return suffix.length >= 4 ? suffix : null;
 }
 
+interface CompiledRegexEntry {
+  catastrophic: boolean;
+  regex: RegExp | null;
+  terminalLiteral: string | null;
+  caseInsensitiveGuard: RegExp | null;
+}
+
+const compiledRegexCache = new Map<string, CompiledRegexEntry>();
+
+function getCompiledRegexEntry(pattern: string, flags: string): CompiledRegexEntry {
+  const key = `${flags}\0${pattern}`;
+  const cached = compiledRegexCache.get(key);
+  if (cached !== undefined) {
+    compiledRegexCache.delete(key);
+    compiledRegexCache.set(key, cached);
+    return cached;
+  }
+
+  let entry: CompiledRegexEntry;
+  if (isLikelyCatastrophicRegex(pattern)) {
+    entry = {
+      catastrophic: true,
+      regex: null,
+      terminalLiteral: null,
+      caseInsensitiveGuard: null,
+    };
+  } else {
+    let regex: RegExp | null = null;
+    try {
+      regex = new RegExp(pattern, flags);
+    } catch {
+      regex = null;
+    }
+
+    if (!regex) {
+      entry = {
+        catastrophic: false,
+        regex: null,
+        terminalLiteral: null,
+        caseInsensitiveGuard: null,
+      };
+    } else {
+      const terminalLiteral = flags.includes("y") ? null : getRequiredTerminalLiteral(pattern);
+      let caseInsensitiveGuard: RegExp | null = null;
+      if (terminalLiteral && flags.includes("i")) {
+        const unicodeFlag = flags.includes("v") ? "v" : flags.includes("u") ? "u" : "";
+        caseInsensitiveGuard = new RegExp(escapeRegExp(terminalLiteral), `gi${unicodeFlag}`);
+      }
+      entry = {
+        catastrophic: false,
+        regex,
+        terminalLiteral,
+        caseInsensitiveGuard,
+      };
+    }
+  }
+
+  if (compiledRegexCache.size >= COMPILED_REGEX_CACHE_MAX) {
+    const oldestKey = compiledRegexCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      compiledRegexCache.delete(oldestKey);
+    }
+  }
+  compiledRegexCache.set(key, entry);
+  return entry;
+}
+
 function getRegexSearchEnd(
   input: string,
-  pattern: string,
+  compiled: CompiledRegexEntry,
   flags: string,
   replacementTemplate: string,
 ): number {
   if (flags.includes("y") || replacementTemplate.includes("$'")) return input.length;
-  const terminal = getRequiredTerminalLiteral(pattern);
+  const terminal = compiled.terminalLiteral;
   if (!terminal) return input.length;
 
   let index = -1;
   if (!flags.includes("i")) {
     index = input.lastIndexOf(terminal);
-  } else {
-    const unicodeFlag = flags.includes("v") ? "v" : flags.includes("u") ? "u" : "";
-    const guard = new RegExp(escapeRegExp(terminal), `gi${unicodeFlag}`);
+  } else if (compiled.caseInsensitiveGuard) {
+    const guard = compiled.caseInsensitiveGuard;
+    guard.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = guard.exec(input)) !== null) {
       index = match.index;
@@ -828,7 +929,7 @@ export async function applyRegexScripts(
       options.resolveMacros,
     );
 
-    if (resolvedFindRegex.length > MAX_REGEX_PATTERN_LENGTH || isLikelyCatastrophicRegex(resolvedFindRegex)) {
+    if (resolvedFindRegex.length > MAX_REGEX_PATTERN_LENGTH) {
       continue;
     }
 
@@ -838,12 +939,11 @@ export async function applyRegexScripts(
     const repeatBack = actions.has("repeat_back");
     const effectiveFlags = moveTop || moveBottom ? flags.replaceAll("g", "") : flags;
 
-    let regex: RegExp;
-    try {
-      regex = new RegExp(resolvedFindRegex, effectiveFlags);
-    } catch {
+    const compiled = getCompiledRegexEntry(resolvedFindRegex, effectiveFlags);
+    if (compiled.catastrophic || !compiled.regex) {
       continue;
     }
+    const regex = compiled.regex;
 
     const baseReplaceTemplate =
       script.substitute_macros === "escaped"
@@ -855,7 +955,7 @@ export async function applyRegexScripts(
 
     const trimStrings = Array.isArray(script.trim_strings) ? script.trim_strings : [];
 
-    const searchEnd = getRegexSearchEnd(current, resolvedFindRegex, effectiveFlags, baseReplaceTemplate);
+    const searchEnd = getRegexSearchEnd(current, compiled, effectiveFlags, baseReplaceTemplate);
     const searchInput = searchEnd === current.length ? current : current.slice(0, searchEnd);
     const searchTail = searchEnd === current.length ? "" : current.slice(searchEnd);
 
@@ -869,6 +969,7 @@ export async function applyRegexScripts(
     let timedOut = false;
     const startedAt = Date.now();
     if (searchEnd > 0 || current.length === 0) {
+      regex.lastIndex = 0;
       let execResult: RegExpExecArray | null;
       while ((execResult = regex.exec(searchInput)) !== null) {
         const trimmedMatch = trimMatchStrings(execResult[0], trimStrings);
@@ -881,7 +982,9 @@ export async function applyRegexScripts(
         );
 
         if (script.substitute_macros === "raw" && options.resolveMacros) {
+          const savedLastIndex = regex.lastIndex;
           replacement = await options.resolveMacros(replacement);
+          regex.lastIndex = savedLastIndex;
         }
 
         const movedValue = replacement.length > 0 ? replacement : trimmedMatch;
@@ -918,13 +1021,8 @@ export async function applyRegexScripts(
 
     if (matches.length === 0) {
       if (repeatBack && options.previousContent !== undefined) {
-        let priorRegex: RegExp | null = null;
-        try {
-          priorRegex = new RegExp(resolvedFindRegex, effectiveFlags);
-        } catch {
-          priorRegex = null;
-        }
-        const priorExec = priorRegex ? priorRegex.exec(options.previousContent) : null;
+        regex.lastIndex = 0;
+        const priorExec = regex.exec(options.previousContent);
         if (priorExec) {
           const repeatRawMatch = script.metadata?.repeat_raw_match === true;
           const repeatPosition =
@@ -990,19 +1088,29 @@ export async function applyRegexScripts(
       continue;
     }
 
-    let rebuilt = "";
+    const rebuiltChunks: string[] = [];
     let cursor = 0;
     const movedChunks: string[] = [];
 
     for (const m of matches) {
-      rebuilt += searchInput.slice(cursor, m.index);
-      rebuilt += m.replacement;
+      if (m.index > cursor) {
+        rebuiltChunks.push(searchInput.slice(cursor, m.index));
+      }
+      if (m.replacement.length > 0) {
+        rebuiltChunks.push(m.replacement);
+      }
       if (repeatBack && options.previousContent === undefined && m.movedValue) {
         movedChunks.push(m.movedValue);
       }
       cursor = m.index + m.length;
     }
-    rebuilt += searchInput.slice(cursor) + searchTail;
+    if (cursor < searchInput.length) {
+      rebuiltChunks.push(searchInput.slice(cursor));
+    }
+    if (searchTail.length > 0) {
+      rebuiltChunks.push(searchTail);
+    }
+    let rebuilt = rebuiltChunks.join("");
 
     if (script.substitute_macros === "after" && options.resolveMacros) {
       rebuilt = await options.resolveMacros(rebuilt);
@@ -1018,7 +1126,13 @@ export async function applyRegexScripts(
   return current;
 }
 
+const FONT_OPEN_PRESENT_RE = /<font\b/i;
+
 function healFontTagsAndAttributes(prose: string): string {
+  if (!prose.includes("<") || !FONT_OPEN_PRESENT_RE.test(prose)) {
+    return prose;
+  }
+
   // 1. Repair unterminated <font ... color="..."> quotes before '>' or next attribute.
   let out = prose.replace(/<font\b([^>]*)>/gi, (_full, attrs: string) => {
     let fixed = attrs.replace(
@@ -1101,14 +1215,19 @@ function healFontTagsAndAttributes(prose: string): string {
 
   if (closeInsertOffsets.length > 0) {
     closeInsertOffsets.sort((a, b) => a - b);
-    let rebuilt = "";
+    const chunks: string[] = [];
     let cursor = 0;
     for (const offset of closeInsertOffsets) {
-      rebuilt += out.slice(cursor, offset) + "</font>";
+      if (offset > cursor) {
+        chunks.push(out.slice(cursor, offset));
+      }
+      chunks.push("</font>");
       cursor = offset;
     }
-    rebuilt += out.slice(cursor);
-    out = rebuilt;
+    if (cursor < out.length) {
+      chunks.push(out.slice(cursor));
+    }
+    out = chunks.join("");
   }
 
   return out;
@@ -1123,16 +1242,69 @@ interface TextSpan {
   end: number;
 }
 
-function findHtmlTagSpansOnLine(line: string): TextSpan[] {
+const EMPTY_SPANS: readonly TextSpan[] = [];
+
+function isHtmlTagStartChar(code: number): boolean {
+  return (
+    (code >= 0x41 && code <= 0x5a) || // A-Z
+    (code >= 0x61 && code <= 0x7a) || // a-z
+    code === 0x21 || // !
+    code === 0x3f || // ?
+    code === 0x2f // /
+  );
+}
+
+function isSpaceOrTab(code: number): boolean {
+  return code === 0x20 || code === 0x09;
+}
+
+function isAsciiDigit(code: number): boolean {
+  return code >= 0x30 && code <= 0x39;
+}
+
+function isMathAsteriskRun(text: string, runStart: number, runEnd: number): boolean {
+  // Check /[\d)][ \t]+$/ before runStart without slicing.
+  let l = runStart - 1;
+  if (l < 0 || !isSpaceOrTab(text.charCodeAt(l))) return false;
+  while (l >= 0 && isSpaceOrTab(text.charCodeAt(l))) l -= 1;
+  if (l < 0) return false;
+  const leftCode = text.charCodeAt(l);
+  if (!isAsciiDigit(leftCode) && leftCode !== 0x29 /* ')' */) return false;
+
+  // Check /^[ \t]+[\d(]/ after runEnd without slicing.
+  let r = runEnd;
+  if (r >= text.length || !isSpaceOrTab(text.charCodeAt(r))) return false;
+  while (r < text.length && isSpaceOrTab(text.charCodeAt(r))) r += 1;
+  if (r >= text.length) return false;
+  const rightCode = text.charCodeAt(r);
+  return isAsciiDigit(rightCode) || rightCode === 0x28 /* '(' */;
+}
+
+function findHtmlTagSpansOnLine(line: string): readonly TextSpan[] {
+  if (!line.includes("<")) return EMPTY_SPANS;
+  const lastGt = line.lastIndexOf(">");
+  if (lastGt === -1) return EMPTY_SPANS;
+
   const spans: TextSpan[] = [];
-  for (let i = 0; i < line.length; i += 1) {
-    if (line[i] !== "<") continue;
-    const next = line[i + 1];
-    if (!next || !/[a-zA-Z!?/]/.test(next)) continue;
+  // Lazily allocated only if an unclosed `<` scan fails; tracks (index, quoteState)
+  // pairs already known to reach end-of-line without an unquoted `>` so worst-case is O(L).
+  let deadStates: Uint8Array | null = null;
+
+  for (let i = 0; i < lastGt; i += 1) {
+    if (line.charCodeAt(i) !== 0x3c /* '<' */) continue;
+    if (i + 1 >= line.length || !isHtmlTagStartChar(line.charCodeAt(i + 1))) continue;
 
     let attrQuote: '"' | "'" | null = null;
     let closedAt = -1;
+    let stopAt = line.length;
     for (let j = i + 1; j < line.length; j += 1) {
+      if (deadStates !== null) {
+        const bit = attrQuote === null ? 1 : attrQuote === '"' ? 2 : 4;
+        if ((deadStates[j]! & bit) !== 0) {
+          stopAt = j;
+          break;
+        }
+      }
       const ch = line[j]!;
       if (attrQuote) {
         if (ch === attrQuote && countPrecedingBackslashes(line, j) % 2 === 0) {
@@ -1148,17 +1320,27 @@ function findHtmlTagSpansOnLine(line: string): TextSpan[] {
     if (closedAt > i) {
       spans.push({ start: i, end: closedAt });
       i = closedAt - 1;
+    } else {
+      if (deadStates === null) {
+        deadStates = new Uint8Array(line.length);
+      }
+      let markQuote: '"' | "'" | null = null;
+      for (let j = i + 1; j < stopAt; j += 1) {
+        const bit = markQuote === null ? 1 : markQuote === '"' ? 2 : 4;
+        if ((deadStates[j]! & bit) !== 0) break;
+        deadStates[j] = deadStates[j]! | bit;
+        const ch = line[j]!;
+        if (markQuote) {
+          if (ch === markQuote && countPrecedingBackslashes(line, j) % 2 === 0) {
+            markQuote = null;
+          }
+        } else if (ch === '"' || ch === "'") {
+          markQuote = ch;
+        }
+      }
     }
   }
   return spans;
-}
-
-function isInsideSpans(index: number, spans: readonly TextSpan[]): boolean {
-  for (const span of spans) {
-    if (index < span.start) return false;
-    if (index < span.end) return true;
-  }
-  return false;
 }
 
 interface TextEdit {
@@ -1169,14 +1351,22 @@ interface TextEdit {
 
 function applyTextEdits(line: string, edits: readonly TextEdit[]): string {
   if (edits.length === 0) return line;
-  let out = "";
+  const chunks: string[] = [];
   let cursor = 0;
   for (const edit of edits) {
     if (edit.start < cursor) continue;
-    out += line.slice(cursor, edit.start) + edit.replacement;
+    if (edit.start > cursor) {
+      chunks.push(line.slice(cursor, edit.start));
+    }
+    if (edit.replacement.length > 0) {
+      chunks.push(edit.replacement);
+    }
     cursor = edit.end;
   }
-  return out + line.slice(cursor);
+  if (cursor < line.length) {
+    chunks.push(line.slice(cursor));
+  }
+  return chunks.join("");
 }
 
 function trimInnerWhitespaceInPairs(
@@ -1185,13 +1375,21 @@ function trimInnerWhitespaceInPairs(
   closeChar: string,
   tagSpans: readonly TextSpan[] = findHtmlTagSpansOnLine(line),
 ): string {
+  if (!line.includes(openChar) || (openChar !== closeChar && !line.includes(closeChar))) {
+    return line;
+  }
+
   const edits: TextEdit[] = [];
   let openEnd = -1;
+  let spanIdx = 0;
 
   for (let i = 0; i < line.length; i += 1) {
     const ch = line[i]!;
     if (ch !== openChar && ch !== closeChar) continue;
-    if (isInsideSpans(i, tagSpans)) continue;
+    while (spanIdx < tagSpans.length && tagSpans[spanIdx]!.end <= i) {
+      spanIdx += 1;
+    }
+    if (spanIdx < tagSpans.length && i >= tagSpans[spanIdx]!.start) continue;
     if (countPrecedingBackslashes(line, i) % 2 === 1) continue;
 
     const canOpen = i === 0 || OPEN_BOUNDARY_RE.test(line[i - 1]!);
@@ -1234,12 +1432,16 @@ function trimDelimiterOnLine(
   delimiter: "*" | "_",
   tagSpans: readonly TextSpan[],
 ): string {
+  if (!line.includes(delimiter)) return line;
+
   let out = line;
   let currentTagSpans = tagSpans;
+  let spansDirty = false;
 
   for (const size of [3, 2, 1] as const) {
-    if (out !== line) {
-      currentTagSpans = findHtmlTagSpansOnLine(out);
+    if (spansDirty) {
+      currentTagSpans = out.includes("<") ? findHtmlTagSpansOnLine(out) : EMPTY_SPANS;
+      spansDirty = false;
     }
 
     const runs: Array<{
@@ -1250,12 +1452,17 @@ function trimDelimiterOnLine(
       isMath: boolean;
     }> = [];
 
+    let spanIdx = 0;
     for (let i = 0; i < out.length; ) {
       if (out[i] !== delimiter) {
         i += 1;
         continue;
       }
-      if (isInsideSpans(i, currentTagSpans) || countPrecedingBackslashes(out, i) % 2 === 1) {
+      while (spanIdx < currentTagSpans.length && currentTagSpans[spanIdx]!.end <= i) {
+        spanIdx += 1;
+      }
+      const insideTag = spanIdx < currentTagSpans.length && i >= currentTagSpans[spanIdx]!.start;
+      if (insideTag || countPrecedingBackslashes(out, i) % 2 === 1) {
         while (i < out.length && out[i] === delimiter) i += 1;
         continue;
       }
@@ -1269,9 +1476,7 @@ function trimDelimiterOnLine(
 
       let isMath = false;
       if (delimiter === "*" && (size === 1 || size === 2)) {
-        const hasLeftMath = /[\d)][ \t]+$/.test(out.slice(0, runStart));
-        const hasRightMath = /^[ \t]+[\d(]/.test(out.slice(runEnd));
-        isMath = hasLeftMath && hasRightMath;
+        isMath = isMathAsteriskRun(out, runStart, runEnd);
       }
 
       runs.push({ start: runStart, end: runEnd, canOpen, canClose, isMath });
@@ -1321,34 +1526,85 @@ function trimDelimiterOnLine(
       }
     }
 
-    out = applyTextEdits(out, edits);
+    if (edits.length > 0) {
+      out = applyTextEdits(out, edits);
+      spansDirty = true;
+    }
   }
 
   return out;
 }
 
-function trimEmphasisOnLine(
-  line: string,
-  tagSpans: readonly TextSpan[] = findHtmlTagSpansOnLine(line),
-): string {
-  let out = trimDelimiterOnLine(line, "*", tagSpans);
-  const nextSpans = out === line ? tagSpans : findHtmlTagSpansOnLine(out);
-  out = trimDelimiterOnLine(out, "_", nextSpans);
-  return out;
-}
-
 function healProseSegment(prose: string): string {
   const out = healFontTagsAndAttributes(prose);
+  if (
+    !out.includes("*") &&
+    !out.includes("_") &&
+    !out.includes('"') &&
+    !out.includes("“") &&
+    !out.includes("‘")
+  ) {
+    return out;
+  }
+
   const lines = out.split("\n");
 
   for (let i = 0; i < lines.length; i += 1) {
     let line = lines[i]!;
+    if (
+      !line.includes("*") &&
+      !line.includes("_") &&
+      !line.includes('"') &&
+      !line.includes("“") &&
+      !line.includes("‘")
+    ) {
+      continue;
+    }
+    let tagSpans: readonly TextSpan[] | null = null;
+    const getSpans = (s: string): readonly TextSpan[] => {
+      if (tagSpans === null) {
+        tagSpans = s.includes("<") ? findHtmlTagSpansOnLine(s) : EMPTY_SPANS;
+      }
+      return tagSpans;
+    };
+
     for (let pass = 0; pass < 2; pass += 1) {
-      let next = trimEmphasisOnLine(line);
-      const tagSpans = findHtmlTagSpansOnLine(next);
-      next = trimInnerWhitespaceInPairs(next, '"', '"', tagSpans);
-      next = trimInnerWhitespaceInPairs(next, "“", "”", tagSpans);
-      next = trimInnerWhitespaceInPairs(next, "‘", "’", tagSpans);
+      let next = line;
+      if (next.includes("*")) {
+        const afterStar = trimDelimiterOnLine(next, "*", getSpans(next));
+        if (afterStar !== next) {
+          next = afterStar;
+          tagSpans = null;
+        }
+      }
+      if (next.includes("_")) {
+        const afterUnderscore = trimDelimiterOnLine(next, "_", getSpans(next));
+        if (afterUnderscore !== next) {
+          next = afterUnderscore;
+          tagSpans = null;
+        }
+      }
+      if (next.includes('"')) {
+        const afterDq = trimInnerWhitespaceInPairs(next, '"', '"', getSpans(next));
+        if (afterDq !== next) {
+          next = afterDq;
+          tagSpans = null;
+        }
+      }
+      if (next.includes("“") && next.includes("”")) {
+        const afterCurlyD = trimInnerWhitespaceInPairs(next, "“", "”", getSpans(next));
+        if (afterCurlyD !== next) {
+          next = afterCurlyD;
+          tagSpans = null;
+        }
+      }
+      if (next.includes("‘") && next.includes("’")) {
+        const afterCurlyS = trimInnerWhitespaceInPairs(next, "‘", "’", getSpans(next));
+        if (afterCurlyS !== next) {
+          next = afterCurlyS;
+          tagSpans = null;
+        }
+      }
       if (next === line) break;
       line = next;
     }
@@ -1359,6 +1615,10 @@ function healProseSegment(prose: string): string {
 }
 
 function findFencedCodeSpans(text: string): TextSpan[] {
+  if (!text.includes("```") && !text.includes("~~~")) {
+    return [];
+  }
+
   interface FenceLine {
     lineStart: number;
     lineEnd: number;
@@ -1440,6 +1700,11 @@ function findJsonBlockSpans(
   from: number,
   to: number,
 ): { spans: TextSpan[]; stoppedAt: number } {
+  const firstLt = text.indexOf("<", from);
+  if (firstLt === -1 || firstLt >= to) {
+    return { spans: [], stoppedAt: to };
+  }
+
   const spans: TextSpan[] = [];
   let rejected = 0;
 
@@ -1450,7 +1715,7 @@ function findJsonBlockSpans(
     return { start: m.index, end: m.index + m[0].length };
   };
 
-  let open = findOpen(from);
+  let open = findOpen(firstLt);
   while (open) {
     const innerStart = open.end;
     const tagIdx = indexOfJsonTagOutsideStrings(text, innerStart, to);
@@ -1491,6 +1756,10 @@ function findJsonBlockSpans(
 }
 
 function healInlineBackticksAndProse(segment: string): string {
+  if (!segment.includes("`")) {
+    return healProseSegment(segment);
+  }
+
   const runs: Array<{ start: number; end: number; len: number }> = [];
   const byLen = new Map<number, number[]>();
 
@@ -1517,7 +1786,7 @@ function healInlineBackticksAndProse(segment: string): string {
   }
 
   const lenCursors = new Map<number, number>();
-  let result = "";
+  const chunks: string[] = [];
   let textCursor = 0;
 
   for (let rIdx = 0; rIdx < runs.length; rIdx += 1) {
@@ -1536,39 +1805,42 @@ function healInlineBackticksAndProse(segment: string): string {
     const closeIdx = list[ptr]!;
     const close = runs[closeIdx]!;
     if (open.start > textCursor) {
-      result += healProseSegment(segment.slice(textCursor, open.start));
+      chunks.push(healProseSegment(segment.slice(textCursor, open.start)));
     }
-    result += segment.slice(open.start, close.end);
+    chunks.push(segment.slice(open.start, close.end));
     textCursor = close.end;
     lenCursors.set(open.len, ptr + 1);
     rIdx = closeIdx;
   }
 
   if (textCursor < segment.length) {
-    result += healProseSegment(segment.slice(textCursor));
+    chunks.push(healProseSegment(segment.slice(textCursor)));
   }
 
-  return result;
+  return chunks.join("");
 }
 
 function healOutsideJsonBlocks(text: string, from: number, to: number): string {
   const { spans, stoppedAt } = findJsonBlockSpans(text, from, to);
-  let result = "";
+  if (spans.length === 0 && stoppedAt === to) {
+    return healInlineBackticksAndProse(from === 0 && to === text.length ? text : text.slice(from, to));
+  }
+  const chunks: string[] = [];
   let cursor = from;
   for (const span of spans) {
     if (span.start > cursor) {
-      result += healInlineBackticksAndProse(text.slice(cursor, span.start));
+      chunks.push(healInlineBackticksAndProse(text.slice(cursor, span.start)));
     }
-    result += text.slice(span.start, span.end);
+    chunks.push(text.slice(span.start, span.end));
     cursor = span.end;
   }
   if (stoppedAt > cursor) {
-    result += healInlineBackticksAndProse(text.slice(cursor, stoppedAt));
+    chunks.push(healInlineBackticksAndProse(text.slice(cursor, stoppedAt)));
   }
   if (stoppedAt < to) {
-    result += text.slice(stoppedAt, to);
+    chunks.push(text.slice(stoppedAt, to));
   }
-  return result;
+  return chunks.join("");
 }
 
 /**
@@ -1581,22 +1853,26 @@ export function healFormattingArtifacts(text: string): string {
   }
 
   const fencedSpans = findFencedCodeSpans(text);
-  let result = "";
+  if (fencedSpans.length === 0) {
+    return healOutsideJsonBlocks(text, 0, text.length);
+  }
+
+  const chunks: string[] = [];
   let lastIndex = 0;
 
   for (const span of fencedSpans) {
     if (span.start > lastIndex) {
-      result += healOutsideJsonBlocks(text, lastIndex, span.start);
+      chunks.push(healOutsideJsonBlocks(text, lastIndex, span.start));
     }
-    result += text.slice(span.start, span.end);
+    chunks.push(text.slice(span.start, span.end));
     lastIndex = span.end;
   }
 
   if (lastIndex < text.length) {
-    result += healOutsideJsonBlocks(text, lastIndex, text.length);
+    chunks.push(healOutsideJsonBlocks(text, lastIndex, text.length));
   }
 
-  return result;
+  return chunks.join("");
 }
 
 /**

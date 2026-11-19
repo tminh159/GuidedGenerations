@@ -281,6 +281,38 @@ describe("prompt-builder", () => {
       "She whispered, barely audible.",
     );
     expect(stitchContinueContent("", "First line")).toBe("First line");
+    expect(stitchContinueContent("Existing text", "")).toBe("Existing text");
+
+    // Trailing whitespace variants and leading whitespace in delta
+    expect(stitchContinueContent("Line one\n", "Line two")).toBe("Line one\nLine two");
+    expect(stitchContinueContent("Tab\t", "word")).toBe("Tab\tword");
+    expect(stitchContinueContent("Word", " next")).toBe("Word next");
+    expect(stitchContinueContent("Word", "\nnext")).toBe("Word\nnext");
+
+    // Trailing opening delimiters do not insert a space
+    expect(stitchContinueContent("Wait (", "really)")).toBe("Wait (really)");
+    expect(stitchContinueContent("Open [", "tag]")).toBe("Open [tag]");
+    expect(stitchContinueContent("Dash—", "suddenly")).toBe("Dash—suddenly");
+    expect(stitchContinueContent("Curly “", "hello")).toBe("Curly “hello");
+
+    // Trailing quote/emphasis delimiters: opening vs closing context
+    expect(stitchContinueContent('"', "Hello")).toBe('"Hello');
+    expect(stitchContinueContent('She said "', "Hello")).toBe('She said "Hello');
+    expect(stitchContinueContent("<b>*", "italic")).toBe("<b>*italic");
+    expect(stitchContinueContent('She said "hi"', "then left.")).toBe('She said "hi" then left.');
+    expect(stitchContinueContent("word*", "next")).toBe("word* next");
+
+    // Leading punctuation in delta does not insert a space
+    expect(stitchContinueContent("Hello", "...")).toBe("Hello...");
+    expect(stitchContinueContent("Hello", "…")).toBe("Hello…");
+    expect(stitchContinueContent("Hello", "! Next")).toBe("Hello! Next");
+    expect(stitchContinueContent("Hello", "—wait")).toBe("Hello—wait");
+
+    // Long baseContent boundary check (trailing-slice fast path)
+    const longBase = "a".repeat(100_000);
+    expect(stitchContinueContent(longBase, "next")).toBe(`${longBase} next`);
+    expect(stitchContinueContent(`${longBase} "`, "quoted")).toBe(`${longBase} "quoted`);
+    expect(stitchContinueContent(`${longBase}"`, "after")).toBe(`${longBase}" after`);
   });
 
   test("swipe helpers append new swipes and update active swipe without clobbering siblings", () => {

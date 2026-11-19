@@ -975,6 +975,12 @@ export function normalizeMessageSwipes(message: ChatMessageDTO): {
   return { swipes, swipeDates, activeIndex };
 }
 
+const TRAILING_WHITESPACE_RE = /\s$/;
+const TRAILING_OPENING_DELIM_RE = /[(\[{“‘—–-]$/;
+const TRAILING_QUOTED_OPEN_RE = /(?:^|[\s(\[>])["'*_]$/;
+const LEADING_WHITESPACE_RE = /^\s/;
+const LEADING_PUNCTUATION_RE = /^[,.;:!?'"’”\)\]\-—…]/;
+
 /**
  * Combines base message text with streamed continuation output without
  * collapsing intentional spacing or introducing double gaps at join boundaries.
@@ -983,17 +989,15 @@ export function stitchContinueContent(baseContent: string, delta: string): strin
   if (!delta) return baseContent;
   if (!baseContent) return delta;
 
-  const endsWithWhitespace = /\s$/.test(baseContent);
-  const endsWithOpeningDelimiter =
-    /[(\[{“‘—–-]$/.test(baseContent) || /(?:^|[\s(\[>])["'*_]$/.test(baseContent);
-  const startsWithWhitespace = /^\s/.test(delta);
-  const startsWithPunctuation = /^[,.;:!?'"’”\)\]\-—…]/.test(delta);
+  const tail = baseContent.length > 2 ? baseContent.slice(-2) : baseContent;
+  const head = delta[0]!;
 
   if (
-    endsWithWhitespace ||
-    endsWithOpeningDelimiter ||
-    startsWithWhitespace ||
-    startsWithPunctuation
+    TRAILING_WHITESPACE_RE.test(tail) ||
+    TRAILING_OPENING_DELIM_RE.test(tail) ||
+    TRAILING_QUOTED_OPEN_RE.test(tail) ||
+    LEADING_WHITESPACE_RE.test(head) ||
+    LEADING_PUNCTUATION_RE.test(head)
   ) {
     return baseContent + delta;
   }

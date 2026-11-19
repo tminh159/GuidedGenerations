@@ -591,6 +591,10 @@ export const GUIDED_GENERATIONS_CSS = `
   margin-top: 4px;
 }
 
+.gg-streaming-indicator--optimistic {
+  padding: 8px 16px;
+}
+
 .gg-streaming-dot {
   width: 5px;
   height: 5px;
@@ -838,7 +842,6 @@ export const GUIDED_GENERATIONS_CSS = `
 @media (prefers-reduced-motion: reduce) {
   .gg-btn,
   .gg-btn.is-running::after,
-  .gg-streaming-dot,
   .gg-chat-head,
   .gg-chat-head.is-running::after,
   .gg-chat-head-dismiss,

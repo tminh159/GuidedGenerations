@@ -8,20 +8,48 @@ const INDICATOR_ACTIONS = new Set<GuidedActionId>([
   "guided_continue",
 ]);
 
+const STREAM_AFTER_OPTIMISTIC_ACTIONS = new Set<GuidedActionId>([
+  "guided_response",
+  "guided_regenerate",
+]);
+
+const LATEST_ROW_OPTIMISTIC_ACTIONS = new Set<GuidedActionId>([
+  "guided_continue",
+  "guided_swipe",
+]);
+
 const INDICATOR_HTML_BEFORE =
   '<div class="gg-streaming-indicator" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
 
 const INDICATOR_HTML_AFTER =
   '<div class="gg-streaming-indicator gg-streaming-indicator--after" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
 
-const MAX_RAF_RETRIES = 30;
+const INDICATOR_HTML_OPTIMISTIC =
+  '<div class="gg-streaming-indicator gg-streaming-indicator--optimistic" data-gg-optimistic-indicator="true" role="status" aria-label="Generating response"><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span><span class="gg-streaming-dot"></span></div>';
+
+const FAST_RAF_RETRIES = 2;
+const MAX_RETRY_ATTEMPTS = 10;
+const BASE_BACKOFF_MS = 32;
+const MAX_BACKOFF_MS = 500;
 const MAX_RUN_STATE_CACHE = 32;
 
 interface ResolvedIndicatorTarget {
+  row: Element;
   element: Element;
   position: InsertPosition;
   isMessageContent: boolean;
 }
+
+type DisplayPlan =
+  | { kind: "none" }
+  | { kind: "stream_after" }
+  | {
+      kind: "row";
+      messageId: string;
+      actionId: GuidedActionId;
+      allowStreamAfterFallback: boolean;
+      retryRowIfMissing: boolean;
+    };
 
 interface PerRunIndicatorState {
   viewedSwipeId: number | undefined;
@@ -51,8 +79,14 @@ export class StreamingIndicatorController {
   private mountedEl: Element | null = null;
   private mountedTarget: Element | null = null;
   private mountedPosition: InsertPosition | null = null;
+  private mountedIsMessageContent: boolean | null = null;
+  private mountedMessageId: string | null = null;
+  private streamAfterMount: Element | null = null;
+  private optimisticStreamEl: Element | null = null;
   private rafId: number | null = null;
   private rafTimerId: ReturnType<typeof setTimeout> | null = null;
+  private rowObserver: MutationObserver | null = null;
+  private observedRow: Element | null = null;
   private rafRetries = 0;
   private retryMode: RetryMode = null;
   private destroyed = false;
@@ -90,11 +124,6 @@ export class StreamingIndicatorController {
       this.saveRunState(prevRun.runId);
     }
 
-    const runIdentityChanged =
-      prevRun?.runId !== run?.runId ||
-      prevRun?.messageId !== run?.messageId ||
-      prevRun?.actionId !== run?.actionId;
-
     if (prevRun?.runId !== run?.runId) {
       const cached = run ? this.runStateById.get(run.runId) : undefined;
       if (cached) {
@@ -121,10 +150,6 @@ export class StreamingIndicatorController {
       this.saveRunState(run.runId);
     }
 
-    if (runIdentityChanged) {
-      this.unmount();
-    }
-
     this.syncCurrent();
   }
 
@@ -133,6 +158,7 @@ export class StreamingIndicatorController {
     this.destroyed = true;
     this.resetRetry();
     this.unmount();
+    this.streamAfterMount = null;
     this.currentRun = null;
     this.runStateById.clear();
     for (const dispose of this.disposers) {
@@ -186,6 +212,10 @@ export class StreamingIndicatorController {
     }
 
     if (eventMessageId === this.currentRun.messageId) {
+      const prevViewedSwipeId = this.viewedSwipeId;
+      const prevSwipeInitialized = this.swipeInitialized;
+      const prevContentSeen = this.contentSeen;
+
       const nextSwipeId =
         typeof msg?.swipe_id === "number"
           ? msg.swipe_id
@@ -207,9 +237,15 @@ export class StreamingIndicatorController {
         this.contentSeen = true;
       }
 
-      this.saveRunState(this.currentRun.runId);
+      if (
+        this.viewedSwipeId !== prevViewedSwipeId ||
+        this.swipeInitialized !== prevSwipeInitialized ||
+        this.contentSeen !== prevContentSeen
+      ) {
+        this.saveRunState(this.currentRun.runId);
+      }
 
-      if (eventType === "MESSAGE_SWIPED" || this.retryMode === "content") {
+      if (eventType === "MESSAGE_SWIPED") {
         this.rafRetries = 0;
       }
     }
@@ -220,9 +256,17 @@ export class StreamingIndicatorController {
   private syncCurrent(): void {
     if (this.destroyed) return;
     const run = this.currentRun;
-    if (!this.shouldDisplay(run)) {
+    const plan = this.resolveDisplayPlan(run);
+    if (plan.kind === "none") {
       this.resetRetry();
       this.unmount();
+      return;
+    }
+
+    if (plan.kind === "stream_after") {
+      this.resetRetry();
+      this.unmountRow();
+      this.mountOptimisticStreamAfter();
       return;
     }
 
@@ -230,27 +274,37 @@ export class StreamingIndicatorController {
       typeof this.ctx.dom?.findMessageElement !== "function" ||
       typeof this.ctx.dom?.inject !== "function"
     ) {
+      if (plan.allowStreamAfterFallback) {
+        this.mountOptimisticStreamAfter();
+      }
       return;
     }
-
-    const target = this.resolveTarget(run.messageId, run.actionId);
-    if (!target) {
-      this.unmount();
-      this.ensureRetryMode("row");
-      this.scheduleRetry();
-      return;
-    }
-
-    const expectMessageContent = Boolean(run.hasContentOutput || this.contentSeen);
 
     if (
       this.mountedEl &&
-      this.mountedTarget === target.element &&
-      this.mountedPosition === target.position &&
-      this.isMountedAt(this.mountedEl, target.element, target.position)
+      this.mountedTarget &&
+      this.mountedPosition &&
+      this.mountedIsMessageContent === true &&
+      this.mountedMessageId === plan.messageId &&
+      this.mountedEl.isConnected &&
+      this.mountedTarget.isConnected &&
+      this.isMountedAt(this.mountedEl, this.mountedTarget, this.mountedPosition)
     ) {
-      if (!target.isMessageContent && expectMessageContent) {
-        this.ensureRetryMode("content");
+      this.unmountOptimisticStreamAfter();
+      this.resetRetry();
+      return;
+    }
+
+    const target = this.resolveTarget(plan.messageId, plan.actionId);
+    if (!target) {
+      this.unmountRow();
+      if (plan.allowStreamAfterFallback) {
+        this.mountOptimisticStreamAfter();
+      } else {
+        this.unmountOptimisticStreamAfter();
+      }
+      if (plan.retryRowIfMissing) {
+        this.ensureRetryMode("row");
         this.scheduleRetry();
       } else {
         this.resetRetry();
@@ -258,43 +312,154 @@ export class StreamingIndicatorController {
       return;
     }
 
-    this.unmount();
+    const expectMessageContent = Boolean(run?.hasContentOutput || this.contentSeen);
+
+    this.unmountOptimisticStreamAfter();
+
+    if (
+      this.mountedEl &&
+      this.mountedTarget === target.element &&
+      this.mountedPosition === target.position &&
+      this.mountedIsMessageContent === target.isMessageContent &&
+      this.mountedMessageId === plan.messageId &&
+      this.isMountedAt(this.mountedEl, target.element, target.position)
+    ) {
+      if (!target.isMessageContent && expectMessageContent) {
+        this.ensureRetryMode("content");
+        this.scheduleRetry(target.row);
+      } else {
+        this.resetRetry();
+      }
+      return;
+    }
+
+    this.unmountRow();
     const html = target.isMessageContent
       ? INDICATOR_HTML_AFTER
       : INDICATOR_HTML_BEFORE;
     this.mountedEl = this.ctx.dom.inject(target.element, html, target.position);
     this.mountedTarget = target.element;
     this.mountedPosition = target.position;
+    this.mountedIsMessageContent = target.isMessageContent;
+    this.mountedMessageId = plan.messageId;
 
     if (!target.isMessageContent && expectMessageContent) {
       this.ensureRetryMode("content");
-      this.scheduleRetry();
+      this.scheduleRetry(target.row);
     } else {
       this.resetRetry();
     }
   }
 
-  private shouldDisplay(
-    run: ActiveRunState | null,
-  ): run is ActiveRunState & { messageId: string } {
-    if (!run || this.destroyed) return false;
-    if (!INDICATOR_ACTIONS.has(run.actionId)) return false;
-    if (typeof run.messageId !== "string" || run.messageId.length === 0) {
-      return false;
-    }
+  private resolveDisplayPlan(run: ActiveRunState | null): DisplayPlan {
+    if (!run || this.destroyed) return { kind: "none" };
+    if (!INDICATOR_ACTIONS.has(run.actionId)) return { kind: "none" };
 
     const activeChatId = this.safeGetActiveChatId();
-    if (!activeChatId || run.chatId !== activeChatId) return false;
+    if (!activeChatId || run.chatId !== activeChatId) return { kind: "none" };
 
-    if (run.actionId === "guided_swipe") {
-      if (typeof run.swipeId !== "number" || this.viewedSwipeId !== run.swipeId) {
-        return false;
+    const hasConfirmedMessageId =
+      typeof run.messageId === "string" && run.messageId.length > 0;
+
+    if (hasConfirmedMessageId) {
+      if (run.actionId === "guided_swipe") {
+        if (typeof run.swipeId !== "number" || this.viewedSwipeId !== run.swipeId) {
+          return { kind: "none" };
+        }
+      } else if (run.swipeId != null && this.viewedSwipeId !== run.swipeId) {
+        return { kind: "none" };
       }
-    } else if (run.swipeId != null && this.viewedSwipeId !== run.swipeId) {
-      return false;
+
+      return {
+        kind: "row",
+        messageId: run.messageId!,
+        actionId: run.actionId,
+        allowStreamAfterFallback: STREAM_AFTER_OPTIMISTIC_ACTIONS.has(run.actionId),
+        retryRowIfMissing: true,
+      };
     }
 
-    return true;
+    // Optimistic phase (before backend confirms run.messageId):
+    // Never show optimistic indicator for background swipes.
+    if (run.actionId === "guided_swipe" && run.backgroundSwipe) {
+      return { kind: "none" };
+    }
+
+    if (STREAM_AFTER_OPTIMISTIC_ACTIONS.has(run.actionId)) {
+      return { kind: "stream_after" };
+    }
+
+    if (LATEST_ROW_OPTIMISTIC_ACTIONS.has(run.actionId)) {
+      if (typeof this.ctx.messages?.getLatestMessageId === "function") {
+        const latestMessageId = this.safeGetLatestMessageId();
+        if (!latestMessageId) {
+          return { kind: "none" };
+        }
+        return {
+          kind: "row",
+          messageId: latestMessageId,
+          actionId: run.actionId,
+          allowStreamAfterFallback: true,
+          retryRowIfMissing: false,
+        };
+      }
+      // Graceful fallback on hosts without ctx.messages.getLatestMessageId()
+      return { kind: "stream_after" };
+    }
+
+    return { kind: "none" };
+  }
+
+  private safeGetLatestMessageId(): string | null {
+    try {
+      const id = this.ctx.messages?.getLatestMessageId?.();
+      return typeof id === "string" && id.length > 0 ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getStreamAfterMount(): Element | null {
+    if (this.destroyed) return null;
+    if (this.streamAfterMount) return this.streamAfterMount;
+    if (typeof this.ctx.ui?.mount !== "function") return null;
+    try {
+      this.streamAfterMount = this.ctx.ui.mount("chat_stream_after");
+      return this.streamAfterMount;
+    } catch {
+      return null;
+    }
+  }
+
+  private mountOptimisticStreamAfter(): void {
+    if (this.destroyed) return;
+    const container = this.getStreamAfterMount();
+    if (!container) return;
+    if (
+      this.optimisticStreamEl &&
+      this.optimisticStreamEl.parentNode === container
+    ) {
+      return;
+    }
+    this.unmountOptimisticStreamAfter();
+    if (typeof document === "undefined") return;
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = INDICATOR_HTML_OPTIMISTIC;
+    const el = wrapper.firstElementChild;
+    if (!el) return;
+    container.append(el);
+    this.optimisticStreamEl = el;
+  }
+
+  private unmountOptimisticStreamAfter(): void {
+    const el = this.optimisticStreamEl;
+    this.optimisticStreamEl = null;
+    if (!el) return;
+    try {
+      el.remove();
+    } catch {
+      // Host DOM may already be torn down
+    }
   }
 
   private safeGetActiveChatId(): string | null {
@@ -330,6 +495,7 @@ export class StreamingIndicatorController {
     const messageContent = row.querySelector('[data-component="MessageContent"]');
     if (messageContent) {
       return {
+        row,
         element: messageContent,
         position: "afterend",
         isMessageContent: true,
@@ -345,6 +511,7 @@ export class StreamingIndicatorController {
     );
     if (mountBefore) {
       return {
+        row,
         element: mountBefore,
         position: "beforeend",
         isMessageContent: false,
@@ -356,6 +523,7 @@ export class StreamingIndicatorController {
     );
     if (mountAfter) {
       return {
+        row,
         element: mountAfter,
         position: "beforeend",
         isMessageContent: false,
@@ -367,6 +535,7 @@ export class StreamingIndicatorController {
     );
     if (bubbleFallback) {
       return {
+        row,
         element: bubbleFallback,
         position: "beforeend",
         isMessageContent: false,
@@ -378,7 +547,7 @@ export class StreamingIndicatorController {
     ) {
       const el = row.firstElementChild?.lastElementChild;
       return el
-        ? { element: el, position: "beforeend", isMessageContent: false }
+        ? { row, element: el, position: "beforeend", isMessageContent: false }
         : null;
     }
 
@@ -387,6 +556,7 @@ export class StreamingIndicatorController {
     );
     if (minimalFallback) {
       return {
+        row,
         element: minimalFallback,
         position: "beforeend",
         isMessageContent: false,
@@ -398,7 +568,7 @@ export class StreamingIndicatorController {
     ) {
       const el = row.firstElementChild;
       return el
-        ? { element: el, position: "beforeend", isMessageContent: false }
+        ? { row, element: el, position: "beforeend", isMessageContent: false }
         : null;
     }
 
@@ -411,6 +581,7 @@ export class StreamingIndicatorController {
     );
     if (mountAfter) {
       return {
+        row,
         element: mountAfter,
         position: "beforeend",
         isMessageContent: false,
@@ -422,6 +593,7 @@ export class StreamingIndicatorController {
     );
     if (mountBefore) {
       return {
+        row,
         element: mountBefore,
         position: "beforeend",
         isMessageContent: false,
@@ -433,6 +605,7 @@ export class StreamingIndicatorController {
     );
     if (bubbleContent) {
       return {
+        row,
         element: bubbleContent,
         position: "beforeend",
         isMessageContent: false,
@@ -447,6 +620,7 @@ export class StreamingIndicatorController {
         row.firstElementChild?.lastElementChild;
       if (ownContent) {
         return {
+          row,
           element: ownContent,
           position: "beforeend",
           isMessageContent: false,
@@ -458,6 +632,7 @@ export class StreamingIndicatorController {
     );
     if (bubbleFallback) {
       return {
+        row,
         element: bubbleFallback,
         position: "beforeend",
         isMessageContent: false,
@@ -469,6 +644,7 @@ export class StreamingIndicatorController {
     );
     if (minimalFallback) {
       return {
+        row,
         element: minimalFallback,
         position: "beforeend",
         isMessageContent: false,
@@ -480,13 +656,14 @@ export class StreamingIndicatorController {
       row.firstElementChild
     ) {
       return {
+        row,
         element: row.firstElementChild,
         position: "beforeend",
         isMessageContent: false,
       };
     }
 
-    return { element: row, position: "beforeend", isMessageContent: false };
+    return { row, element: row, position: "beforeend", isMessageContent: false };
   }
 
   private ensureRetryMode(mode: Exclude<RetryMode, null>): void {
@@ -503,11 +680,14 @@ export class StreamingIndicatorController {
     this.retryMode = null;
   }
 
-  private unmount(): void {
+  private unmountRow(): void {
     const el = this.mountedEl;
     this.mountedEl = null;
     this.mountedTarget = null;
     this.mountedPosition = null;
+    this.mountedIsMessageContent = null;
+    this.mountedMessageId = null;
+    this.disconnectRowObserver();
     if (!el) return;
     try {
       if (typeof this.ctx.dom?.uninject === "function") {
@@ -520,32 +700,99 @@ export class StreamingIndicatorController {
     }
   }
 
-  private scheduleRetry(): void {
+  private unmount(): void {
+    this.unmountRow();
+    this.unmountOptimisticStreamAfter();
+  }
+
+  private scheduleRetry(row?: Element | null): void {
     if (this.destroyed || this.rafId !== null || this.rafTimerId !== null) {
       return;
     }
-    if (this.rafRetries >= MAX_RAF_RETRIES) return;
-    this.rafRetries += 1;
 
-    const raf =
-      typeof globalThis.requestAnimationFrame === "function"
-        ? globalThis.requestAnimationFrame.bind(globalThis)
-        : undefined;
-    if (raf) {
-      this.rafId = raf(() => {
-        this.rafId = null;
-        if (!this.destroyed) {
+    if (this.rowObserver !== null) {
+      if (row && this.observedRow === row) {
+        return;
+      }
+      this.disconnectRowObserver();
+    }
+
+    if (this.rafRetries < FAST_RAF_RETRIES) {
+      this.rafRetries += 1;
+      const raf =
+        typeof globalThis.requestAnimationFrame === "function"
+          ? globalThis.requestAnimationFrame.bind(globalThis)
+          : undefined;
+      if (raf) {
+        this.rafId = raf(() => {
+          this.rafId = null;
+          if (!this.destroyed) {
+            this.syncCurrent();
+          }
+        });
+      } else {
+        this.rafTimerId = setTimeout(() => {
+          this.rafTimerId = null;
+          if (!this.destroyed) {
+            this.syncCurrent();
+          }
+        }, 16);
+      }
+      return;
+    }
+
+    if (
+      this.retryMode === "content" &&
+      row &&
+      typeof globalThis.MutationObserver === "function"
+    ) {
+      const observer = new globalThis.MutationObserver((mutations) => {
+        if (this.destroyed || this.retryMode !== "content") {
+          this.disconnectRowObserver();
+          return;
+        }
+        let hasElementAddition = false;
+        for (const mutation of mutations) {
+          for (let i = 0; i < mutation.addedNodes.length; i += 1) {
+            if (mutation.addedNodes[i]?.nodeType === 1) {
+              hasElementAddition = true;
+              break;
+            }
+          }
+          if (hasElementAddition) break;
+        }
+        if (hasElementAddition) {
           this.syncCurrent();
         }
       });
-    } else {
-      this.rafTimerId = setTimeout(() => {
-        this.rafTimerId = null;
-        if (!this.destroyed) {
-          this.syncCurrent();
-        }
-      }, 16);
+      observer.observe(row, { childList: true, subtree: true });
+      this.rowObserver = observer;
+      this.observedRow = row;
+      return;
     }
+
+    if (this.rafRetries >= MAX_RETRY_ATTEMPTS) return;
+    const backoffStep = this.rafRetries - FAST_RAF_RETRIES;
+    this.rafRetries += 1;
+    const delayMs = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** backoffStep);
+    this.rafTimerId = setTimeout(() => {
+      this.rafTimerId = null;
+      if (!this.destroyed) {
+        this.syncCurrent();
+      }
+    }, delayMs);
+  }
+
+  private disconnectRowObserver(): void {
+    if (this.rowObserver) {
+      try {
+        this.rowObserver.disconnect();
+      } catch {
+        // Ignore teardown errors
+      }
+      this.rowObserver = null;
+    }
+    this.observedRow = null;
   }
 
   private cancelRetry(): void {
@@ -559,5 +806,6 @@ export class StreamingIndicatorController {
       clearTimeout(this.rafTimerId);
       this.rafTimerId = null;
     }
+    this.disconnectRowObserver();
   }
 }

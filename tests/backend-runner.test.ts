@@ -7376,3 +7376,989 @@ describe("performance optimization regressions (backend)", () => {
     expect(loadedView.catalogWarnings).toHaveLength(2);
   });
 });
+
+describe("concurrent normal swipe + guided swipe regressions", () => {
+  test("preserves normal swipe text when normal swipe (slot 1) finishes while guided swipe (slot 2) is actively streaming, with or without MESSAGE_SWIPED delivery", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    for (const emitEvent of [true, false]) {
+      let releaseToken2!: () => void;
+      const token2Gate = new Promise<void>((resolve) => {
+        releaseToken2 = resolve;
+      });
+      let releaseToken3!: () => void;
+      const token3Gate = new Promise<void>((resolve) => {
+        releaseToken3 = resolve;
+      });
+
+      const harness = createSpindleHarness({
+        chats: {
+          "chat-1": [
+            makeMessage({ id: "u1", role: "user", content: "Tell me a tale" }),
+            makeMessage({
+              id: "a1",
+              role: "assistant",
+              // Normal swipe has already staged blank slot 1 and is generating in parallel
+              content: "",
+              swipes: ["Original reply", ""],
+              swipe_id: 1,
+              swipe_dates: [100, 200],
+            }),
+          ],
+        },
+        rawStreamImpl: async function* () {
+          yield { type: "token", token: "Guided part 1" };
+          await token2Gate;
+          // Wait past STREAM_FLUSH_INTERVAL_MS so mid-stream flush fires
+          await waitMs(135);
+          yield { type: "token", token: " + part 2" };
+          await token3Gate;
+          await waitMs(135);
+          yield { type: "token", token: " + part 3" };
+          yield {
+            type: "done",
+            content: "Guided part 1 + part 2 + part 3",
+            finish_reason: "stop",
+          };
+        },
+      });
+
+      const { runner } = registerBackend(harness.api);
+      const runPromise = runner.run(
+        { actionId: "guided_swipe", chatId: "chat-1", inputText: "Be dramatic" },
+        "u1",
+      );
+
+      // Wait for slot 2 creation + first mid-stream flush
+      while (harness.updateMessageCalls.length < 2) {
+        await waitMs(5);
+      }
+      const msg = harness.chatMessages.get("chat-1")![1]!;
+      expect(msg.swipes).toHaveLength(3);
+      expect(msg.swipe_id).toBe(2);
+
+      // Normal swipe finishes and writes its generated response to slot 1 (chatsSvc.updateSwipe)
+      msg.swipes[1] = "Normal swipe full response";
+      if (emitEvent) {
+        harness.triggerEvent("MESSAGE_SWIPED", {
+          chatId: "chat-1",
+          action: "updated",
+          swipeId: 1,
+          message: {
+            ...msg,
+            swipes: [...msg.swipes],
+            swipe_dates: [...msg.swipe_dates],
+          },
+        });
+      }
+
+      const callsBeforePart2 = harness.updateMessageCalls.length;
+      releaseToken2();
+      while (harness.updateMessageCalls.length <= callsBeforePart2) {
+        await waitMs(5);
+      }
+
+      // Mid-stream flush MUST NOT overwrite slot 1 back to blank ""
+      expect(msg.swipes[1]).toBe("Normal swipe full response");
+      expect(msg.swipes[2]).toBe("Guided part 1 + part 2");
+
+      releaseToken3();
+      const res = await runPromise;
+
+      expect(res.aborted).toBe(false);
+      expect(res.swipeId).toBe(2);
+      expect(res.text).toBe("Guided part 1 + part 2 + part 3");
+      expect(msg.swipes).toEqual([
+        "Original reply",
+        "Normal swipe full response",
+        "Guided part 1 + part 2 + part 3",
+      ]);
+      expect(msg.swipe_id).toBe(2);
+    }
+  });
+
+  test("preserves concurrently added normal swipe slot (slot 2) when guided swipe (slot 1) is actively flushing mid-stream", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    let releaseToken2!: () => void;
+    const token2Gate = new Promise<void>((resolve) => {
+      releaseToken2 = resolve;
+    });
+    let releaseToken3!: () => void;
+    const token3Gate = new Promise<void>((resolve) => {
+      releaseToken3 = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Tell me a tale" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Original reply",
+            swipes: ["Original reply"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Guided A" };
+        await token2Gate;
+        await waitMs(135);
+        yield { type: "token", token: " + B" };
+        await token3Gate;
+        await waitMs(135);
+        yield { type: "token", token: " + C" };
+        yield { type: "done", content: "Guided A + B + C", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+    const runPromise = runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+
+    // Wait for guided swipe slot 1 creation + first mid-stream flush
+    while (harness.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    expect(msg.swipes).toEqual(["Original reply", "Guided A"]);
+    expect(msg.swipe_id).toBe(1);
+
+    // Concurrent normal background swipe stages slot 2 (keeping swipe_id = 1)
+    msg.swipes.push("");
+    msg.swipe_dates.push(300);
+    harness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "added",
+      swipeId: 2,
+      message: {
+        ...msg,
+        swipes: [...msg.swipes],
+        swipe_dates: [...msg.swipe_dates],
+      },
+    });
+
+    const callsBeforePart2 = harness.updateMessageCalls.length;
+    releaseToken2();
+    while (harness.updateMessageCalls.length <= callsBeforePart2) {
+      await waitMs(5);
+    }
+
+    // Mid-stream flush MUST preserve slot 2 instead of truncating swipes back to length 2
+    expect(msg.swipes).toEqual(["Original reply", "Guided A + B", ""]);
+    expect(msg.swipe_dates).toHaveLength(3);
+
+    // Normal swipe finishes and commits slot 2
+    msg.swipes[2] = "Normal background swipe text";
+    harness.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "updated",
+      swipeId: 2,
+      message: {
+        ...msg,
+        swipes: [...msg.swipes],
+        swipe_dates: [...msg.swipe_dates],
+      },
+    });
+
+    releaseToken3();
+    const res = await runPromise;
+
+    expect(res.aborted).toBe(false);
+    expect(res.swipeId).toBe(1);
+    expect(msg.swipes).toEqual([
+      "Original reply",
+      "Guided A + B + C",
+      "Normal background swipe text",
+    ]);
+    expect(msg.swipe_id).toBe(1);
+  });
+
+  test("does not steal focus or truncate slot 2 when normal foreground swipe starts mid-stream before MESSAGE_SWIPED arrives, and does not resurrect deleted later swipe", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // 1. Normal foreground swipe starts mid-stream without MESSAGE_SWIPED delivered yet
+    let releaseToken2!: () => void;
+    const token2Gate = new Promise<void>((resolve) => {
+      releaseToken2 = resolve;
+    });
+
+    const harnessFg = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Original",
+            swipes: ["Original"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Guided 1" };
+        await token2Gate;
+        await waitMs(135);
+        yield { type: "token", token: " Guided 2" };
+        yield { type: "done", content: "Guided 1 Guided 2", finish_reason: "stop" };
+      },
+    });
+
+    const { runner: fgRunner } = registerBackend(harnessFg.api);
+    const fgPromise = fgRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+
+    while (harnessFg.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    const fgMsg = harnessFg.chatMessages.get("chat-1")![1]!;
+    // Host adds foreground normal swipe slot 2 and selects swipe_id = 2 (no event yet)
+    fgMsg.swipes.push("");
+    fgMsg.swipe_dates.push(300);
+    fgMsg.swipe_id = 2;
+    fgMsg.content = "";
+    const callsAtNormalStart = harnessFg.updateMessageCalls.length;
+
+    releaseToken2();
+    const fgRes = await fgPromise;
+
+    expect(fgRes.aborted).toBe(false);
+    // Only the final background commit patch should have landed (no mid-stream focus steal)
+    expect(harnessFg.updateMessageCalls.length).toBe(callsAtNormalStart + 1);
+    const finalPatch =
+      harnessFg.updateMessageCalls[harnessFg.updateMessageCalls.length - 1]!.patch;
+    expect("swipe_id" in finalPatch).toBe(false);
+    expect("content" in finalPatch).toBe(false);
+    expect(fgMsg.swipe_id).toBe(2);
+    expect(fgMsg.swipes).toEqual(["Original", "Guided 1 Guided 2", ""]);
+
+    // 2. Later normal swipe (slot 2) fails and is deleted mid-stream -> guided swipe (slot 1) does not resurrect it
+    let releaseDelToken2!: () => void;
+    const delToken2Gate = new Promise<void>((resolve) => {
+      releaseDelToken2 = resolve;
+    });
+
+    const harnessDelLater = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Original",
+            swipes: ["Original"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Guided A" };
+        await delToken2Gate;
+        await waitMs(135);
+        yield { type: "token", token: " Guided B" };
+        yield { type: "done", content: "Guided A Guided B", finish_reason: "stop" };
+      },
+    });
+
+    const { runner: delLaterRunner } = registerBackend(harnessDelLater.api);
+    const delLaterPromise = delLaterRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+
+    while (harnessDelLater.updateMessageCalls.length < 2) {
+      await waitMs(5);
+    }
+    const delMsg = harnessDelLater.chatMessages.get("chat-1")![1]!;
+    // Add slot 2, then delete slot 2 before guided swipe continues
+    delMsg.swipes.push("");
+    delMsg.swipe_dates.push(300);
+    harnessDelLater.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "added",
+      swipeId: 2,
+      message: { ...delMsg, swipes: [...delMsg.swipes], swipe_dates: [...delMsg.swipe_dates] },
+    });
+    delMsg.swipes.splice(2, 1);
+    delMsg.swipe_dates.splice(2, 1);
+    harnessDelLater.triggerEvent("MESSAGE_SWIPED", {
+      chatId: "chat-1",
+      action: "deleted",
+      swipeId: 2,
+      message: { id: "a1", swipe_id: 1 },
+    });
+
+    releaseDelToken2();
+    const delLaterRes = await delLaterPromise;
+    expect(delLaterRes.aborted).toBe(false);
+    expect(delLaterRes.swipeId).toBe(1);
+    expect(delMsg.swipes).toEqual(["Original", "Guided A Guided B"]);
+    expect(delMsg.swipe_dates).toHaveLength(2);
+  });
+});
+
+describe("startup latency optimization regressions (backend)", () => {
+  test("short-circuits spindle.macros.resolve when instructionTemplate has no remaining macros after {{input}}", async () => {
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hello" })],
+      },
+      macrosResolveImpl: async (template) => ({
+        text: template.replaceAll("{{char}}", "Alice"),
+        diagnostics: [],
+      }),
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    // 1. Default template "[OOC: {{input}}]" has no macros besides {{input}} -> 0 macros.resolve calls
+    await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Keep it brief" },
+      "u1",
+    );
+    expect(harness.macroResolveCalls).toHaveLength(0);
+    const firstSent = harness.rawStreamCalls[0]?.messages as LlmMessageDTO[];
+    expect(
+      firstSent.some(
+        (m) => typeof m.content === "string" && m.content.includes("Keep it brief"),
+      ),
+    ).toBe(true);
+
+    // 2. Template with {{char}} macro -> calls macros.resolve once and resolves {{char}}
+    const settings = createDefaultSettings();
+    settings.actions.guided_response.instructionTemplate = "[For {{char}}: {{input}}]";
+    await store.saveSettings(settings, "u1");
+
+    await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Stay calm {{char}}" },
+      "u1",
+    );
+    expect(harness.macroResolveCalls).toHaveLength(1);
+    const secondSent = harness.rawStreamCalls[1]?.messages as LlmMessageDTO[];
+    expect(
+      secondSent.some(
+        (m) =>
+          typeof m.content === "string" &&
+          m.content.includes("[For Alice: Stay calm {{char}}]"),
+      ),
+    ).toBe(true);
+  });
+
+  test("store.pushRecovery is non-blocking on generation startup and swallows write errors safely", async () => {
+    let releaseRecoveryWrite!: () => void;
+    const recoveryWriteGate = new Promise<void>((resolve) => {
+      releaseRecoveryWrite = resolve;
+    });
+    let recoveryWriteStarted = false;
+    let recoveryWriteFinished = false;
+    let sawStreamBeforeRecoveryFinished = false;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hello" })],
+      },
+      rawStreamImpl: async function* () {
+        sawStreamBeforeRecoveryFinished = recoveryWriteStarted && !recoveryWriteFinished;
+        yield { type: "token", token: "Fast reply" };
+        yield { type: "done", content: "Fast reply", finish_reason: "stop" };
+      },
+    });
+
+    const origWrite = harness.api.userStorage.write;
+    harness.api.userStorage.write = async (path, data, userId) => {
+      if (path === "recovery.json") {
+        recoveryWriteStarted = true;
+        await recoveryWriteGate;
+        await origWrite(path, data, userId);
+        recoveryWriteFinished = true;
+        return;
+      }
+      return origWrite(path, data, userId);
+    };
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, (ev, uid) =>
+      harness.api.sendToFrontend(ev, uid),
+    );
+
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Be quick" },
+      "u1",
+    );
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("Fast reply");
+    expect(sawStreamBeforeRecoveryFinished).toBe(true);
+    expect(recoveryWriteFinished).toBe(false);
+
+    // Unblock recovery write and confirm gg:recovery-updated emits asynchronously
+    releaseRecoveryWrite();
+    await new Promise((r) => setTimeout(r, 15));
+    expect(recoveryWriteFinished).toBe(true);
+    const recoveryEvents = harness.sentFrontend.filter(
+      (e) => (e.payload as BackendPushEvent).type === "gg:recovery-updated",
+    );
+    expect(recoveryEvents.length).toBeGreaterThanOrEqual(1);
+
+    // Recovery write errors must not fail generation
+    const warnings: string[] = [];
+    const errHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hello" })],
+      },
+      writeError: (path) => (path === "recovery.json" ? new Error("disk full") : null),
+    });
+    errHarness.api.log.warn = (msg: string) => {
+      warnings.push(msg);
+    };
+    const errStore = new SettingsStore(errHarness.api);
+    const errRunner = new GuidedGenerationRunner(errHarness.api, errStore, () => {});
+    const errRes = await errRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Still works" },
+      "u1",
+    );
+    expect(errRes.aborted).toBe(false);
+    expect(errRes.text).toBe("Generated reply.");
+    await new Promise((r) => setTimeout(r, 15));
+    expect(warnings.some((w) => w.includes("Failed persisting input recovery"))).toBe(true);
+  });
+
+  test("parallelizes pre-dryRun setup calls and overlaps response regex fetch with rawStream", async () => {
+    const started = new Set<string>();
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const markStarted = (label: string) => {
+      started.add(label);
+      if (started.size === 4) {
+        releaseBarrier();
+      }
+    };
+
+    let releaseResponseRegex!: () => void;
+    const responseRegexGate = new Promise<void>((resolve) => {
+      releaseResponseRegex = resolve;
+    });
+    let rawStreamStartedWhileResponseRegexPending = false;
+    let responseRegexResolved = false;
+
+    const responseScript: RegexScriptDTO = {
+      id: "resp-1",
+      name: "Upper",
+      find_regex: "hello",
+      replace_string: "HELLO",
+      placement: ["ai_output"],
+      target: "response",
+      enabled: true,
+    } as unknown as RegexScriptDTO;
+
+    const harness = createSpindleHarness({
+      activePresetId: "p-1",
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hi" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Base" }),
+        ],
+      },
+      regexScripts: [responseScript],
+      rawStreamImpl: async function* () {
+        rawStreamStartedWhileResponseRegexPending = !responseRegexResolved;
+        yield { type: "token", token: "hello world" };
+        // Release response regex only AFTER streaming has started
+        releaseResponseRegex();
+        yield { type: "done", content: "hello world", finish_reason: "stop" };
+      },
+    });
+
+    const origConnList = harness.api.connections.list;
+    harness.api.connections.list = async (uid) => {
+      markStarted("connections");
+      await barrier;
+      return origConnList(uid);
+    };
+    const origGetActive = (
+      harness.api.presets as unknown as {
+        getActive: () => Promise<{ preset_id: string | null }>;
+      }
+    ).getActive;
+    (
+      harness.api.presets as unknown as {
+        getActive: () => Promise<{ preset_id: string | null }>;
+      }
+    ).getActive = async () => {
+      markStarted("presets");
+      await barrier;
+      return origGetActive();
+    };
+    const origGetMessages = harness.api.chat.getMessages;
+    let firstGetMessages = true;
+    harness.api.chat.getMessages = async (chatId) => {
+      if (firstGetMessages) {
+        firstGetMessages = false;
+        markStarted("getMessages");
+        await barrier;
+      }
+      return origGetMessages(chatId);
+    };
+    const origRegexGetActive = harness.api.regex_scripts.getActive;
+    harness.api.regex_scripts.getActive = async (opts) => {
+      if (opts.target === "prompt") {
+        markStarted("regexPrompt");
+        await barrier;
+        return origRegexGetActive(opts);
+      }
+      await responseRegexGate;
+      responseRegexResolved = true;
+      return origRegexGetActive(opts);
+    };
+
+    const store = new SettingsStore(harness.api);
+    const settings = createDefaultSettings();
+    settings.actions.guided_continue.applyRegex = true;
+    await store.saveSettings(settings, "u1");
+
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Continue" },
+      "u1",
+    );
+
+    expect(started.size).toBe(4);
+    expect(rawStreamStartedWhileResponseRegexPending).toBe(true);
+    expect(res.text).toBe("Base HELLO world");
+  });
+
+  test("eliminates redundant getMessages calls in guided_continue and on chunk #1 in guided_swipe", async () => {
+    // 1. guided_continue: should make 3 getMessages calls (pre-dryRun, ensureTarget on chunk #1, final refresh)
+    // and 0 calls between dryRun and rawStream start.
+    let continueGetMessagesCount = 0;
+    let countAtDryRunEnd = 0;
+    let countAtRawStreamStart = 0;
+    let countAfterChunk1Flush = 0;
+
+    const continueHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Go on" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Start" }),
+        ],
+      },
+      dryRunImpl: async () => {
+        const res = {
+          messages: [{ role: "user", content: "Go on" }],
+          request_messages: [
+            { role: "user", content: "Go on" },
+            { role: "assistant", content: "Start" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+        countAtDryRunEnd = continueGetMessagesCount;
+        return res;
+      },
+      rawStreamImpl: async function* () {
+        countAtRawStreamStart = continueGetMessagesCount;
+        yield { type: "token", token: " more" };
+        await new Promise((r) => setTimeout(r, 10));
+        countAfterChunk1Flush = continueGetMessagesCount;
+        yield { type: "done", content: " more", finish_reason: "stop" };
+      },
+    });
+    const origContinueGet = continueHarness.api.chat.getMessages;
+    continueHarness.api.chat.getMessages = async (chatId) => {
+      continueGetMessagesCount += 1;
+      return origContinueGet(chatId);
+    };
+
+    const continueStore = new SettingsStore(continueHarness.api);
+    const continueRunner = new GuidedGenerationRunner(continueHarness.api, continueStore, () => {});
+    const continueRes = await continueRunner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" },
+      "u1",
+    );
+
+    expect(continueRes.text).toBe("Start more");
+    // No redundant getMessages between dryRun and rawStream start (reuses preTargetMessage)
+    expect(countAtRawStreamStart).toBe(countAtDryRunEnd);
+    // Only 1 getMessages on chunk #1 (ensureTarget), NOT 2 back-to-back
+    expect(countAfterChunk1Flush).toBe(countAtRawStreamStart + 1);
+    // Total = 3 (pre-dryRun + ensureTarget + final refresh)
+    expect(continueGetMessagesCount).toBe(3);
+
+    // 2. guided_swipe: chunk #1 flush skips redundant back-to-back refresh after ensureTarget
+    let swipeGetMessagesCount = 0;
+    let swipeCountAtRawStreamStart = 0;
+    let swipeCountAfterChunk1Flush = 0;
+
+    const swipeHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Original" }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        swipeCountAtRawStreamStart = swipeGetMessagesCount;
+        yield { type: "token", token: "Fresh swipe" };
+        await new Promise((r) => setTimeout(r, 10));
+        swipeCountAfterChunk1Flush = swipeGetMessagesCount;
+        yield { type: "done", content: "Fresh swipe", finish_reason: "stop" };
+      },
+    });
+    const origSwipeGet = swipeHarness.api.chat.getMessages;
+    swipeHarness.api.chat.getMessages = async (chatId) => {
+      swipeGetMessagesCount += 1;
+      return origSwipeGet(chatId);
+    };
+
+    const swipeStore = new SettingsStore(swipeHarness.api);
+    const swipeRunner = new GuidedGenerationRunner(swipeHarness.api, swipeStore, () => {});
+    const swipeRes = await swipeRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Try again" },
+      "u1",
+    );
+
+    expect(swipeRes.text).toBe("Fresh swipe");
+    // Only 1 getMessages on chunk #1 (ensureTarget), NOT 2 back-to-back
+    expect(swipeCountAfterChunk1Flush).toBe(swipeCountAtRawStreamStart + 1);
+    // Total = 4 (pre-dryRun + pendingSwipeSlotWrite + ensureTarget + final refresh)
+    expect(swipeGetMessagesCount).toBe(4);
+  });
+
+  test("guided_impersonate flushes intermediate chunks at ~40ms cadence instead of 120ms", async () => {
+    const events: BackendPushEvent[] = [];
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "a1", role: "assistant", content: "Hello" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Part 1" };
+        await new Promise((r) => setTimeout(r, 50));
+        yield { type: "token", token: " Part 2" };
+        yield { type: "done", content: "Part 1 Part 2", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, (ev) => events.push(ev));
+    await runner.run(
+      { actionId: "guided_impersonate", chatId: "chat-1", inputText: "Respond" },
+      "u1",
+    );
+
+    const midChunks = events.filter(
+      (e) => e.type === "gg:impersonate-chunk" && e.done === false,
+    );
+    expect(midChunks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("initial gg:status for background guided_swipe includes backgroundSwipe: true before dryRun completes", async () => {
+    const statusEvents: Array<Extract<BackendPushEvent, { type: "gg:status" }>> = [];
+    let statusCountBeforeDryRun = 0;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Original" }),
+        ],
+      },
+      dryRunImpl: async () => {
+        statusCountBeforeDryRun = statusEvents.length;
+        return {
+          messages: [{ role: "user", content: "Prompt" }],
+          request_messages: [{ role: "user", content: "Prompt" }],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, (ev) => {
+      if (ev.type === "gg:status") {
+        statusEvents.push(ev);
+      }
+    });
+
+    await runner.run(
+      {
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        inputText: "Steer quietly",
+        backgroundSwipe: true,
+      },
+      "u1",
+    );
+
+    expect(statusCountBeforeDryRun).toBeGreaterThanOrEqual(1);
+    expect(statusEvents[0]?.run?.actionId).toBe("guided_swipe");
+    expect(statusEvents[0]?.run?.backgroundSwipe).toBe(true);
+  });
+});
+
+describe("streaming hot-loop optimizations (backend)", () => {
+  test("single-flight flush coalescing skips obsolete intermediate snapshots when updateMessage stalls past 120ms and flushes cleanly on completion and abort", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // 1. Stalled midstream flush coalesces multiple 120ms intervals into one write with latest content
+    let releaseFirstFlush!: () => void;
+    const firstFlushGate = new Promise<void>((resolve) => {
+      releaseFirstFlush = resolve;
+    });
+    let inFlightCount = 0;
+    let maxInFlight = 0;
+    let flushSeq = 0;
+    let releaseAfterSecondFlush!: () => void;
+    const secondFlushDone = new Promise<void>((resolve) => {
+      releaseAfterSecondFlush = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Write a story" })],
+      },
+      updateMessageImpl: async (_chatId, _messageId, _patch, defaultUpdate) => {
+        flushSeq += 1;
+        const mySeq = flushSeq;
+        inFlightCount += 1;
+        maxInFlight = Math.max(maxInFlight, inFlightCount);
+        try {
+          if (mySeq === 1) {
+            await firstFlushGate;
+          }
+          await defaultUpdate();
+          if (mySeq === 2) {
+            releaseAfterSecondFlush();
+          }
+        } finally {
+          inFlightCount -= 1;
+        }
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "A" };
+        await waitMs(135);
+        yield { type: "token", token: " B" };
+        await waitMs(135);
+        yield { type: "token", token: " C" };
+        // Release stalled flush #1 after two 120ms intervals have elapsed
+        releaseFirstFlush();
+        await secondFlushDone;
+        yield { type: "token", token: " D" };
+        yield { type: "done", content: "A B C D", finish_reason: "stop" };
+      },
+    });
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("A B C D");
+    expect(maxInFlight).toBe(1);
+    // Exactly 3 flushes: #1 ("A"), #2 coalesced ("A B C", skipping obsolete "A B"), #3 final ("A B C D")
+    expect(harness.updateMessageCalls.map((c) => c.patch.content)).toEqual([
+      "A",
+      "A B C",
+      "A B C D",
+    ]);
+    expect(harness.updateMessageCalls[0]!.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[1]!.patch.skipChunkRebuild).toBe(true);
+    expect(harness.updateMessageCalls[2]!.patch.skipChunkRebuild).toBe(false);
+
+    // 2. Abort while a midstream flush is stalled skips obsolete midstream flush and awaits final flush cleanly
+    let releaseAbortFlush!: () => void;
+    const abortFlushGate = new Promise<void>((resolve) => {
+      releaseAbortFlush = resolve;
+    });
+    let abortFlushSeq = 0;
+    let abortRunner!: GuidedGenerationRunner;
+
+    const abortHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Write" })],
+      },
+      updateMessageImpl: async (_chatId, _messageId, _patch, defaultUpdate) => {
+        abortFlushSeq += 1;
+        if (abortFlushSeq === 1) {
+          await abortFlushGate;
+        }
+        await defaultUpdate();
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "X" };
+        await waitMs(135);
+        yield { type: "token", token: " Y" };
+        abortRunner.abortCurrent("u1");
+        // Release stalled flush #1 right after abort
+        setTimeout(() => releaseAbortFlush(), 15);
+        yield { type: "token", token: " Z" };
+      },
+    });
+
+    const abortStore = new SettingsStore(abortHarness.api);
+    abortRunner = new GuidedGenerationRunner(abortHarness.api, abortStore, () => {});
+    const abortRes = await abortRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+
+    expect(abortRes.aborted).toBe(true);
+    expect(abortRes.text).toBe("X Y");
+    // Only stalled flush #1 ("X") + final flush ("X Y"), no extra obsolete midstream write
+    expect(abortHarness.updateMessageCalls.map((c) => c.patch.content)).toEqual(["X", "X Y"]);
+    expect(abortHarness.updateMessageCalls[1]!.patch.skipChunkRebuild).toBe(false);
+    expect(abortHarness.chatMessages.get("chat-1")![1]!.content).toBe("X Y");
+  });
+
+  test("guided_continue skips getMessages on midstream flushes while preserving concurrent sibling swipe edits across multiple flushes", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    let getMessagesCount = 0;
+    let countAfterChunk1 = 0;
+    let countBeforeDone = 0;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Continue" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Start",
+            swipes: ["Start"],
+            swipe_id: 0,
+            swipe_dates: [1700000000],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: " one" };
+        await waitMs(15);
+        countAfterChunk1 = getMessagesCount;
+        // Concurrent edit adds a sibling swipe BEFORE subsequent 120ms midstream flushes
+        harness.chatMessages.get("chat-1")![1]!.swipes.push("Concurrent sibling");
+        harness.chatMessages.get("chat-1")![1]!.swipe_dates.push(1700000123);
+        await waitMs(130);
+        yield { type: "token", token: " two" };
+        await waitMs(135);
+        yield { type: "token", token: " three" };
+        await waitMs(15);
+        countBeforeDone = getMessagesCount;
+        yield { type: "done", content: " one two three", finish_reason: "stop" };
+      },
+    });
+
+    const origGetMessages = harness.api.chat.getMessages;
+    harness.api.chat.getMessages = async (chatId) => {
+      getMessagesCount += 1;
+      return origGetMessages(chatId);
+    };
+
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const res = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" },
+      "u1",
+    );
+
+    expect(res.aborted).toBe(false);
+    expect(res.text).toBe("Start one two three");
+    // Zero getMessages calls during the 120ms midstream flushes
+    expect(countBeforeDone).toBe(countAfterChunk1);
+    // Total = 3 (pre-dryRun + ensureTarget on chunk #1 + final refresh)
+    expect(getMessagesCount).toBe(3);
+
+    // Midstream flushes omit swipes/swipe_id so sibling swipes are never clobbered midstream
+    const midstreamPatches = harness.updateMessageCalls.slice(0, -1).map((c) => c.patch);
+    expect(midstreamPatches.length).toBeGreaterThanOrEqual(2);
+    for (const patch of midstreamPatches) {
+      expect(patch.skipChunkRebuild).toBe(true);
+      expect("swipes" in patch).toBe(false);
+      expect("swipe_id" in patch).toBe(false);
+    }
+
+    // Final flush commits full authoritative swipes preserving the concurrent sibling
+    const finalPatch = harness.updateMessageCalls.at(-1)!.patch;
+    expect(finalPatch.skipChunkRebuild).toBe(false);
+    expect(harness.chatMessages.get("chat-1")![1]!.swipes).toEqual([
+      "Start one two three",
+      "Concurrent sibling",
+    ]);
+  });
+
+  test("guided_swipe does not structuredClone extra during midstream flushes and still preserves background reasoning on final flush", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const origStructuredClone = globalThis.structuredClone;
+    let cloneCallsDuringStream = 0;
+    let inStream = false;
+
+    globalThis.structuredClone = ((value: unknown, options?: StructuredSerializeOptions) => {
+      if (inStream) {
+        cloneCallsDuringStream += 1;
+      }
+      return origStructuredClone(value, options);
+    }) as typeof structuredClone;
+
+    try {
+      const harness = createSpindleHarness({
+        chats: {
+          "chat-1": [
+            makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+            makeMessage({
+              id: "a1",
+              role: "assistant",
+              content: "Original",
+              swipes: ["Original"],
+              swipe_id: 0,
+              swipe_dates: [100],
+              extra: {
+                reasoning: "Orig thought",
+                reasoningBySwipe: ["Orig thought"],
+              },
+            }),
+          ],
+        },
+        rawStreamImpl: async function* () {
+          yield { type: "token", token: "Part 1" };
+          await waitMs(15);
+          inStream = true;
+          await waitMs(130);
+          yield { type: "token", token: " Part 2" };
+          await waitMs(135);
+          yield { type: "token", token: " Part 3" };
+          await waitMs(15);
+          inStream = false;
+          yield { type: "done", content: "Part 1 Part 2 Part 3", finish_reason: "stop" };
+        },
+      });
+
+      const { runner } = registerBackend(harness.api);
+      const res = await runner.run(
+        { actionId: "guided_swipe", chatId: "chat-1", inputText: "Try again" },
+        "u1",
+      );
+
+      expect(res.aborted).toBe(false);
+      expect(res.text).toBe("Part 1 Part 2 Part 3");
+      expect(cloneCallsDuringStream).toBe(0);
+    } finally {
+      globalThis.structuredClone = origStructuredClone;
+    }
+  });
+});

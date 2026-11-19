@@ -39,6 +39,21 @@ interface RectBox {
   bottom: number;
 }
 
+interface HeadItemRefs {
+  item: HTMLDivElement;
+  btn: HTMLButtonElement;
+  badge: HTMLSpanElement;
+  img: HTMLImageElement | null;
+  initials: HTMLSpanElement | null;
+  pip: HTMLSpanElement | null;
+  dismissBtn: HTMLButtonElement | null;
+  lastStatus?: ChatHeadStatus;
+  lastDisplayName?: string;
+  lastLabel?: string;
+  lastAvatarUrl?: string;
+  lastAvatarFailed?: boolean;
+}
+
 const STORAGE_POS_KEY = "gg:chatHeadsPos";
 const NATIVE_STORAGE_POS_KEY = "lumiverse:chatHeadsPos";
 const DEFAULT_POS: StoredChatHeadPos = { xPct: 94, yPct: 22 };
@@ -50,6 +65,9 @@ const ROOT_PAD_PX = 6;
 const VIEWPORT_PAD_PX = 12;
 const NATIVE_COLLISION_GAP_PX = 8;
 const SUPPRESS_CLICK_FALLBACK_MS = 350;
+const MAX_CHARACTER_CACHE_ENTRIES = 200;
+const NATIVE_HEAD_SCAN_SELECTOR =
+  "[data-head-idx][data-chat-id]:not([data-gg-chat-head]), [data-chat-head][data-chat-id]:not([data-gg-chat-head]), body > * > [data-chat-id]:not([data-gg-chat-head])";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -142,7 +160,7 @@ function boxesOverlap(a: RectBox, b: RectBox, gap = 0): boolean {
  */
 export class ChatHeadController {
   private readonly heads = new Map<string, ChatHeadEntry>();
-  private readonly headItemEls = new Map<string, HTMLDivElement>();
+  private readonly headItemRefs = new Map<string, HeadItemRefs>();
   private readonly characterCache = new Map<string, CachedCharacterMeta>();
   private readonly pendingCharacterFetches = new Set<string>();
   private readonly disposers: Array<() => void> = [];
@@ -306,12 +324,38 @@ export class ChatHeadController {
     }
     this.disposers.length = 0;
     this.heads.clear();
-    this.headItemEls.clear();
+    this.headItemRefs.clear();
+    this.characterCache.clear();
     this.pendingCharacterFetches.clear();
     if (this.rootEl) {
       this.rootEl.remove();
       this.rootEl = null;
     }
+  }
+
+  private getCachedCharacter(characterId: string): CachedCharacterMeta | undefined {
+    const cached = this.characterCache.get(characterId);
+    if (cached !== undefined) {
+      // Refresh LRU recency
+      this.characterCache.delete(characterId);
+      this.characterCache.set(characterId, cached);
+    }
+    return cached;
+  }
+
+  private setCachedCharacter(
+    characterId: string,
+    meta: CachedCharacterMeta,
+  ): void {
+    if (this.characterCache.has(characterId)) {
+      this.characterCache.delete(characterId);
+    } else if (this.characterCache.size >= MAX_CHARACTER_CACHE_ENTRIES) {
+      const oldestKey = this.characterCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.characterCache.delete(oldestKey);
+      }
+    }
+    this.characterCache.set(characterId, meta);
   }
 
   private upsertFromActiveRun(
@@ -331,7 +375,7 @@ export class ChatHeadController {
         ? activeChatMeta.characterId
         : undefined);
 
-    const cached = characterId ? this.characterCache.get(characterId) : undefined;
+    const cached = characterId ? this.getCachedCharacter(characterId) : undefined;
     const characterName =
       (typeof run.characterName === "string" && run.characterName.trim().length > 0
         ? run.characterName.trim()
@@ -423,7 +467,7 @@ export class ChatHeadController {
       const raw = await Promise.resolve(charactersApi.get(characterId));
       if (this.destroyed) return;
       if (!isRecord(raw)) {
-        this.characterCache.set(characterId, {});
+        this.setCachedCharacter(characterId, {});
         return;
       }
 
@@ -436,7 +480,7 @@ export class ChatHeadController {
         sanitizeAvatarUrl(raw.avatarUrl) ?? sanitizeAvatarUrl(raw.avatar_url);
       const safeAvatar = customAvatar ?? defaultAvatar;
 
-      this.characterCache.set(characterId, {
+      this.setCachedCharacter(characterId, {
         ...(name ? { name } : {}),
         avatarUrl: safeAvatar,
       });
@@ -464,7 +508,7 @@ export class ChatHeadController {
       }
     } catch {
       if (!this.destroyed) {
-        this.characterCache.set(characterId, {});
+        this.setCachedCharacter(characterId, {});
       }
     } finally {
       this.pendingCharacterFetches.delete(characterId);
@@ -478,17 +522,22 @@ export class ChatHeadController {
     const currentActiveChatId =
       activeChatId !== undefined ? activeChatId : this.safeGetActiveChatId();
 
+    const { nativeChatIds, nativeContainer } =
+      this.heads.size > 0
+        ? this.scanNativeChatHeads()
+        : { nativeChatIds: new Set<string>(), nativeContainer: null };
+
     const visibleEntries: ChatHeadEntry[] = [];
     for (const entry of this.heads.values()) {
       if (entry.chatId === currentActiveChatId) continue;
-      if (this.hasNativeChatHead(entry.chatId)) continue;
+      if (nativeChatIds.has(entry.chatId)) continue;
       visibleEntries.push(entry);
     }
 
     if (visibleEntries.length === 0) {
       this.clearDragSession();
       this.clearResizeListener();
-      this.headItemEls.clear();
+      this.headItemRefs.clear();
       if (this.rootEl) {
         this.rootEl.remove();
         this.rootEl = null;
@@ -497,14 +546,11 @@ export class ChatHeadController {
     }
 
     const avoidNative = !this.isDragging;
-    const preReadNativeBox = avoidNative
-      ? (() => {
-          const nativeContainer = this.findNativeChatHeadsContainer();
-          if (!nativeContainer) return null;
-          const { vw, vh } = this.getViewportSize();
-          return this.resolveNativeBounds(nativeContainer, vw, vh);
-        })()
-      : null;
+    const viewport = this.getViewportSize();
+    const preReadNativeBox =
+      avoidNative && nativeContainer
+        ? this.resolveNativeBounds(nativeContainer, viewport.vw, viewport.vh)
+        : null;
 
     if (!this.rootEl) {
       this.rootEl = document.createElement("div");
@@ -515,30 +561,31 @@ export class ChatHeadController {
     }
 
     const visibleIds = new Set(visibleEntries.map((entry) => entry.chatId));
-    for (const [chatId, itemEl] of [...this.headItemEls.entries()]) {
+    for (const [chatId, refs] of [...this.headItemRefs.entries()]) {
       if (!visibleIds.has(chatId)) {
-        itemEl.remove();
-        this.headItemEls.delete(chatId);
+        refs.item.remove();
+        this.headItemRefs.delete(chatId);
       }
     }
 
     for (let i = 0; i < visibleEntries.length; i += 1) {
       const entry = visibleEntries[i]!;
-      let itemEl = this.headItemEls.get(entry.chatId);
-      if (itemEl) {
-        this.updateHeadItem(itemEl, entry);
+      let refs = this.headItemRefs.get(entry.chatId);
+      if (refs) {
+        this.updateHeadItem(refs, entry);
       } else {
-        itemEl = this.buildHeadItem(entry);
-        this.headItemEls.set(entry.chatId, itemEl);
+        refs = this.buildHeadItem(entry);
+        this.headItemRefs.set(entry.chatId, refs);
       }
-      if (this.rootEl.children[i] !== itemEl) {
-        this.rootEl.insertBefore(itemEl, this.rootEl.children[i] ?? null);
+      if (this.rootEl.children[i] !== refs.item) {
+        this.rootEl.insertBefore(refs.item, this.rootEl.children[i] ?? null);
       }
     }
 
     this.applyRootPosition(this.rootEl, visibleEntries.length, {
       avoidNative,
       nativeBox: preReadNativeBox,
+      viewport,
     });
 
     if (!this.rootEl.isConnected) {
@@ -546,7 +593,7 @@ export class ChatHeadController {
     }
   }
 
-  private buildHeadItem(entry: ChatHeadEntry): HTMLDivElement {
+  private buildHeadItem(entry: ChatHeadEntry): HeadItemRefs {
     const chatId = entry.chatId;
     const item = document.createElement("div");
     item.className = "gg-chat-head-item";
@@ -589,22 +636,31 @@ export class ChatHeadController {
     });
 
     item.append(btn);
-    this.updateHeadItem(item, entry);
-    return item;
+    const refs: HeadItemRefs = {
+      item,
+      btn,
+      badge,
+      img: null,
+      initials: null,
+      pip: null,
+      dismissBtn: null,
+    };
+    this.updateHeadItem(refs, entry);
+    return refs;
   }
 
-  private updateHeadItem(item: HTMLDivElement, entry: ChatHeadEntry): void {
-    const btn = item.querySelector<HTMLButtonElement>("[data-gg-chat-head]");
-    const badge = btn?.querySelector<HTMLSpanElement>(".gg-chat-head-badge");
-    if (!btn || !badge) return;
+  private updateHeadItem(refs: HeadItemRefs, entry: ChatHeadEntry): void {
+    const { item, btn, badge } = refs;
 
-    btn.classList.toggle(
-      "is-running",
-      entry.status === "running" || entry.status === "streaming",
-    );
-    btn.classList.toggle("is-streaming", entry.status === "streaming");
-    btn.classList.toggle("is-completed", entry.status === "completed");
-    btn.setAttribute("data-status", entry.status);
+    if (refs.lastStatus !== entry.status) {
+      btn.classList.toggle(
+        "is-running",
+        entry.status === "running" || entry.status === "streaming",
+      );
+      btn.classList.toggle("is-streaming", entry.status === "streaming");
+      btn.classList.toggle("is-completed", entry.status === "completed");
+      btn.setAttribute("data-status", entry.status);
+    }
 
     const displayName = entry.characterName || entry.chatId;
     const statusDescription =
@@ -614,77 +670,101 @@ export class ChatHeadController {
           ? "Streaming response in background — click to open chat"
           : "Generating response in background — click to open chat";
     const fullLabel = `${displayName}: ${statusDescription}`;
-    btn.setAttribute("aria-label", fullLabel);
-    btn.title = fullLabel;
-
-    const effectiveAvatarUrl =
-      sanitizeAvatarUrl(entry.avatarUrl) ??
-      (entry.characterId ? buildDefaultAvatarUrl(entry.characterId) : undefined);
-
-    const existingImg = btn.querySelector<HTMLImageElement>(".gg-chat-head-avatar");
-    const existingInitials = btn.querySelector<HTMLSpanElement>(".gg-chat-head-initials");
-
-    if (effectiveAvatarUrl && !entry.avatarFailed) {
-      existingInitials?.remove();
-      if (existingImg) {
-        if (existingImg.getAttribute("src") !== effectiveAvatarUrl) {
-          existingImg.src = effectiveAvatarUrl;
-        }
-        existingImg.alt = displayName;
-      } else {
-        const img = document.createElement("img");
-        img.className = "gg-chat-head-avatar";
-        img.src = effectiveAvatarUrl;
-        img.alt = displayName;
-        img.draggable = false;
-        img.addEventListener("error", () => {
-          if (this.destroyed) return;
-          const current = this.heads.get(entry.chatId);
-          if (current) {
-            current.avatarFailed = true;
-          }
-          if (img.isConnected) {
-            const latestName =
-              this.heads.get(entry.chatId)?.characterName || entry.chatId;
-            const initials = document.createElement("span");
-            initials.className = "gg-chat-head-initials";
-            initials.textContent = computeInitials(latestName);
-            img.replaceWith(initials);
-          }
-        });
-        btn.insertBefore(img, badge);
-      }
-    } else {
-      existingImg?.remove();
-      const initialsText = computeInitials(displayName);
-      if (existingInitials) {
-        existingInitials.textContent = initialsText;
-      } else {
-        const initials = document.createElement("span");
-        initials.className = "gg-chat-head-initials";
-        initials.textContent = initialsText;
-        btn.insertBefore(initials, badge);
-      }
+    if (refs.lastLabel !== fullLabel) {
+      btn.setAttribute("aria-label", fullLabel);
+      btn.title = fullLabel;
+      refs.lastLabel = fullLabel;
     }
 
-    const existingPip = btn.querySelector<HTMLSpanElement>(".gg-chat-head-pip");
+    const effectiveAvatarUrl =
+      entry.avatarUrl ??
+      (entry.characterId ? buildDefaultAvatarUrl(entry.characterId) : undefined);
+    const avatarFailed = Boolean(entry.avatarFailed);
+
+    if (
+      refs.lastAvatarUrl !== effectiveAvatarUrl ||
+      refs.lastAvatarFailed !== avatarFailed ||
+      refs.lastDisplayName !== displayName ||
+      (!refs.img && !refs.initials)
+    ) {
+      if (effectiveAvatarUrl && !avatarFailed) {
+        if (refs.initials) {
+          refs.initials.remove();
+          refs.initials = null;
+        }
+        if (refs.img) {
+          if (refs.img.getAttribute("src") !== effectiveAvatarUrl) {
+            refs.img.src = effectiveAvatarUrl;
+          }
+          refs.img.alt = displayName;
+        } else {
+          const img = document.createElement("img");
+          img.className = "gg-chat-head-avatar";
+          img.src = effectiveAvatarUrl;
+          img.alt = displayName;
+          img.draggable = false;
+          img.addEventListener("error", () => {
+            if (this.destroyed) return;
+            const current = this.heads.get(entry.chatId);
+            if (current) {
+              current.avatarFailed = true;
+            }
+            if (img.isConnected) {
+              const latestName =
+                this.heads.get(entry.chatId)?.characterName || entry.chatId;
+              const initials = document.createElement("span");
+              initials.className = "gg-chat-head-initials";
+              initials.textContent = computeInitials(latestName);
+              img.replaceWith(initials);
+              const latestRefs = this.headItemRefs.get(entry.chatId);
+              if (latestRefs && latestRefs.img === img) {
+                latestRefs.img = null;
+                latestRefs.initials = initials;
+                latestRefs.lastAvatarFailed = true;
+              }
+            }
+          });
+          btn.insertBefore(img, badge);
+          refs.img = img;
+        }
+      } else {
+        if (refs.img) {
+          refs.img.remove();
+          refs.img = null;
+        }
+        const initialsText = computeInitials(displayName);
+        if (refs.initials) {
+          refs.initials.textContent = initialsText;
+        } else {
+          const initials = document.createElement("span");
+          initials.className = "gg-chat-head-initials";
+          initials.textContent = initialsText;
+          btn.insertBefore(initials, badge);
+          refs.initials = initials;
+        }
+      }
+      refs.lastAvatarUrl = effectiveAvatarUrl;
+      refs.lastAvatarFailed = avatarFailed;
+    }
+
     if (entry.status === "completed") {
-      if (!existingPip) {
+      if (!refs.pip) {
         const pip = document.createElement("span");
         pip.className = "gg-chat-head-pip";
         pip.setAttribute("aria-hidden", "true");
         btn.append(pip);
+        refs.pip = pip;
       }
-    } else {
-      existingPip?.remove();
+    } else if (refs.pip) {
+      refs.pip.remove();
+      refs.pip = null;
     }
 
-    const existingDismiss = item.querySelector<HTMLButtonElement>(
-      "[data-gg-chat-head-dismiss]",
-    );
     if (entry.status === "completed") {
-      if (existingDismiss) {
-        existingDismiss.setAttribute("aria-label", `Dismiss ${displayName}`);
+      if (refs.dismissBtn) {
+        if (refs.lastDisplayName !== displayName) {
+          refs.dismissBtn.setAttribute("aria-label", `Dismiss ${displayName}`);
+        }
       } else {
         const dismissBtn = document.createElement("button");
         dismissBtn.type = "button";
@@ -699,10 +779,15 @@ export class ChatHeadController {
           this.dismissCompletedHead(entry.chatId);
         });
         item.append(dismissBtn);
+        refs.dismissBtn = dismissBtn;
       }
-    } else {
-      existingDismiss?.remove();
+    } else if (refs.dismissBtn) {
+      refs.dismissBtn.remove();
+      refs.dismissBtn = null;
     }
+
+    refs.lastStatus = entry.status;
+    refs.lastDisplayName = displayName;
   }
 
   private dismissCompletedHead(chatId: string): void {
@@ -714,51 +799,61 @@ export class ChatHeadController {
     }
   }
 
-  private isNativeChatHeadElement(el: Element): boolean {
-    if (el.hasAttribute("data-gg-chat-head")) return false;
-    if (el.closest("[data-gg-chat-heads-root]")) return false;
-    if (el.hasAttribute("data-head-idx")) return true;
-    if (el.hasAttribute("data-chat-head")) return true;
-    const parent = el.parentElement;
-    if (parent && parent.parentElement === document.body) {
-      const cls = typeof parent.className === "string" ? parent.className : "";
-      if (
-        parent.querySelector("[data-head-idx]") !== null ||
-        /ChatHeads/i.test(cls)
-      ) {
-        return true;
-      }
+  private scanNativeChatHeads(): {
+    nativeChatIds: Set<string>;
+    nativeContainer: HTMLElement | null;
+  } {
+    const nativeChatIds = new Set<string>();
+    let nativeContainer: HTMLElement | null = null;
+    if (typeof document === "undefined" || !document.body) {
+      return { nativeChatIds, nativeContainer };
     }
-    return false;
-  }
 
-  private hasNativeChatHead(chatId: string): boolean {
-    if (typeof document === "undefined" || !document.body || !chatId) return false;
-    const candidates = document.body.querySelectorAll(
-      "[data-head-idx][data-chat-id]:not([data-gg-chat-head]), [data-chat-head][data-chat-id]:not([data-gg-chat-head]), body > * > [data-chat-id]:not([data-gg-chat-head])",
-    );
+    const candidates = document.body.querySelectorAll(NATIVE_HEAD_SCAN_SELECTOR);
+    const parentIsNative = new Map<Element, boolean>();
+
     for (const el of candidates) {
-      if (
-        el.getAttribute("data-chat-id") === chatId &&
-        this.isNativeChatHeadElement(el)
-      ) {
-        return true;
+      if (el.hasAttribute("data-gg-chat-head")) continue;
+      if (this.rootEl?.contains(el) || el.closest("[data-gg-chat-heads-root]")) {
+        continue;
+      }
+
+      const chatId = el.getAttribute("data-chat-id");
+      if (!chatId) continue;
+
+      const isDirectNative =
+        el.hasAttribute("data-head-idx") || el.hasAttribute("data-chat-head");
+
+      if (isDirectNative) {
+        nativeChatIds.add(chatId);
+        if (!nativeContainer) {
+          const parent = el.parentElement;
+          nativeContainer =
+            !parent || parent === document.body ? (el as HTMLElement) : parent;
+        }
+        continue;
+      }
+
+      const parent = el.parentElement;
+      if (parent && parent.parentElement === document.body) {
+        let isNative = parentIsNative.get(parent);
+        if (isNative === undefined) {
+          const cls = typeof parent.className === "string" ? parent.className : "";
+          isNative =
+            /ChatHeads/i.test(cls) || parent.querySelector("[data-head-idx]") !== null;
+          parentIsNative.set(parent, isNative);
+        }
+        if (isNative) {
+          nativeChatIds.add(chatId);
+        }
       }
     }
-    return false;
+
+    return { nativeChatIds, nativeContainer };
   }
 
   private findNativeChatHeadsContainer(): HTMLElement | null {
-    if (typeof document === "undefined" || !document.body) return null;
-    const firstHead = document.body.querySelector<HTMLElement>(
-      "[data-head-idx][data-chat-id]:not([data-gg-chat-head]), [data-chat-head][data-chat-id]:not([data-gg-chat-head])",
-    );
-    if (!firstHead || firstHead.closest("[data-gg-chat-heads-root]")) {
-      return null;
-    }
-    const parent = firstHead.parentElement;
-    if (!parent || parent === document.body) return firstHead;
-    return parent;
+    return this.scanNativeChatHeads().nativeContainer;
   }
 
   private getViewportSize(): { vw: number; vh: number } {
@@ -799,8 +894,9 @@ export class ChatHeadController {
   private clampCenterPos(
     pos: StoredChatHeadPos,
     headCount: number,
+    viewport?: { vw: number; vh: number },
   ): StoredChatHeadPos {
-    const { vw, vh } = this.getViewportSize();
+    const { vw, vh } = viewport ?? this.getViewportSize();
     const { width, height } = this.getStackDimensions(headCount, vh);
     const minX = VIEWPORT_PAD_PX + width / 2;
     const maxX = vw - VIEWPORT_PAD_PX - width / 2;
@@ -936,21 +1032,54 @@ export class ChatHeadController {
       const pointerId = event.pointerId;
       const startX = event.clientX;
       const startY = event.clientY;
-      const initialCount = this.rootEl?.children.length || this.heads.size || 1;
+      const dragViewport = this.getViewportSize();
+      const dragVisibleCount = this.rootEl?.children.length || this.heads.size || 1;
       const styleLeftPct = parseFloat(root.style.left);
       const styleTopPct = parseFloat(root.style.top);
       const startPos =
         Number.isFinite(styleLeftPct) && Number.isFinite(styleTopPct)
           ? { xPct: styleLeftPct, yPct: styleTopPct }
-          : this.clampCenterPos(this.pos, initialCount);
+          : this.clampCenterPos(this.pos, dragVisibleCount, dragViewport);
       let moved = false;
       let finished = false;
       let holdDismissTimer: ReturnType<typeof setTimeout> | null = null;
+      let dragRafId: number | null = null;
+      let pendingDx = 0;
+      let pendingDy = 0;
+      let hasPendingMove = false;
 
       const clearHoldDismissTimer = () => {
         if (holdDismissTimer !== null) {
           clearTimeout(holdDismissTimer);
           holdDismissTimer = null;
+        }
+      };
+
+      const cancelDragRaf = () => {
+        if (dragRafId !== null) {
+          if (typeof cancelAnimationFrame === "function") {
+            cancelAnimationFrame(dragRafId);
+          }
+          dragRafId = null;
+        }
+      };
+
+      const applyPendingDragMove = () => {
+        if (!hasPendingMove || this.destroyed) return;
+        hasPendingMove = false;
+        this.pos = this.clampCenterPos(
+          {
+            xPct: startPos.xPct + (pendingDx / dragViewport.vw) * 100,
+            yPct: startPos.yPct + (pendingDy / dragViewport.vh) * 100,
+          },
+          dragVisibleCount,
+          dragViewport,
+        );
+        if (this.rootEl) {
+          this.applyRootPosition(this.rootEl, dragVisibleCount, {
+            avoidNative: false,
+            viewport: dragViewport,
+          });
         }
       };
 
@@ -972,17 +1101,20 @@ export class ChatHeadController {
         }
         if (!moved) return;
 
-        const { vw, vh } = this.getViewportSize();
-        const visibleCount = this.rootEl?.children.length || this.heads.size || 1;
-        this.pos = this.clampCenterPos(
-          {
-            xPct: startPos.xPct + (dx / vw) * 100,
-            yPct: startPos.yPct + (dy / vh) * 100,
-          },
-          visibleCount,
-        );
-        if (this.rootEl) {
-          this.applyRootPosition(this.rootEl, visibleCount, { avoidNative: false });
+        pendingDx = dx;
+        pendingDy = dy;
+        hasPendingMove = true;
+
+        if (typeof requestAnimationFrame === "function") {
+          if (dragRafId === null) {
+            dragRafId = requestAnimationFrame(() => {
+              dragRafId = null;
+              if (finished || this.destroyed) return;
+              applyPendingDragMove();
+            });
+          }
+        } else {
+          applyPendingDragMove();
         }
       };
 
@@ -990,6 +1122,10 @@ export class ChatHeadController {
         if (finished) return;
         finished = true;
         clearHoldDismissTimer();
+        cancelDragRaf();
+        if (moved && hasPendingMove) {
+          applyPendingDragMove();
+        }
         this.clearDragSession();
         root.classList.remove("is-dragging");
         try {
@@ -1075,6 +1211,7 @@ export class ChatHeadController {
 
       this.dragCleanup = () => {
         clearHoldDismissTimer();
+        cancelDragRaf();
         document.removeEventListener("pointermove", onPointerMove, true);
         document.removeEventListener("pointerup", onPointerEnd, true);
         document.removeEventListener("pointercancel", onPointerEnd, true);
@@ -1113,15 +1250,34 @@ export class ChatHeadController {
           ? document.defaultView
           : null;
     if (!win) return;
-    const onResize = () => {
+    let resizeRafId: number | null = null;
+    const flushResize = () => {
       if (this.destroyed || !this.rootEl) return;
       const count = this.rootEl.children.length || this.heads.size || 1;
       this.applyRootPosition(this.rootEl, count, {
         avoidNative: !this.isDragging,
       });
     };
+    const onResize = () => {
+      if (this.destroyed || !this.rootEl) return;
+      if (typeof requestAnimationFrame === "function") {
+        if (resizeRafId !== null) return;
+        resizeRafId = requestAnimationFrame(() => {
+          resizeRafId = null;
+          flushResize();
+        });
+      } else {
+        flushResize();
+      }
+    };
     win.addEventListener("resize", onResize);
     this.resizeCleanup = () => {
+      if (resizeRafId !== null) {
+        if (typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(resizeRafId);
+        }
+        resizeRafId = null;
+      }
       win.removeEventListener("resize", onResize);
     };
   }
@@ -1137,11 +1293,16 @@ export class ChatHeadController {
   private applyRootPosition(
     root: HTMLDivElement,
     headCount = this.heads.size || 1,
-    options: { avoidNative?: boolean; nativeBox?: RectBox | null } = {},
+    options: {
+      avoidNative?: boolean;
+      nativeBox?: RectBox | null;
+      viewport?: { vw: number; vh: number };
+    } = {},
   ): void {
-    const { vw, vh } = this.getViewportSize();
+    const viewport = options.viewport ?? this.getViewportSize();
+    const { vw, vh } = viewport;
     const { width, height } = this.getStackDimensions(headCount, vh);
-    const clamped = this.clampCenterPos(this.pos, headCount);
+    const clamped = this.clampCenterPos(this.pos, headCount, viewport);
 
     let cx = (clamped.xPct / 100) * vw;
     let cy = (clamped.yPct / 100) * vh;

@@ -7,6 +7,8 @@ import {
   normalizeRecoveryList,
   normalizeSettings,
 } from "../src/backend/settings-store";
+import { buildGenerationMetricsPayload } from "../src/backend/generation-metrics";
+import { registerBackend } from "../src/backend";
 import { InputToolbarController } from "../src/frontend/input-toolbar";
 import { PillMetricsController } from "../src/frontend/pill-metrics";
 import {
@@ -2397,6 +2399,297 @@ describe("InputToolbarController DOM behavior", () => {
       streamCtrl.destroy();
       row.remove();
     }
+  });
+});
+
+describe("backend perf optimizations (Phase 3 & 4)", () => {
+  test("SettingsStore coalesces concurrent cold-cache reads for settings.json and recovery.json (including bootstrap)", async () => {
+    const files = new Map<string, string>([
+      ["u1:settings.json", JSON.stringify({ toolbarPlacement: "before_native", inputRecovery: { enabled: true, maxEntries: 5 } })],
+      [
+        "u1:recovery.json",
+        JSON.stringify([
+          { id: "r1", text: "Saved draft", actionId: "guided_response", chatId: "c1", createdAt: 100 },
+        ]),
+      ],
+    ]);
+    const readCounts = new Map<string, number>();
+    const existsCounts = new Map<string, number>();
+
+    const fakeSpindle = {
+      permissions: { has: () => true, onChanged: () => () => {} },
+      log: { warn: () => {} },
+      onFrontendMessage: () => () => {},
+      sendToFrontend: () => {},
+      connections: { list: async () => [] },
+      presets: { list: async () => ({ data: [], total: 0 }) },
+      userStorage: {
+        exists: async (file: string, userId?: string) => {
+          const k = `${userId}:${file}`;
+          existsCounts.set(k, (existsCounts.get(k) ?? 0) + 1);
+          await new Promise((r) => setTimeout(r, 10));
+          return files.has(k);
+        },
+        read: async (file: string, userId?: string) => {
+          const k = `${userId}:${file}`;
+          readCounts.set(k, (readCounts.get(k) ?? 0) + 1);
+          await new Promise((r) => setTimeout(r, 10));
+          const val = files.get(k);
+          if (val === undefined) throw new Error("missing");
+          return val;
+        },
+        write: async (file: string, content: string, userId?: string) => {
+          files.set(`${userId}:${file}`, content);
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const backend = registerBackend(fakeSpindle);
+    try {
+      const [view1, view2] = await Promise.all([
+        backend.buildBootstrapView("u1", { includeCatalogs: false }),
+        backend.buildBootstrapView("u1", { includeCatalogs: false }),
+      ]);
+
+      expect(existsCounts.get("u1:settings.json")).toBe(1);
+      expect(readCounts.get("u1:settings.json")).toBe(1);
+      expect(existsCounts.get("u1:recovery.json")).toBe(1);
+      expect(readCounts.get("u1:recovery.json")).toBe(1);
+
+      expect(view1.settings.toolbarPlacement).toBe("before_native");
+      expect(view2.settings.toolbarPlacement).toBe("before_native");
+      expect(view1.recovery).toHaveLength(1);
+      expect(view2.recovery).toHaveLength(1);
+
+      // Verify callers received independent clones
+      view1.settings.toolbarPlacement = "right";
+      view1.recovery[0]!.text = "mutated";
+      expect(view2.settings.toolbarPlacement).toBe("before_native");
+      expect(view2.recovery[0]!.text).toBe("Saved draft");
+    } finally {
+      backend.dispose();
+    }
+  });
+
+  test("SettingsStore skips redundant disk writes in pushRecovery on no-op duplicate or blank text", async () => {
+    const files = new Map<string, string>();
+    let recoveryWrites = 0;
+
+    const fakeSpindle = {
+      permissions: { has: () => true },
+      log: { warn: () => {} },
+      userStorage: {
+        exists: async (file: string, userId?: string) => files.has(`${userId}:${file}`),
+        read: async (file: string, userId?: string) => files.get(`${userId}:${file}`) ?? "",
+        write: async (file: string, content: string, userId?: string) => {
+          if (file === "recovery.json") recoveryWrites += 1;
+          files.set(`${userId}:${file}`, content);
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const store = new SettingsStore(fakeSpindle);
+
+    const first = await store.pushRecovery(
+      { text: "Keep this draft", actionId: "guided_response", chatId: "c1" },
+      "u1",
+    );
+    expect(first).toHaveLength(1);
+    expect(recoveryWrites).toBe(1);
+
+    // Duplicate of top entry -> skips disk write
+    const dup = await store.pushRecovery(
+      { text: "Keep this draft", actionId: "guided_swipe", chatId: "c2" },
+      "u1",
+    );
+    expect(dup).toHaveLength(1);
+    expect(dup[0]!.id).toBe(first[0]!.id);
+    expect(recoveryWrites).toBe(1);
+
+    // Blank / whitespace-only -> skips disk write
+    const blank = await store.pushRecovery(
+      { text: "   \n\t ", actionId: "guided_response", chatId: "c1" },
+      "u1",
+    );
+    expect(blank).toHaveLength(1);
+    expect(recoveryWrites).toBe(1);
+
+    // Different text -> writes to disk
+    const second = await store.pushRecovery(
+      { text: "New draft", actionId: "guided_response", chatId: "c1" },
+      "u1",
+    );
+    expect(second).toHaveLength(2);
+    expect(second[0]!.text).toBe("New draft");
+    expect(recoveryWrites).toBe(2);
+  });
+
+  test("SettingsStore enforces LRU maxCachedUsers eviction and isolates writeQueues per (userId, fileKey)", async () => {
+    const files = new Map<string, string>([
+      ["u1:settings.json", JSON.stringify({ toolbarPlacement: "before_native" })],
+      ["u2:settings.json", JSON.stringify({ toolbarPlacement: "right" })],
+      ["u3:settings.json", JSON.stringify({ toolbarPlacement: "below_bar" })],
+    ]);
+    const readCounts = new Map<string, number>();
+
+    let releaseBlockedSettingsWrite!: () => void;
+    const settingsWriteBlocked = new Promise<void>((resolve) => {
+      releaseBlockedSettingsWrite = resolve;
+    });
+    let settingsWriteStarted!: () => void;
+    const settingsWriteStartedPromise = new Promise<void>((resolve) => {
+      settingsWriteStarted = resolve;
+    });
+    let blockNextSettingsWrite = false;
+
+    const fakeSpindle = {
+      permissions: { has: () => true },
+      log: { warn: () => {} },
+      userStorage: {
+        exists: async (file: string, userId?: string) => files.has(`${userId}:${file}`),
+        read: async (file: string, userId?: string) => {
+          const k = `${userId}:${file}`;
+          readCounts.set(k, (readCounts.get(k) ?? 0) + 1);
+          return files.get(k) ?? "";
+        },
+        write: async (file: string, content: string, userId?: string) => {
+          if (file === "settings.json" && blockNextSettingsWrite) {
+            blockNextSettingsWrite = false;
+            settingsWriteStarted();
+            await settingsWriteBlocked;
+          }
+          files.set(`${userId}:${file}`, content);
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const store = new SettingsStore(fakeSpindle, { maxCachedUsers: 2 });
+
+    // Load u1, u2; touch u1 to refresh recency; load u3 -> u2 evicted, u1 & u3 kept
+    await store.getSettings("u1");
+    await store.getSettings("u2");
+    await store.getSettings("u1");
+    await store.getSettings("u3");
+
+    expect(readCounts.get("u1:settings.json")).toBe(1);
+    expect(readCounts.get("u2:settings.json")).toBe(1);
+    expect(readCounts.get("u3:settings.json")).toBe(1);
+
+    // u1 and u3 are still cached (no new reads); u2 was evicted (triggers a 2nd read)
+    await store.getSettings("u1");
+    await store.getSettings("u3");
+    expect(readCounts.get("u1:settings.json")).toBe(1);
+    expect(readCounts.get("u3:settings.json")).toBe(1);
+
+    await store.getSettings("u2");
+    expect(readCounts.get("u2:settings.json")).toBe(2);
+
+    // Verify per-(userId, fileKey) writeQueue isolation:
+    // A blocked settings.json write for u1 must NOT block continue-history.json writes for u1
+    blockNextSettingsWrite = true;
+    const pendingSettingsSave = store.saveSettings({ toolbarPlacement: "after_native" }, "u1");
+    await settingsWriteStartedPromise;
+
+    const continueEntry = await store.pushContinueEntry(
+      {
+        chatId: "chat-1",
+        messageId: "m-1",
+        swipeIndex: 0,
+        baseText: "Hello",
+        resultText: "Hello world",
+        baseReasoning: null,
+        baseReasoningDuration: null,
+        inputText: "continue",
+      },
+      "u1",
+    );
+    expect(continueEntry.resultText).toBe("Hello world");
+
+    // Unblock settings write and verify it completes cleanly
+    releaseBlockedSettingsWrite();
+    const saved = await pendingSettingsSave;
+    expect(saved.toolbarPlacement).toBe("after_native");
+  });
+
+  test("buildGenerationMetricsPayload executes independent token count and preset lookup RPCs in parallel", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const createDeferred = <T>() => {
+      let resolve!: (val: T) => void;
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    };
+
+    const countFinalDeferred = createDeferred<{ total_tokens: number }>();
+    const countDeltaDeferred = createDeferred<{ total_tokens: number }>();
+    const presetDeferred = createDeferred<{ id: string; name: string }>();
+
+    const fakeSpindle = {
+      permissions: { has: () => true },
+      tokens: {
+        countText: async (text: string) => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          try {
+            return text === "Combined message text"
+              ? await countFinalDeferred.promise
+              : await countDeltaDeferred.promise;
+          } finally {
+            inFlight -= 1;
+          }
+        },
+      },
+      presets: {
+        get: async () => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          try {
+            return await presetDeferred.promise;
+          } finally {
+            inFlight -= 1;
+          }
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    const payloadPromise = buildGenerationMetricsPayload({
+      spindle: fakeSpindle,
+      userId: "u1",
+      isContinue: true,
+      finalText: "Combined message text",
+      rawDeltaText: "message text",
+      presetId: "preset-1",
+      model: "gpt-4o",
+      provider: "openai",
+      timingSource: {
+        streamingStartedAt: 1000,
+        firstTokenAt: 1200,
+        firstContentTokenAt: 1250,
+        responseStoppedAt: 2250,
+        completedAt: 2300,
+        wasStreaming: true,
+      },
+    });
+
+    // Yield a microtask so all parallel RPCs start before resolving any of them
+    await Promise.resolve();
+    expect(inFlight).toBe(3);
+    expect(maxInFlight).toBe(3);
+
+    countFinalDeferred.resolve({ total_tokens: 42 });
+    countDeltaDeferred.resolve({ total_tokens: 20 });
+    presetDeferred.resolve({ id: "preset-1", name: "Storyteller" });
+
+    const payload = await payloadPromise;
+    expect(payload.tokenCount).toBe(42);
+    expect(payload.generationMetrics.presetId).toBe("preset-1");
+    expect(payload.generationMetrics.presetName).toBe("Storyteller");
+    expect(payload.generationMetrics.ttft).toBe(200);
+    expect(payload.generationMetrics.tps).toBe(20);
+    expect(payload.generationMetrics.durationMs).toBe(1300);
   });
 });
 

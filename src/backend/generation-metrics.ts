@@ -231,32 +231,49 @@ export async function buildGenerationMetricsPayload(args: {
     ...(args.userId ? { userId: args.userId } : {}),
   };
 
+  const normalizedPresetId =
+    typeof args.presetId === "string" && args.presetId.trim()
+      ? args.presetId.trim()
+      : undefined;
+  const providedPresetName =
+    typeof args.presetName === "string" && args.presetName.trim()
+      ? args.presetName.trim()
+      : undefined;
+  const presetNamePromise: Promise<string | undefined> =
+    providedPresetName !== undefined
+      ? Promise.resolve(providedPresetName)
+      : normalizedPresetId
+        ? resolvePresetNameSafe(args.spindle, normalizedPresetId, args.userId)
+        : Promise.resolve(undefined);
+
   let resolvedTokenCount: number | undefined;
   let responseTokenCount: number | undefined;
+  let resolvedPresetName: string | undefined;
 
   if (args.isContinue) {
     // Continue appends to an existing message, so the pill tokenCount reflects
     // the full combined message while TPS counts only the newly generated delta.
-    const calculatedMessageTokenCount =
-      args.finalText.length > 0
-        ? await safeCountTokens(args.spindle, args.finalText, countOptions)
-        : undefined;
+    const needMessageCount = args.finalText.length > 0;
+    const needResponseCount = wasStreaming && /\S/.test(args.rawDeltaText);
+    const reuseMessageCountForResponse =
+      needMessageCount && needResponseCount && args.rawDeltaText === args.finalText;
 
-    let calculatedResponseTokenCount: number | undefined;
-    if (wasStreaming && /\S/.test(args.rawDeltaText)) {
-      if (args.rawDeltaText === args.finalText) {
-        calculatedResponseTokenCount = calculatedMessageTokenCount;
-      } else {
-        calculatedResponseTokenCount = await safeCountTokens(
-          args.spindle,
-          args.rawDeltaText,
-          countOptions,
-        );
-      }
-    }
+    const [calculatedMessageTokenCount, rawCalculatedResponseTokenCount, presetName] =
+      await Promise.all([
+        needMessageCount
+          ? safeCountTokens(args.spindle, args.finalText, countOptions)
+          : Promise.resolve(undefined),
+        needResponseCount && !reuseMessageCountForResponse
+          ? safeCountTokens(args.spindle, args.rawDeltaText, countOptions)
+          : Promise.resolve(undefined),
+        presetNamePromise,
+      ]);
 
     resolvedTokenCount = calculatedMessageTokenCount;
-    responseTokenCount = calculatedResponseTokenCount;
+    responseTokenCount = reuseMessageCountForResponse
+      ? calculatedMessageTokenCount
+      : rawCalculatedResponseTokenCount;
+    resolvedPresetName = presetName;
   } else {
     const tokenCountOptions: GenerationTokenCountOptions = {
       hasReasoning: args.hasReasoning,
@@ -271,34 +288,29 @@ export async function buildGenerationMetricsPayload(args: {
       tokenCountOptions,
     );
 
-    let calculatedMessageTokenCount: number | undefined;
-    if (providerTokenCounts.messageTokenCount == null && args.finalText.length > 0) {
-      calculatedMessageTokenCount = await safeCountTokens(
-        args.spindle,
-        args.finalText,
-        countOptions,
-      );
-    }
-
-    let calculatedResponseTokenCount: number | undefined;
-    if (
+    const needMessageCount =
+      providerTokenCounts.messageTokenCount == null && args.finalText.length > 0;
+    const needResponseCount =
       wasStreaming &&
       providerTokenCounts.responseTokenCount == null &&
-      /\S/.test(args.rawDeltaText)
-    ) {
-      if (
-        providerTokenCounts.messageTokenCount == null &&
-        args.rawDeltaText === args.finalText
-      ) {
-        calculatedResponseTokenCount = calculatedMessageTokenCount;
-      } else {
-        calculatedResponseTokenCount = await safeCountTokens(
-          args.spindle,
-          args.rawDeltaText,
-          countOptions,
-        );
-      }
-    }
+      /\S/.test(args.rawDeltaText);
+    const reuseMessageCountForResponse =
+      needMessageCount && needResponseCount && args.rawDeltaText === args.finalText;
+
+    const [calculatedMessageTokenCount, rawCalculatedResponseTokenCount, presetName] =
+      await Promise.all([
+        needMessageCount
+          ? safeCountTokens(args.spindle, args.finalText, countOptions)
+          : Promise.resolve(undefined),
+        needResponseCount && !reuseMessageCountForResponse
+          ? safeCountTokens(args.spindle, args.rawDeltaText, countOptions)
+          : Promise.resolve(undefined),
+        presetNamePromise,
+      ]);
+
+    const calculatedResponseTokenCount = reuseMessageCountForResponse
+      ? calculatedMessageTokenCount
+      : rawCalculatedResponseTokenCount;
 
     const resolved = resolveGenerationTokenCounts(
       args.usage?.completion_tokens,
@@ -310,24 +322,13 @@ export async function buildGenerationMetricsPayload(args: {
     );
     resolvedTokenCount = resolved.messageTokenCount;
     responseTokenCount = resolved.responseTokenCount;
+    resolvedPresetName = presetName;
   }
 
   const timingMetrics = calculateGenerationTimingMetrics(
     args.timingSource,
     responseTokenCount,
   );
-
-  const normalizedPresetId =
-    typeof args.presetId === "string" && args.presetId.trim()
-      ? args.presetId.trim()
-      : undefined;
-  const resolvedPresetName =
-    (typeof args.presetName === "string" && args.presetName.trim()
-      ? args.presetName.trim()
-      : undefined) ??
-    (normalizedPresetId
-      ? await resolvePresetNameSafe(args.spindle, normalizedPresetId, args.userId)
-      : undefined);
 
   const generationMetrics: NativeGenerationMetrics = {
     ...timingMetrics,

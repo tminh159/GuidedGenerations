@@ -36,17 +36,51 @@ interface PendingMetricsEntry {
   swipeId: number;
   tokenCount?: number | null;
   generationMetrics?: NativeGenerationMetrics | null;
-  latestFallback?: HostMessageShape | null;
+  lastKnownSwipeId?: number;
+  pendingFallback?: HostMessageShape | null;
   revision: number;
   attempts: number;
 }
 
 const MESSAGE_READ_LIMIT = 50;
 const WIDER_MESSAGE_READ_LIMIT = 200;
+const MAX_PENDING_ENTRIES = 100;
 const RETRY_DELAYS_MS = [0, 50, 150] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function toMinimalMessageFallback(
+  msg: Record<string, unknown> | HostMessageShape | null | undefined,
+): HostMessageShape | null {
+  if (!isRecord(msg) || typeof msg.id !== "string") return null;
+  const minimal: HostMessageShape = { id: msg.id };
+  if (typeof msg.chat_id === "string") {
+    minimal.chat_id = msg.chat_id;
+  }
+  if (typeof msg.swipe_id === "number") {
+    minimal.swipe_id = msg.swipe_id;
+  }
+  if (isRecord(msg.extra)) {
+    minimal.extra = msg.extra;
+  }
+  return minimal;
+}
+
+function isAuthoritativeFallback(
+  fallback: HostMessageShape | null | undefined,
+  chatId: string,
+  messageId: string,
+): fallback is HostMessageShape {
+  return Boolean(
+    fallback &&
+      fallback.id === messageId &&
+      (typeof fallback.chat_id !== "string" || fallback.chat_id === chatId) &&
+      typeof fallback.swipe_id === "number" &&
+      isRecord(fallback.extra) &&
+      Object.keys(fallback.extra).length > 0,
+  );
 }
 
 function extractMessageList(page: unknown): HostMessageShape[] {
@@ -107,6 +141,7 @@ export class PillMetricsController {
   private readonly pending = new Map<string, PendingMetricsEntry>();
   private readonly scheduledKeys = new Set<string>();
   private readonly inFlightByMessage = new Map<string, Promise<void>>();
+  private readonly inFlightTailReads = new Map<string, Promise<unknown>>();
   private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private nextRevision = 0;
   private destroyed = false;
@@ -115,6 +150,20 @@ export class PillMetricsController {
 
   private makeKey(chatId: string, messageId: string, swipeId: number): string {
     return `${chatId}:${messageId}:${swipeId}`;
+  }
+
+  private setPendingEntry(key: string, entry: PendingMetricsEntry): void {
+    if (this.pending.has(key)) {
+      this.pending.delete(key);
+    } else if (this.pending.size >= MAX_PENDING_ENTRIES) {
+      const oldestKey = this.pending.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.pending.delete(oldestKey);
+        this.scheduledKeys.delete(oldestKey);
+        this.clearRetryTimer(oldestKey);
+      }
+    }
+    this.pending.set(key, entry);
   }
 
   handleMetricsEvent(event: GenerationMetricsEvent): void {
@@ -152,11 +201,12 @@ export class PillMetricsController {
         event.generationMetrics !== undefined
           ? event.generationMetrics
           : existing?.generationMetrics,
-      latestFallback: existing?.latestFallback ?? null,
+      lastKnownSwipeId: existing?.lastKnownSwipeId,
+      pendingFallback: existing?.pendingFallback ?? null,
       revision: ++this.nextRevision,
       attempts: 0,
     };
-    this.pending.set(key, entry);
+    this.setPendingEntry(key, entry);
     this.clearRetryTimer(key);
     this.enqueueFlush(key);
   }
@@ -193,10 +243,7 @@ export class PillMetricsController {
           ? payload.swipeId
           : undefined;
 
-    const eventFallback: HostMessageShape | null =
-      msg && typeof msg.id === "string"
-        ? (msg as unknown as HostMessageShape)
-        : null;
+    const eventFallback = toMinimalMessageFallback(msg);
 
     if (deletedSwipeId !== null) {
       const shifted: PendingMetricsEntry[] = [];
@@ -216,7 +263,8 @@ export class PillMetricsController {
           shifted.push({
             ...entry,
             swipeId: nextSwipeId,
-            latestFallback: null,
+            lastKnownSwipeId: undefined,
+            pendingFallback: null,
             key: this.makeKey(entry.chatId, entry.messageId, nextSwipeId),
             revision: ++this.nextRevision,
           });
@@ -228,7 +276,7 @@ export class PillMetricsController {
         if (!existing || entry.revision > existing.revision) {
           this.scheduledKeys.delete(entry.key);
           this.clearRetryTimer(entry.key);
-          this.pending.set(entry.key, entry);
+          this.setPendingEntry(entry.key, entry);
         }
       }
     }
@@ -238,12 +286,14 @@ export class PillMetricsController {
       if (chatId && entry.chatId !== chatId) continue;
 
       if (activeSwipeId !== undefined && activeSwipeId !== entry.swipeId) {
-        if (eventFallback !== null) {
-          entry.latestFallback = eventFallback;
-        }
+        entry.lastKnownSwipeId = activeSwipeId;
+        entry.pendingFallback = null;
         continue;
       }
 
+      if (activeSwipeId === entry.swipeId) {
+        entry.lastKnownSwipeId = activeSwipeId;
+      }
       entry.attempts = 0;
       this.enqueueFlush(key, eventFallback);
     }
@@ -260,9 +310,8 @@ export class PillMetricsController {
     for (const [key, entry] of [...this.pending.entries()]) {
       if (entry.chatId !== targetChatId) continue;
       if (
-        entry.latestFallback &&
-        typeof entry.latestFallback.swipe_id === "number" &&
-        entry.latestFallback.swipe_id !== entry.swipeId
+        entry.lastKnownSwipeId !== undefined &&
+        entry.lastKnownSwipeId !== entry.swipeId
       ) {
         continue;
       }
@@ -320,6 +369,7 @@ export class PillMetricsController {
     this.pending.clear();
     this.scheduledKeys.clear();
     this.inFlightByMessage.clear();
+    this.inFlightTailReads.clear();
     for (const timer of this.retryTimers.values()) {
       clearTimeout(timer);
     }
@@ -334,7 +384,7 @@ export class PillMetricsController {
     const entry = this.pending.get(key);
     if (!entry) return;
     if (eventFallback !== null) {
-      entry.latestFallback = eventFallback;
+      entry.pendingFallback = eventFallback;
     }
     if (this.scheduledKeys.has(key)) return;
     this.scheduledKeys.add(key);
@@ -357,6 +407,29 @@ export class PillMetricsController {
     this.inFlightByMessage.set(msgKey, run);
   }
 
+  private fetchTailPage(
+    getMessages: GetMessagesFn,
+    chatId: string,
+    limit: number,
+  ): Promise<unknown> {
+    const cacheKey = `${chatId}:${limit}`;
+    const existing = this.inFlightTailReads.get(cacheKey);
+    if (existing) return existing;
+    let rawPromise: Promise<unknown>;
+    try {
+      rawPromise = Promise.resolve(getMessages(chatId, { limit, tail: true }));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const tracked = rawPromise.finally(() => {
+      if (this.inFlightTailReads.get(cacheKey) === tracked) {
+        this.inFlightTailReads.delete(cacheKey);
+      }
+    });
+    this.inFlightTailReads.set(cacheKey, tracked);
+    return tracked;
+  }
+
   private async flushKey(
     key: string,
     eventFallback: HostMessageShape | null,
@@ -365,8 +438,10 @@ export class PillMetricsController {
     const current = this.pending.get(key);
     if (!current) return;
     // Snapshot by value so concurrent deletedSwipeId shifts cannot mutate fields in-flight.
+    const resolvedFallback = current.pendingFallback ?? eventFallback;
+    // Clear transient fallback immediately so we never retain message payloads across idle waits.
+    current.pendingFallback = null;
     const snapshot: PendingMetricsEntry = { ...current };
-    const resolvedFallback = snapshot.latestFallback ?? eventFallback;
 
     const updateMessage = this.resolveUpdateMessage();
     if (!updateMessage) {
@@ -375,15 +450,53 @@ export class PillMetricsController {
     }
 
     let target: HostMessageShape | null = null;
-    const getMessages = this.resolveGetMessages();
 
-    if (getMessages) {
+    // 1. Use authoritative eventFallback directly when it already carries swipe_id and non-empty extra.
+    if (
+      isAuthoritativeFallback(
+        resolvedFallback,
+        snapshot.chatId,
+        snapshot.messageId,
+      )
+    ) {
+      target = resolvedFallback;
+    }
+
+    const getSingleMessage = target ? null : this.resolveGetSingleMessage();
+    const getMessages = target ? null : this.resolveGetMessages();
+
+    // 2. Try single-message lookup first when available (avoids fetching 50-200 tail messages).
+    if (!target && getSingleMessage) {
+      try {
+        const single = await getSingleMessage(snapshot.messageId);
+        if (this.destroyed) return;
+        if (
+          isRecord(single) &&
+          typeof single.id === "string" &&
+          single.id === snapshot.messageId &&
+          (typeof single.chat_id !== "string" || single.chat_id === snapshot.chatId)
+        ) {
+          target = single as unknown as HostMessageShape;
+        }
+      } catch (error) {
+        if (this.destroyed) return;
+        if (!getMessages) {
+          this.handleFlushFailure(key, snapshot, error);
+          return;
+        }
+        // Fall through to coalesced tail read when getMessages is available.
+      }
+    }
+
+    // 3. Fall back to per-chat coalesced tail reads when needed.
+    if (!target && getMessages) {
       let page: unknown;
       try {
-        page = await getMessages(snapshot.chatId, {
-          limit: MESSAGE_READ_LIMIT,
-          tail: true,
-        });
+        page = await this.fetchTailPage(
+          getMessages,
+          snapshot.chatId,
+          MESSAGE_READ_LIMIT,
+        );
       } catch (error) {
         if (this.destroyed) return;
         this.handleFlushFailure(key, snapshot, error);
@@ -402,56 +515,45 @@ export class PillMetricsController {
           return;
         }
 
-        const getSingleMessage = this.resolveGetSingleMessage();
-        if (getSingleMessage) {
-          try {
-            const single = await getSingleMessage(snapshot.messageId);
-            if (this.destroyed) return;
-            if (
-              isRecord(single) &&
-              typeof single.id === "string" &&
-              single.id === snapshot.messageId &&
-              (typeof single.chat_id !== "string" || single.chat_id === snapshot.chatId)
-            ) {
-              target = single as unknown as HostMessageShape;
-            }
-          } catch {
-            // Fall through to wider tail / fallback check
-          }
-        }
-
-        if (!target && truncated) {
-          try {
-            const widerPage = await getMessages(snapshot.chatId, {
-              limit: WIDER_MESSAGE_READ_LIMIT,
-              tail: true,
-            });
-            if (this.destroyed) return;
-            const widerMessages = extractMessageList(widerPage);
-            target = widerMessages.find((m) => m.id === snapshot.messageId) ?? null;
-            if (
-              !target &&
-              !isPageTruncated(widerPage, widerMessages.length, WIDER_MESSAGE_READ_LIMIT)
-            ) {
-              this.deleteIfSameRevision(key, snapshot.revision);
-              return;
-            }
-          } catch (error) {
-            if (this.destroyed) return;
-            this.handleFlushFailure(key, snapshot, error);
+        try {
+          const widerPage = await this.fetchTailPage(
+            getMessages,
+            snapshot.chatId,
+            WIDER_MESSAGE_READ_LIMIT,
+          );
+          if (this.destroyed) return;
+          const widerMessages = extractMessageList(widerPage);
+          target = widerMessages.find((m) => m.id === snapshot.messageId) ?? null;
+          if (
+            !target &&
+            !isPageTruncated(widerPage, widerMessages.length, WIDER_MESSAGE_READ_LIMIT)
+          ) {
+            this.deleteIfSameRevision(key, snapshot.revision);
             return;
           }
+        } catch (error) {
+          if (this.destroyed) return;
+          this.handleFlushFailure(key, snapshot, error);
+          return;
         }
 
         if (!target) {
-          // Tail read was truncated (or single-message read failed); keep queued for next event.
+          // Tail read was truncated; keep queued for next event.
           return;
         }
       }
-    } else if (resolvedFallback && resolvedFallback.id === snapshot.messageId) {
+    } else if (
+      !target &&
+      resolvedFallback &&
+      resolvedFallback.id === snapshot.messageId &&
+      (typeof resolvedFallback.chat_id !== "string" ||
+        resolvedFallback.chat_id === snapshot.chatId)
+    ) {
       target = resolvedFallback;
-    } else {
-      // Cannot verify swipe_id without getMessages or event message payload.
+    }
+
+    if (!target) {
+      // Cannot verify swipe_id without single-message lookup, getMessages, or event payload.
       return;
     }
 
@@ -464,8 +566,8 @@ export class PillMetricsController {
       return;
     }
     if (target.swipe_id !== snapshot.swipeId) {
-      // User is currently viewing a different swipe; cache latest known swipe and keep queued until swiped back.
-      latestBeforeWrite.latestFallback = target;
+      // User is currently viewing a different swipe; cache only swipe_id and keep queued until swiped back.
+      latestBeforeWrite.lastKnownSwipeId = target.swipe_id;
       return;
     }
 

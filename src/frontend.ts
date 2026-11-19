@@ -47,6 +47,13 @@ type FrontendContextWithHostExtensions = SpindleFrontendContext & {
   connections?: SpindleFrontendContext["connections"] & HostConnectionsDomainAPI;
 };
 
+const PENDING_RUN_ID_PREFIX = "pending:";
+const MAX_CHAT_STATUS_SEQ_ENTRIES = 200;
+
+function isPendingRunId(runId: string | null | undefined): boolean {
+  return typeof runId === "string" && runId.startsWith(PENDING_RUN_ID_PREFIX);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -137,6 +144,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   let destroyed = false;
   let seq = 0;
+  let pendingRunSeq = 0;
   let bootstrapSeq = 0;
   let settingsRevision = 0;
   let statusSeq = 0;
@@ -157,6 +165,26 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let impersonateDraftRetryAttempt = 0;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let composerAlertMount: Element | null = null;
+  let inFlightRefresh: Promise<void> | null = null;
+  let inFlightRefreshIncludeCatalogs = false;
+  let pendingFollowUpRefresh = false;
+  let pendingFollowUpOnlyIfChanged = true;
+  let pendingFollowUpIncludeCatalogs = false;
+  let lastChatSwitchKey: string | null = null;
+  let chatSwitchResetQueued = false;
+  let lastObservedActiveChatId: string | null = ctx.getActiveChat().chatId;
+
+  function setChatStatusSeq(chatId: string, seqValue: number): void {
+    if (chatStatusSeq.has(chatId)) {
+      chatStatusSeq.delete(chatId);
+    } else if (chatStatusSeq.size >= MAX_CHAT_STATUS_SEQ_ENTRIES) {
+      const oldestKey = chatStatusSeq.keys().next().value;
+      if (oldestKey !== undefined) {
+        chatStatusSeq.delete(oldestKey);
+      }
+    }
+    chatStatusSeq.set(chatId, seqValue);
+  }
 
   try {
     composerAlertMount = ctx.ui.mount("chat_composer_above");
@@ -192,6 +220,51 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       }
     }
     activeRun = latest;
+  }
+
+  function startPendingRun(
+    actionId: GuidedActionId,
+    chatId: string,
+    options?: { backgroundSwipe?: boolean },
+  ): ActiveRunState {
+    const pendingRun: ActiveRunState = {
+      runId: `${PENDING_RUN_ID_PREFIX}${++pendingRunSeq}`,
+      actionId,
+      chatId,
+      startedAt: Date.now(),
+      ...(options?.backgroundSwipe ? { backgroundSwipe: true } : {}),
+    };
+    statusSeq += 1;
+    setChatStatusSeq(chatId, statusSeq);
+    activeRunsByChat.set(chatId, pendingRun);
+    syncPrimaryActiveRun();
+    if (view) {
+      view = { ...view, activeRun };
+    }
+    const activeChatId = ctx.getActiveChat().chatId;
+    indicator.sync(getActiveRunForChat(activeChatId));
+    renderToolbar();
+    return pendingRun;
+  }
+
+  function clearPendingRun(chatId: string, pendingRunId: string): boolean {
+    const existing = activeRunsByChat.get(chatId);
+    if (!existing || existing.runId !== pendingRunId) {
+      return false;
+    }
+    statusSeq += 1;
+    setChatStatusSeq(chatId, statusSeq);
+    activeRunsByChat.delete(chatId);
+    syncPrimaryActiveRun();
+    if (view) {
+      view = { ...view, activeRun };
+    }
+    if (!destroyed) {
+      const activeChatId = ctx.getActiveChat().chatId;
+      indicator.sync(getActiveRunForChat(activeChatId));
+      renderToolbar();
+    }
+    return true;
   }
 
   function clearImpersonateDraftRetry(): void {
@@ -252,9 +325,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     if (state.text.trim().length > 0) {
       return;
     }
-    if (safeSetComposerText(draft)) {
+    if (safeSetComposerText(draft, state)) {
       pendingImpersonateDrafts.delete(chatId);
-      safeFocusComposer();
+      safeFocusComposer(state);
     }
   }
 
@@ -273,9 +346,13 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     return Boolean(state) && state!.mounted !== false;
   }
 
-  function safeSetComposerText(text: string): boolean {
+  function safeSetComposerText(
+    text: string,
+    precheckedState?: HostComposerState | null,
+  ): boolean {
     if (destroyed) return false;
-    const state = safeGetComposerState();
+    const state =
+      precheckedState !== undefined ? precheckedState : safeGetComposerState();
     if (!isComposerAvailable(state)) return false;
     try {
       ctx.composer.setText(text);
@@ -285,9 +362,12 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
   }
 
-  function safeFocusComposer(): boolean {
+  function safeFocusComposer(
+    precheckedState?: HostComposerState | null,
+  ): boolean {
     if (destroyed) return false;
-    const state = safeGetComposerState();
+    const state =
+      precheckedState !== undefined ? precheckedState : safeGetComposerState();
     if (!isComposerAvailable(state)) return false;
     try {
       ctx.composer.focus();
@@ -413,136 +493,191 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     syncRecoveryBusy();
   }
 
-  async function refresh(options: { onlyIfChanged?: boolean } = {}): Promise<void> {
+  async function refresh(
+    options: { onlyIfChanged?: boolean; includeCatalogs?: boolean } = {},
+  ): Promise<void> {
     if (destroyed) return;
     if (!drawerMounted && drawer.isTabConnected()) {
       drawerMounted = true;
       clearTabConnectionObserver();
       drawer.render(view);
     }
-    const includeCatalogs = drawerMounted;
-    const myBootstrapSeq = ++bootstrapSeq;
-    const startSettingsRevision = settingsRevision;
-    const startStatusSeq = statusSeq;
-    try {
-      const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap", {
-        includeCatalogs,
-      });
-      if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
-      const next = includeCatalogs
-        ? await withFrontendConnectionFallback(rawNext, ctx)
-        : rawNext;
-      if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
+    const drawerOpen = drawerMounted && drawer.isTabConnected();
+    const includeCatalogs =
+      options.includeCatalogs !== undefined
+        ? Boolean(options.includeCatalogs)
+        : drawerMounted && (!catalogsLoaded || drawerOpen);
 
-      const resolvedSettings =
-        view && settingsRevision !== startSettingsRevision
-          ? view.settings
-          : next.settings;
+    if (inFlightRefresh && (!includeCatalogs || inFlightRefreshIncludeCatalogs)) {
+      pendingFollowUpRefresh = true;
+      pendingFollowUpOnlyIfChanged =
+        pendingFollowUpOnlyIfChanged && Boolean(options.onlyIfChanged);
+      pendingFollowUpIncludeCatalogs =
+        pendingFollowUpIncludeCatalogs || includeCatalogs;
+      return inFlightRefresh;
+    }
 
-      const bootstrapRunsByChat = new Map<string, ActiveRunState>();
-      const bootstrapRuns = (
-        next as ExtensionBootstrapView & { activeRuns?: ActiveRunState[] }
-      ).activeRuns;
-      if (Array.isArray(bootstrapRuns)) {
-        for (const r of bootstrapRuns) {
-          if (r && typeof r.chatId === "string" && r.chatId.length > 0) {
-            bootstrapRunsByChat.set(r.chatId, r);
-          }
-        }
-      }
-      if (
-        next.activeRun &&
-        typeof next.activeRun.chatId === "string" &&
-        next.activeRun.chatId.length > 0
-      ) {
-        bootstrapRunsByChat.set(next.activeRun.chatId, next.activeRun);
-      }
+    let runPromise!: Promise<void>;
+    runPromise = (async () => {
+      const myBootstrapSeq = ++bootstrapSeq;
+      const startSettingsRevision = settingsRevision;
+      const startStatusSeq = statusSeq;
+      try {
+        const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap", {
+          includeCatalogs,
+        });
+        if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
+        const next = includeCatalogs
+          ? await withFrontendConnectionFallback(rawNext, ctx)
+          : rawNext;
+        if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
 
-      if (statusSeq === startStatusSeq) {
-        activeRunsByChat.clear();
-        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
-          activeRunsByChat.set(chatId, run);
-        }
-      } else if (globalClearSeq <= startStatusSeq) {
-        for (const chatId of [...activeRunsByChat.keys()]) {
-          if ((chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq) {
-            const refreshedRun = bootstrapRunsByChat.get(chatId);
-            if (refreshedRun) {
-              activeRunsByChat.set(chatId, refreshedRun);
-            } else {
-              activeRunsByChat.delete(chatId);
+        const resolvedSettings =
+          view && settingsRevision !== startSettingsRevision
+            ? view.settings
+            : next.settings;
+
+        const bootstrapRunsByChat = new Map<string, ActiveRunState>();
+        const bootstrapRuns = (
+          next as ExtensionBootstrapView & { activeRuns?: ActiveRunState[] }
+        ).activeRuns;
+        if (Array.isArray(bootstrapRuns)) {
+          for (const r of bootstrapRuns) {
+            if (r && typeof r.chatId === "string" && r.chatId.length > 0) {
+              bootstrapRunsByChat.set(r.chatId, r);
             }
           }
         }
-        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
-          if (
-            !activeRunsByChat.has(chatId) &&
-            (chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq
-          ) {
+        if (
+          next.activeRun &&
+          typeof next.activeRun.chatId === "string" &&
+          next.activeRun.chatId.length > 0
+        ) {
+          bootstrapRunsByChat.set(next.activeRun.chatId, next.activeRun);
+        }
+
+        const preservedPendingRuns = new Map<string, ActiveRunState>();
+        for (const [chatId, run] of activeRunsByChat.entries()) {
+          if (isPendingRunId(run.runId) && launchingChats.has(chatId)) {
+            preservedPendingRuns.set(chatId, run);
+          }
+        }
+
+        if (statusSeq === startStatusSeq) {
+          activeRunsByChat.clear();
+          for (const [chatId, run] of bootstrapRunsByChat.entries()) {
             activeRunsByChat.set(chatId, run);
           }
-        }
-      }
-
-      syncPrimaryActiveRun();
-      const resolvedActiveRun = activeRun;
-
-      const prevView = view;
-      const preserveLoadedCatalogs =
-        !includeCatalogs && catalogsLoaded && prevView !== null;
-      const mergedNext: ExtensionBootstrapView = {
-        ...next,
-        settings: resolvedSettings,
-        activeRun: resolvedActiveRun,
-        ...(preserveLoadedCatalogs
-          ? {
-              connections: prevView.connections,
-              presets: prevView.presets,
-              catalogWarnings: prevView.catalogWarnings,
+        } else if (globalClearSeq <= startStatusSeq) {
+          for (const chatId of [...activeRunsByChat.keys()]) {
+            if ((chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq) {
+              const refreshedRun = bootstrapRunsByChat.get(chatId);
+              if (refreshedRun) {
+                activeRunsByChat.set(chatId, refreshedRun);
+              } else {
+                activeRunsByChat.delete(chatId);
+              }
             }
-          : {}),
-      };
+          }
+          for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+            if (
+              !activeRunsByChat.has(chatId) &&
+              (chatStatusSeq.get(chatId) ?? 0) <= startStatusSeq
+            ) {
+              activeRunsByChat.set(chatId, run);
+            }
+          }
+        }
 
-      const isInitialCatalogLoad = includeCatalogs && !catalogsLoaded;
-      if (includeCatalogs) {
-        catalogsLoaded = true;
-      }
+        for (const [chatId, pendingRun] of preservedPendingRuns.entries()) {
+          if (!activeRunsByChat.has(chatId) && launchingChats.has(chatId)) {
+            activeRunsByChat.set(chatId, pendingRun);
+          }
+        }
 
-      const shouldDiffDrawer =
-        drawerMounted &&
-        Boolean(options.onlyIfChanged) &&
-        !isInitialCatalogLoad &&
-        prevView !== null;
+        syncPrimaryActiveRun();
+        const resolvedActiveRun = activeRun;
 
-      const coreUnchanged =
-        shouldDiffDrawer &&
-        areJsonValuesEqual(prevView.settings, mergedNext.settings) &&
-        areJsonValuesEqual(prevView.connections, mergedNext.connections) &&
-        areJsonValuesEqual(prevView.presets, mergedNext.presets) &&
-        areJsonValuesEqual(prevView.permissions, mergedNext.permissions) &&
-        areJsonValuesEqual(
-          prevView.catalogWarnings ?? [],
-          mergedNext.catalogWarnings ?? [],
+        const prevView = view;
+        const preserveLoadedCatalogs =
+          !includeCatalogs && catalogsLoaded && prevView !== null;
+        const mergedNext: ExtensionBootstrapView = {
+          ...next,
+          settings: resolvedSettings,
+          activeRun: resolvedActiveRun,
+          ...(preserveLoadedCatalogs
+            ? {
+                connections: prevView.connections,
+                presets: prevView.presets,
+                catalogWarnings: prevView.catalogWarnings,
+              }
+            : {}),
+        };
+
+        const isInitialCatalogLoad = includeCatalogs && !catalogsLoaded;
+        if (includeCatalogs) {
+          catalogsLoaded = true;
+        }
+
+        const shouldDiffDrawer =
+          drawerMounted &&
+          Boolean(options.onlyIfChanged) &&
+          !isInitialCatalogLoad &&
+          prevView !== null;
+
+        const coreUnchanged =
+          shouldDiffDrawer &&
+          areJsonValuesEqual(prevView.settings, mergedNext.settings) &&
+          areJsonValuesEqual(prevView.connections, mergedNext.connections) &&
+          areJsonValuesEqual(prevView.presets, mergedNext.presets) &&
+          areJsonValuesEqual(prevView.permissions, mergedNext.permissions) &&
+          areJsonValuesEqual(
+            prevView.catalogWarnings ?? [],
+            mergedNext.catalogWarnings ?? [],
+          );
+
+        view = mergedNext;
+        activeRun = resolvedActiveRun;
+        const currentChatId = ctx.getActiveChat().chatId;
+        indicator.sync(getActiveRunForChat(currentChatId));
+        chatHeads.syncRuns(
+          Array.from(activeRunsByChat.values()).filter((r) => !isPendingRunId(r.runId)),
+          currentChatId,
         );
-
-      view = mergedNext;
-      activeRun = resolvedActiveRun;
-      const currentChatId = ctx.getActiveChat().chatId;
-      indicator.sync(getActiveRunForChat(currentChatId));
-      chatHeads.syncRuns(activeRunsByChat.values(), currentChatId);
-      if (drawerMounted) {
-        if (!coreUnchanged) {
-          drawer.render(view);
-        } else if (!areJsonValuesEqual(prevView!.recovery, mergedNext.recovery)) {
-          drawer.updateRecovery(view.recovery, view.settings);
+        if (drawerMounted) {
+          if (!coreUnchanged) {
+            drawer.render(view);
+          } else if (!areJsonValuesEqual(prevView!.recovery, mergedNext.recovery)) {
+            drawer.updateRecovery(view.recovery, view.settings);
+          }
+        }
+        renderToolbar();
+      } catch (error) {
+        if (destroyed) return;
+        const msg = error instanceof Error ? error.message : String(error);
+        showBanner(msg, "error");
+      } finally {
+        if (inFlightRefresh === runPromise) {
+          inFlightRefresh = null;
+          inFlightRefreshIncludeCatalogs = false;
+          if (pendingFollowUpRefresh && !destroyed) {
+            const followUpOnlyIfChanged = pendingFollowUpOnlyIfChanged;
+            const followUpIncludeCatalogs = pendingFollowUpIncludeCatalogs;
+            pendingFollowUpRefresh = false;
+            pendingFollowUpOnlyIfChanged = true;
+            pendingFollowUpIncludeCatalogs = false;
+            void refresh({
+              onlyIfChanged: followUpOnlyIfChanged,
+              includeCatalogs: followUpIncludeCatalogs,
+            });
+          }
         }
       }
-      renderToolbar();
-    } catch (error) {
-      if (destroyed) return;
-      const msg = error instanceof Error ? error.message : String(error);
-      showBanner(msg, "error");
-    }
+    })();
+
+    inFlightRefresh = runPromise;
+    inFlightRefreshIncludeCatalogs = includeCatalogs;
+    return runPromise;
   }
 
   async function triggerAction(
@@ -625,21 +760,26 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       }
 
       const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
+      const isBackgroundSwipe =
+        actionId === "guided_swipe" && Boolean(options?.backgroundSwipe);
       const payload: RunActionInput = {
         actionId,
         chatId,
         activeConnectionId,
         inputText,
-        ...(actionId === "guided_swipe" && options?.backgroundSwipe
-          ? { backgroundSwipe: true }
-          : {}),
+        ...(isBackgroundSwipe ? { backgroundSwipe: true } : {}),
       };
+
+      const pendingRun = startPendingRun(actionId, chatId, {
+        backgroundSwipe: isBackgroundSwipe,
+      });
 
       try {
         // Streaming generations may take longer than default 30s.
         await rpc("run_action", payload, 300_000);
         if (destroyed) return;
       } catch (error) {
+        clearPendingRun(chatId, pendingRun.runId);
         if (destroyed) return;
         // Restore cleared input only when no backend run is still active for this chat,
         // the same chat & composer are still mounted, and the user hasn't typed.
@@ -657,6 +797,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         }
         const msg = error instanceof Error ? error.message : String(error);
         showBanner(msg, "error", 7_000);
+      } finally {
+        clearPendingRun(chatId, pendingRun.runId);
       }
     } finally {
       isPreChatLaunching = false;
@@ -771,10 +913,11 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
     if (isChatBusy(chatId)) return;
     launchingChats.add(chatId);
-    syncRecoveryBusy();
     pendingImpersonateDrafts.delete(chatId);
+    let pendingRun: ActiveRunState | null = null;
     try {
       clearBanner();
+      pendingRun = startPendingRun("guided_continue", chatId);
       const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
       const payload: RegenerateContinueInput = {
         chatId,
@@ -782,10 +925,16 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       };
       await rpc("regenerate_last_continue", payload, 300_000);
     } catch (error) {
+      if (pendingRun) {
+        clearPendingRun(chatId, pendingRun.runId);
+      }
       if (destroyed) return;
       const msg = error instanceof Error ? error.message : String(error);
       showBanner(msg, "error", 7_000);
     } finally {
+      if (pendingRun) {
+        clearPendingRun(chatId, pendingRun.runId);
+      }
       launchingChats.delete(chatId);
       syncRecoveryBusy();
     }
@@ -830,6 +979,18 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     },
     onAbortAction: (runId) => {
       if (destroyed) return;
+      if (isPendingRunId(runId)) {
+        const activeChatId = ctx.getActiveChat().chatId;
+        const pendingRun =
+          (activeChatId ? activeRunsByChat.get(activeChatId) : undefined) ??
+          Array.from(activeRunsByChat.values()).find((r) => r.runId === runId);
+        const targetChatId = pendingRun?.chatId ?? activeChatId;
+        if (targetChatId) {
+          clearPendingRun(targetChatId, runId);
+          void rpc("abort_action", { chatId: targetChatId }).catch(() => undefined);
+        }
+        return;
+      }
       void rpc("abort_action", { runId }).catch(() => undefined);
     },
     onRestoreLatest: () => {
@@ -862,7 +1023,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     onRefresh: () => {
       if (destroyed) return;
       clearBanner();
-      void refresh();
+      void refresh({ includeCatalogs: true });
     },
     onSaveSettings: async (nextSettings: GuidedGenerationsSettings, options) => {
       if (destroyed || !view) return;
@@ -906,7 +1067,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       drawerMounted = true;
       drawer.render(view);
     }
-    void refresh({ onlyIfChanged: catalogsLoaded });
+    void refresh({ onlyIfChanged: catalogsLoaded, includeCatalogs: true });
   }
 
   if (!drawerMounted) {
@@ -921,15 +1082,28 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   function handleActiveChatChanged(metricsChatId?: string | null): void {
     if (destroyed) return;
     const activeChatId = ctx.getActiveChat().chatId;
+    const effectiveMetricsChatId =
+      metricsChatId !== undefined ? metricsChatId : activeChatId;
+    const dedupeKey = `${activeChatId ?? ""}\0${effectiveMetricsChatId ?? ""}`;
+    if (dedupeKey === lastChatSwitchKey) {
+      return;
+    }
+    lastChatSwitchKey = dedupeKey;
+    lastObservedActiveChatId = activeChatId;
+    if (!chatSwitchResetQueued) {
+      chatSwitchResetQueued = true;
+      queueMicrotask(() => {
+        chatSwitchResetQueued = false;
+        lastChatSwitchKey = null;
+      });
+    }
     clearImpersonateDraftRetry();
     syncPrimaryActiveRun();
     indicator.sync(getActiveRunForChat(activeChatId));
     chatHeads.onChatChanged(activeChatId);
     renderToolbar();
     applyPendingImpersonateDraft(activeChatId);
-    pillMetrics.onChatChanged(
-      metricsChatId !== undefined ? metricsChatId : activeChatId,
-    );
+    pillMetrics.onChatChanged(effectiveMetricsChatId);
   }
 
   disposers.push(
@@ -960,6 +1134,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       switch (event.type) {
         case "gg:status": {
           statusSeq += 1;
+          const activeChatId = ctx.getActiveChat().chatId;
+          const prevActiveChatRun = getActiveRunForChat(activeChatId);
           const eventChatId =
             typeof event.chatId === "string" && event.chatId.length > 0
               ? event.chatId
@@ -980,7 +1156,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               hasTerminalSignal
             ) {
               activeRunsByChat.delete(eventChatId);
-              chatStatusSeq.set(eventChatId, statusSeq);
+              setChatStatusSeq(eventChatId, statusSeq);
               if (
                 (prevEventChatRun !== undefined &&
                   prevEventChatRun.actionId !== "guided_impersonate") ||
@@ -998,10 +1174,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
                 pendingImpersonateDrafts.delete(event.run.chatId);
               }
               activeRunsByChat.set(event.run.chatId, event.run);
-              chatStatusSeq.set(event.run.chatId, statusSeq);
+              setChatStatusSeq(event.run.chatId, statusSeq);
             } else {
               activeRunsByChat.delete(event.run.chatId);
-              chatStatusSeq.set(event.run.chatId, statusSeq);
+              setChatStatusSeq(event.run.chatId, statusSeq);
               if (
                 event.run.actionId !== "guided_impersonate" ||
                 event.aborted ||
@@ -1012,7 +1188,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             }
           } else if (eventChatId) {
             activeRunsByChat.delete(eventChatId);
-            chatStatusSeq.set(eventChatId, statusSeq);
+            setChatStatusSeq(eventChatId, statusSeq);
             if (
               (prevEventChatRun !== undefined &&
                 prevEventChatRun.actionId !== "guided_impersonate") ||
@@ -1036,10 +1212,19 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               activeRun,
             };
           }
-          const activeChatId = ctx.getActiveChat().chatId;
-          indicator.sync(getActiveRunForChat(activeChatId));
+          const nextActiveChatRun = getActiveRunForChat(activeChatId);
+          const activeChatAffected =
+            prevActiveChatRun !== nextActiveChatRun ||
+            (activeChatId !== null &&
+              (eventChatId === activeChatId || event.run?.chatId === activeChatId)) ||
+            (!eventChatId && !event.run);
+          if (activeChatAffected) {
+            indicator.sync(nextActiveChatRun);
+          }
           chatHeads.handleStatusEvent(event, activeChatId);
-          renderToolbar();
+          if (activeChatAffected) {
+            renderToolbar();
+          }
           if (event.error) {
             showBanner(event.error, "error", 7_000);
           }
@@ -1054,7 +1239,6 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               (activeRunsByChat.size === 1
                 ? Array.from(activeRunsByChat.values())[0]!.chatId
                 : activeRun?.chatId ?? null);
-            const state = safeGetComposerState();
             const activeChatId = ctx.getActiveChat().chatId;
             if (expectedChatId !== null && expectedChatId !== activeChatId) {
               if (event.done && !event.aborted && event.text.length > 0) {
@@ -1062,6 +1246,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               }
               return;
             }
+            const state = safeGetComposerState();
             if (
               !isComposerAvailable(state) ||
               !activeChatId ||
@@ -1080,10 +1265,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               }
               return;
             }
-            if (safeSetComposerText(event.text)) {
+            if (safeSetComposerText(event.text, state)) {
               pendingImpersonateDrafts.delete(activeChatId);
               if (event.done) {
-                safeFocusComposer();
+                safeFocusComposer(state);
               }
             } else if (event.done && !event.aborted && event.text.length > 0) {
               pendingImpersonateDrafts.set(activeChatId, event.text);
@@ -1139,7 +1324,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       const deletedChatId = extractDeletedChatIdFromPayload(payload);
       if (!deletedChatId) return;
       statusSeq += 1;
-      chatStatusSeq.set(deletedChatId, statusSeq);
+      setChatStatusSeq(deletedChatId, statusSeq);
       activeRunsByChat.delete(deletedChatId);
       pendingImpersonateDrafts.delete(deletedChatId);
       if (impersonateDraftRetryChatId === deletedChatId) {
@@ -1173,7 +1358,13 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   if (ctx.connections?.subscribe) {
     disposers.push(
       ctx.connections.subscribe(() => {
-        if (!destroyed && drawerMounted) void refresh({ onlyIfChanged: true });
+        if (!destroyed && drawerMounted) {
+          if (drawer.isTabConnected() || !catalogsLoaded) {
+            void refresh({ onlyIfChanged: true, includeCatalogs: true });
+          } else {
+            catalogsLoaded = false;
+          }
+        }
       }),
     );
   }
@@ -1183,6 +1374,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     if (ctx.state) {
       disposers.push(
         ctx.state.subscribe("chat.active", () => {
+          const nextChatId = ctx.getActiveChat().chatId;
+          if (nextChatId === lastObservedActiveChatId) return;
           handleActiveChatChanged();
         }),
       );
@@ -1214,6 +1407,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       // Ignore flush errors on teardown
     }
     destroyed = true;
+    inFlightRefresh = null;
+    inFlightRefreshIncludeCatalogs = false;
+    pendingFollowUpRefresh = false;
     clearImpersonateDraftRetry();
     if (noticeTimer) {
       clearTimeout(noticeTimer);

@@ -75,9 +75,30 @@ interface RecoverySectionUi {
   clearBtn: HTMLButtonElement;
   body: HTMLDivElement;
   listEl: HTMLDivElement | null;
+  entries: readonly RecoveryEntry[];
   maxEntries: number;
   recoveryCount: number;
 }
+
+const ROLE_SELECT_OPTIONS: SpindleSelectOption[] = [
+  { value: "system", label: "System" },
+  { value: "user", label: "User" },
+  { value: "assistant", label: "Assistant" },
+];
+
+const TOOLBAR_PLACEMENT_SELECT_OPTIONS: SpindleSelectOption[] =
+  TOOLBAR_PLACEMENT_OPTIONS.map((opt) => ({
+    value: opt.value,
+    label: opt.label,
+    sublabel: opt.sublabel,
+  }));
+
+const GUIDANCE_POSITION_SELECT_OPTIONS: SpindleSelectOption[] =
+  GUIDANCE_POSITION_OPTIONS.map((opt) => ({
+    value: opt.value,
+    label: opt.label,
+    sublabel: opt.sublabel,
+  }));
 
 export class SettingsDrawerController {
   private readonly tab: SpindleDrawerTabHandle;
@@ -534,11 +555,6 @@ export class SettingsDrawerController {
 
     const connectionOptions = buildConnectionOptions(effectiveView.connections);
     const presetOptions = buildPresetOptions(effectiveView.presets);
-    const roleOptions: SpindleSelectOption[] = [
-      { value: "system", label: "System" },
-      { value: "user", label: "User" },
-      { value: "assistant", label: "Assistant" },
-    ];
 
     this.renderToolbarLayoutSection(root, effectiveView.settings);
 
@@ -550,7 +566,7 @@ export class SettingsDrawerController {
         effectiveView.connections,
         connectionOptions,
         presetOptions,
-        roleOptions,
+        ROLE_SELECT_OPTIONS,
       );
     }
 
@@ -732,11 +748,7 @@ export class SettingsDrawerController {
     body.append(placementField.wrap);
     this.handles.push(
       this.ctx.components.mountSelect(placementField.slot, {
-        options: TOOLBAR_PLACEMENT_OPTIONS.map((opt) => ({
-          value: opt.value,
-          label: opt.label,
-          sublabel: opt.sublabel,
-        })),
+        options: TOOLBAR_PLACEMENT_SELECT_OPTIONS,
         value: placement,
         ariaLabel: "Toolbar Bar Placement",
         onChange: (val) => {
@@ -1074,11 +1086,7 @@ export class SettingsDrawerController {
     body.append(positionField.wrap, depthField.wrap);
     this.handles.push(
       this.ctx.components.mountSelect(positionField.slot, {
-        options: GUIDANCE_POSITION_OPTIONS.map((opt) => ({
-          value: opt.value,
-          label: opt.label,
-          sublabel: opt.sublabel,
-        })),
+        options: GUIDANCE_POSITION_SELECT_OPTIONS,
         value: initialPosition,
         ariaLabel: `${meta.label} Guidance Position`,
         onChange: (val) => {
@@ -1377,6 +1385,7 @@ export class SettingsDrawerController {
       clearBtn,
       body,
       listEl: null,
+      entries: [],
       maxEntries: settings.inputRecovery.maxEntries,
       recoveryCount: recovery.length,
     };
@@ -1385,17 +1394,55 @@ export class SettingsDrawerController {
   }
 
   private syncRecoveryList(recovery: readonly RecoveryEntry[]): void {
-    if (!this.recoveryUi) return;
-    if (this.recoveryUi.listEl) {
-      this.recoveryUi.listEl.remove();
-      this.recoveryUi.listEl = null;
+    const ui = this.recoveryUi;
+    if (!ui) return;
+
+    if (recovery.length === 0) {
+      ui.entries = [];
+      if (ui.listEl) {
+        ui.listEl.remove();
+        ui.listEl = null;
+      }
+      return;
     }
 
-    if (recovery.length === 0) return;
+    if (
+      ui.listEl &&
+      ui.entries.length === recovery.length &&
+      ui.entries.every((prev, idx) => {
+        const next = recovery[idx]!;
+        return (
+          prev.id === next.id &&
+          prev.text === next.text &&
+          prev.actionId === next.actionId
+        );
+      })
+    ) {
+      return;
+    }
 
-    const list = document.createElement("div");
-    list.className = "gg-recovery-list";
-    for (const entry of recovery) {
+    ui.entries = [...recovery];
+
+    let list = ui.listEl;
+    if (!list) {
+      list = document.createElement("div");
+      list.className = "gg-recovery-list";
+      list.addEventListener("click", (event) => {
+        const target = event.target as Element | null;
+        const btn = target?.closest<HTMLButtonElement>("button[data-gg-recovery-index]");
+        if (!btn || btn.disabled) return;
+        const idx = Number(btn.dataset.ggRecoveryIndex);
+        const entry = Number.isInteger(idx) ? this.recoveryUi?.entries[idx] : undefined;
+        if (entry) {
+          this.handlers.onRestoreEntry(entry);
+        }
+      });
+      ui.listEl = list;
+      ui.body.append(list);
+    }
+
+    const fragment = document.createDocumentFragment();
+    recovery.forEach((entry, index) => {
       const row = document.createElement("div");
       row.className = "gg-recovery-item";
 
@@ -1418,20 +1465,19 @@ export class SettingsDrawerController {
       const restoreBtn = document.createElement("button");
       restoreBtn.type = "button";
       restoreBtn.className = "gg-btn-sm";
+      restoreBtn.dataset.ggRecoveryIndex = String(index);
       restoreBtn.textContent = "Restore";
       restoreBtn.disabled = this.recoveryBusy;
       restoreBtn.setAttribute(
         "aria-label",
         `Restore ${actionLabel} draft: ${formatRecoverySnippet(entry.text, 40)}`,
       );
-      restoreBtn.addEventListener("click", () => this.handlers.onRestoreEntry(entry));
 
       row.append(meta, restoreBtn);
-      list.append(row);
-    }
+      fragment.append(row);
+    });
 
-    this.recoveryUi.listEl = list;
-    this.recoveryUi.body.append(list);
+    list.replaceChildren(fragment);
   }
 
   private attachSlotInputAttributes(
@@ -1579,19 +1625,31 @@ function isClickableInside(root: Element, node: Node | null): boolean {
   );
 }
 
-function findElementByAttribute(
+function escapeCssAttrValue(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(value);
+  }
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export function findElementByAttribute(
   root: HTMLElement,
   attrName: string,
   attrValue: string,
   tagName?: string,
 ): HTMLElement | null {
-  const selector = tagName ? tagName.toLowerCase() : "*";
-  for (const el of root.querySelectorAll<HTMLElement>(selector)) {
-    if (el.getAttribute(attrName) === attrValue) {
-      return el;
+  const tag = tagName ? tagName.toLowerCase() : "";
+  try {
+    const escaped = escapeCssAttrValue(attrValue);
+    return root.querySelector<HTMLElement>(`${tag}[${attrName}="${escaped}"]`);
+  } catch {
+    for (const el of root.querySelectorAll<HTMLElement>(`${tag}[${attrName}]`)) {
+      if (el.getAttribute(attrName) === attrValue) {
+        return el;
+      }
     }
+    return null;
   }
-  return null;
 }
 
 function getActiveConnectionId(ctx: SpindleFrontendContext): string | null {

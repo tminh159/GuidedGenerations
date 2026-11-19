@@ -458,4 +458,158 @@ describe("regex-processor", () => {
       '<font color="#ff0000">First paragraph</font>\r\n\r\nSecond paragraph',
     );
   });
+
+  test("applyRegexScripts blocks adjacent wildcard-class ReDoS patterns while allowing safe wildcards and disjoint alternations", async () => {
+    const catastrophicWildClass = makeScript({
+      id: "redos-wild-class",
+      find_regex: "[\\s\\S]+[\\s\\S]+!",
+      replace_string: "REPLACED",
+    });
+    const catastrophicMixedWild = makeScript({
+      id: "redos-mixed-wild",
+      find_regex: "[\\d\\D]*[\\w\\W]+!",
+      replace_string: "REPLACED",
+    });
+    const catastrophicOverlapAlt = makeScript({
+      id: "redos-overlap-alt",
+      find_regex: "(foo|foobar)+!",
+      replace_string: "REPLACED",
+    });
+
+    const input = "a".repeat(50);
+    expect(
+      await applyRegexScripts(
+        input,
+        [catastrophicWildClass, catastrophicMixedWild, catastrophicOverlapAlt],
+        "ai_output",
+        0,
+      ),
+    ).toBe(input);
+
+    // Non-adjacent wildcards separated by a literal or non-wildcard char class still execute
+    const safeWild = makeScript({
+      id: "safe-wild",
+      find_regex: "[\\s\\S]+:[\\s\\S]+",
+      replace_string: "OK",
+      flags: "",
+    });
+    expect(await applyRegexScripts("left:right", [safeWild], "ai_output", 0)).toBe("OK");
+
+    const safeNonWildSep = makeScript({
+      id: "safe-non-wild-sep",
+      find_regex: "[\\s\\S]+[^a-z][\\s\\S]+",
+      replace_string: "OK",
+      flags: "",
+    });
+    expect(await applyRegexScripts("abc1def", [safeNonWildSep], "ai_output", 0)).toBe("OK");
+
+    // Disjoint alternation branches inside a repeated group are allowed
+    const safeDisjointAlt = makeScript({
+      id: "safe-disjoint-alt",
+      find_regex: "(cat|dog|bird)+",
+      replace_string: "PETS",
+      flags: "g",
+    });
+    expect(await applyRegexScripts("catdog and bird", [safeDisjointAlt], "ai_output", 0)).toBe(
+      "PETS and PETS",
+    );
+  });
+
+  test("applyRegexScripts cached regexes safely reset lastIndex across repeated, concurrent async, and repeat_back calls", async () => {
+    const globalScript = makeScript({
+      id: "cached-g",
+      find_regex: "foo(\\d+)",
+      replace_string: "bar$1",
+      flags: "g",
+    });
+
+    // Repeated calls reuse cached RegExp without stale lastIndex
+    expect(await applyRegexScripts("foo1 foo2", [globalScript], "ai_output", 0)).toBe("bar1 bar2");
+    expect(await applyRegexScripts("foo3", [globalScript], "ai_output", 0)).toBe("bar3");
+    expect(await applyRegexScripts("foo4 foo5 foo6", [globalScript], "ai_output", 0)).toBe(
+      "bar4 bar5 bar6",
+    );
+
+    // Case-insensitive terminal-literal guard cached RegExp resets lastIndex properly
+    const ciTerminalScript = makeScript({
+      id: "cached-gi-terminal",
+      find_regex: "\\w+_MARKER",
+      replace_string: "HIT",
+      flags: "gi",
+    });
+    expect(
+      await applyRegexScripts("a_marker b_MARKER tail", [ciTerminalScript], "ai_output", 0),
+    ).toBe("HIT HIT tail");
+    expect(await applyRegexScripts("c_marker", [ciTerminalScript], "ai_output", 0)).toBe("HIT");
+
+    // Concurrent async calls sharing the same cached 'g' regex with async raw macro resolution
+    const rawAsyncScript = makeScript({
+      id: "cached-async-raw",
+      find_regex: "item(\\d+)",
+      replace_string: "{{wrap::$1}}",
+      flags: "g",
+      substitute_macros: "raw",
+    });
+    const asyncResolver = async (s: string) => {
+      await new Promise((r) => setTimeout(r, 1));
+      return s.replace(/\{\{wrap::(\d+)\}\}/g, "[$1]");
+    };
+    const [r1, r2] = await Promise.all([
+      applyRegexScripts("item1 item2 item3", [rawAsyncScript], "ai_output", 0, {
+        resolveMacros: asyncResolver,
+      }),
+      applyRegexScripts("item4 item5", [rawAsyncScript], "ai_output", 0, {
+        resolveMacros: asyncResolver,
+      }),
+    ]);
+    expect(r1).toBe("[1] [2] [3]");
+    expect(r2).toBe("[4] [5]");
+
+    // repeat_back with previousContent reuses cached regex cleanly across calls
+    const repeatBackScript = makeScript({
+      id: "cached-repeat-back",
+      find_regex: "\\[STATUS:[^\\]]+\\]",
+      replace_string: "{{match}}",
+      flags: "g",
+      metadata: { match_actions: ["repeat_back"], repeat_position: "end_nl" },
+    });
+    expect(
+      await applyRegexScripts("Current turn", [repeatBackScript], "ai_output", 0, {
+        previousContent: "Prev [STATUS:OK]",
+      }),
+    ).toBe("Current turn\n[STATUS:OK]");
+    expect(
+      await applyRegexScripts("Next turn", [repeatBackScript], "ai_output", 0, {
+        previousContent: "Prev [STATUS:READY]",
+      }),
+    ).toBe("Next turn\n[STATUS:READY]");
+  });
+
+  test("healFormattingArtifacts handles plain prose fast paths, many unclosed '<' tags in linear time, and mixed HTML/emphasis/math lines", () => {
+    // Plain prose with no special delimiters returns unchanged
+    const plain = "Just a normal paragraph with no formatting artifacts at all.\nSecond line.";
+    expect(healFormattingArtifacts(plain)).toBe(plain);
+
+    // Many unclosed '<' tokens with and without a quoted '>' at the end stay fast and accurate
+    const manyUnclosed = `${"<a ".repeat(2000)}* spaced *`;
+    expect(healFormattingArtifacts(manyUnclosed)).toBe(`${"<a ".repeat(2000)}*spaced*`);
+
+    const manyUnclosedWithQuotedGt = `${"<a ".repeat(2000)}" > * spaced *`;
+    expect(healFormattingArtifacts(manyUnclosedWithQuotedGt)).toBe(
+      `${"<a ".repeat(2000)}" > *spaced*`,
+    );
+
+    // Valid tag after an unclosed quote is still recognized as an HTML tag span
+    const tagAfterUnclosedQuote = '<a " <span title=" * keep * "> * heal * </span>';
+    expect(healFormattingArtifacts(tagAfterUnclosedQuote)).toBe(
+      '<a " <span title=" * keep * "> *heal* </span>',
+    );
+
+    // Mixed math runs, emphasis, and quotes on the same line
+    const mixedLine =
+      'Compute 2 * 3 * 4 then * whisper * and ** bold ** with " spaced " and <em data-x=" * keep * "> _ under _ </em>';
+    expect(healFormattingArtifacts(mixedLine)).toBe(
+      'Compute 2 * 3 * 4 then *whisper* and **bold** with "spaced" and <em data-x=" * keep * "> _under_ </em>',
+    );
+  });
 });

@@ -5467,10 +5467,15 @@ describe("frontend orchestration and safety", () => {
       fakeVisualViewport.dispatchEvent(new win.Event("resize"));
       expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
 
-      // (d) CSS includes coarse-pointer dismiss visibility, prefers-reduced-motion, and compositor pseudo-element animations
+      // (d) CSS includes coarse-pointer dismiss visibility, prefers-reduced-motion, static red running button (no pulse animation), and chat-head pseudo-element animation
       expect(GUIDED_GENERATIONS_CSS).toContain("@media (hover: none), (pointer: coarse)");
       expect(GUIDED_GENERATIONS_CSS).toContain("@media (prefers-reduced-motion: reduce)");
-      expect(GUIDED_GENERATIONS_CSS).toContain(".gg-btn.is-running::after");
+      expect(GUIDED_GENERATIONS_CSS).not.toContain(".gg-btn.is-running::after");
+      expect(GUIDED_GENERATIONS_CSS).not.toContain("@keyframes gg-pulse");
+      const runningBtnCss =
+        GUIDED_GENERATIONS_CSS.match(/(?:^|\n)\.gg-btn\.is-running\s*\{([^}]*)\}/)?.[1] ?? "";
+      expect(runningBtnCss).toContain("rgba(239, 68, 68");
+      expect(runningBtnCss).not.toContain("animation");
       expect(GUIDED_GENERATIONS_CSS).toContain(".gg-chat-head.is-running::after");
       const btnCss = GUIDED_GENERATIONS_CSS.match(/(?:^|\n)\.gg-btn\s*\{([^}]*)\}/)?.[1] ?? "";
       expect(btnCss).toContain("position: relative;");

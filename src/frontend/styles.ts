@@ -80,17 +80,6 @@ export const GUIDED_GENERATIONS_CSS = `
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35);
 }
 
-.gg-btn.is-running::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  border: 2px solid rgba(248, 113, 113, 0.45);
-  pointer-events: none;
-  will-change: transform, opacity;
-  animation: gg-pulse 1.3s ease-in-out infinite;
-}
-
 .gg-btn.is-dimmed,
 .gg-btn:disabled {
   opacity: 0.38;
@@ -107,17 +96,6 @@ export const GUIDED_GENERATIONS_CSS = `
 @media (max-width: 768px) {
   .gg-btn {
     width: 28px;
-  }
-}
-
-@keyframes gg-pulse {
-  0%, 100% {
-    transform: scale(1);
-    opacity: 0.75;
-  }
-  50% {
-    transform: scale(1.22);
-    opacity: 0;
   }
 }
 
@@ -841,7 +819,6 @@ export const GUIDED_GENERATIONS_CSS = `
 
 @media (prefers-reduced-motion: reduce) {
   .gg-btn,
-  .gg-btn.is-running::after,
   .gg-chat-head,
   .gg-chat-head.is-running::after,
   .gg-chat-head-dismiss,

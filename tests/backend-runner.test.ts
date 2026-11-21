@@ -7992,12 +7992,12 @@ describe("startup latency optimization regressions (backend)", () => {
     expect(continueRes.text).toBe("Start more");
     // No redundant getMessages between dryRun and rawStream start (reuses preTargetMessage)
     expect(countAtRawStreamStart).toBe(countAtDryRunEnd);
-    // Only 1 getMessages on chunk #1 (ensureTarget), NOT 2 back-to-back
-    expect(countAfterChunk1Flush).toBe(countAtRawStreamStart + 1);
-    // Total = 3 (pre-dryRun + ensureTarget + final refresh)
-    expect(continueGetMessagesCount).toBe(3);
+    // Zero getMessages on chunk #1 (reuses preTargetMessage without blocking first token)
+    expect(countAfterChunk1Flush).toBe(countAtRawStreamStart);
+    // Total = 2 (pre-dryRun + final refresh)
+    expect(continueGetMessagesCount).toBe(2);
 
-    // 2. guided_swipe: chunk #1 flush skips redundant back-to-back refresh after ensureTarget
+    // 2. guided_swipe: chunk #1 skips redundant getMessages (pendingSwipeSlotWrite just synced)
     let swipeGetMessagesCount = 0;
     let swipeCountAtRawStreamStart = 0;
     let swipeCountAfterChunk1Flush = 0;
@@ -8031,10 +8031,10 @@ describe("startup latency optimization regressions (backend)", () => {
     );
 
     expect(swipeRes.text).toBe("Fresh swipe");
-    // Only 1 getMessages on chunk #1 (ensureTarget), NOT 2 back-to-back
-    expect(swipeCountAfterChunk1Flush).toBe(swipeCountAtRawStreamStart + 1);
-    // Total = 4 (pre-dryRun + pendingSwipeSlotWrite + ensureTarget + final refresh)
-    expect(swipeGetMessagesCount).toBe(4);
+    // Zero getMessages on chunk #1 (pendingSwipeSlotWrite already synced swipeSession)
+    expect(swipeCountAfterChunk1Flush).toBe(swipeCountAtRawStreamStart);
+    // Total = 3 (pre-dryRun + pendingSwipeSlotWrite + final refresh)
+    expect(swipeGetMessagesCount).toBe(3);
   });
 
   test("guided_impersonate flushes intermediate chunks at ~40ms cadence instead of 120ms", async () => {
@@ -8281,8 +8281,8 @@ describe("streaming hot-loop optimizations (backend)", () => {
     expect(res.text).toBe("Start one two three");
     // Zero getMessages calls during the 120ms midstream flushes
     expect(countBeforeDone).toBe(countAfterChunk1);
-    // Total = 3 (pre-dryRun + ensureTarget on chunk #1 + final refresh)
-    expect(getMessagesCount).toBe(3);
+    // Total = 2 (pre-dryRun + final refresh; chunk #1 reuses preTargetMessage)
+    expect(getMessagesCount).toBe(2);
 
     // Midstream flushes omit swipes/swipe_id so sibling swipes are never clobbered midstream
     const midstreamPatches = harness.updateMessageCalls.slice(0, -1).map((c) => c.patch);
@@ -8360,5 +8360,386 @@ describe("streaming hot-loop optimizations (backend)", () => {
     } finally {
       globalThis.structuredClone = origStructuredClone;
     }
+  });
+});
+
+describe("bounded tail reads, startup parallelization, and concurrent native swipe safeguards", () => {
+  test("uses bounded tail getMessages options with automatic wider-tail and options-rejection fallback", async () => {
+    const observedOpts: Array<{ tail?: number; includeExtra?: boolean } | undefined> = [];
+    const msgs: ChatMessageWithRole[] = [
+      makeMessage({ id: "a-old", role: "assistant", content: "Old assistant", index_in_chat: 0 }),
+    ];
+    for (let i = 1; i <= 15; i += 1) {
+      msgs.push(makeMessage({ id: `u-${i}`, role: "user", content: `User ${i}`, index_in_chat: i }));
+    }
+
+    const harness = createSpindleHarness({
+      chats: { "chat-1": msgs },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: " continued" };
+        yield { type: "done", content: " continued", finish_reason: "stop" };
+      },
+    });
+
+    const origGet = harness.api.chat.getMessages;
+    (harness.api.chat as unknown as {
+      getMessages: (
+        chatId: string,
+        opts?: { tail?: number; includeExtra?: boolean },
+      ) => Promise<ChatMessageWithRole[]>;
+    }).getMessages = async (chatId, opts) => {
+      observedOpts.push(opts);
+      const all = await origGet(chatId);
+      if (opts?.tail !== undefined) {
+        return all.slice(-opts.tail);
+      }
+      return all;
+    };
+
+    const { runner } = registerBackend(harness.api);
+    const res = await runner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Keep going" },
+      "u1",
+    );
+
+    expect(res.aborted).toBe(false);
+    expect(res.messageId).toBe("a-old");
+    // First tries tail: 10, then widens to tail: 50 because a-old is 16 messages from the end
+    expect(observedOpts[0]).toEqual({ tail: 10, includeExtra: true });
+    expect(observedOpts[1]).toEqual({ tail: 50, includeExtra: true });
+
+    // Also verify fallback when an older host throws on the 2nd options argument
+    const fallbackHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Hi" }),
+          makeMessage({ id: "a1", role: "assistant", content: "Hello" }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: " there" };
+        yield { type: "done", content: " there", finish_reason: "stop" };
+      },
+    });
+    const origFallbackGet = fallbackHarness.api.chat.getMessages;
+    let rejectedOnce = false;
+    (fallbackHarness.api.chat as unknown as {
+      getMessages: (chatId: string, opts?: Record<string, unknown>) => Promise<ChatMessageWithRole[]>;
+    }).getMessages = async (chatId, opts) => {
+      if (opts !== undefined) {
+        rejectedOnce = true;
+        throw new Error("Unexpected options arg");
+      }
+      return origFallbackGet(chatId);
+    };
+
+    const { runner: fallbackRunner } = registerBackend(fallbackHarness.api);
+    const fallbackRes = await fallbackRunner.run(
+      { actionId: "guided_continue", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+    expect(rejectedOnce).toBe(true);
+    expect(fallbackRes.text).toBe("Hello there");
+  });
+
+  test("uses connections.get fast path, launches dryRun in parallel with metadata, reuses preset blocks, and does not block on characters.get", async () => {
+    const connGetCalls: Array<{ id: string; userId?: string }> = [];
+    let blocksListCalls = 0;
+    let releaseCharacter!: () => void;
+    const characterGate = new Promise<void>((resolve) => {
+      releaseCharacter = resolve;
+    });
+    let rawStreamStartedWhileCharacterPending = false;
+    let characterResolved = false;
+
+    let releaseChatsGet!: () => void;
+    const chatsGetGate = new Promise<void>((resolve) => {
+      releaseChatsGet = resolve;
+    });
+    let dryRunStartedBeforeChatsGetDone = false;
+    let chatsGetDone = false;
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hello" })],
+      },
+      chatCharacterIds: { "chat-1": "char-1" },
+      presets: {
+        "p-custom": {
+          id: "p-custom",
+          name: "Custom Preset",
+          prompt_order: [
+            {
+              identifier: "sys",
+              name: "System",
+              role: "system",
+              position: "pre_history",
+              enabled: true,
+              content: "Sys",
+            } as unknown as PromptBlockSnapshotDTO,
+          ],
+        },
+      },
+      dryRunImpl: async () => {
+        if (!chatsGetDone) {
+          dryRunStartedBeforeChatsGetDone = true;
+        }
+        return {
+          messages: [
+            { role: "system", content: "Sys" },
+            { role: "user", content: "Hello" },
+          ],
+          request_messages: [
+            { role: "system", content: "Sys" },
+            { role: "user", content: "Hello" },
+          ],
+          parameters: {},
+          model: "gpt-4o",
+          provider: "openai",
+        };
+      },
+      rawStreamImpl: async function* () {
+        if (!characterResolved) {
+          rawStreamStartedWhileCharacterPending = true;
+        }
+        yield { type: "token", token: "Fast!" };
+        yield { type: "done", content: "Fast!", finish_reason: "stop" };
+      },
+    });
+
+    (harness.api.connections as unknown as {
+      get: (id: string, userId?: string) => Promise<Record<string, unknown> | null>;
+    }).get = async (id, userId) => {
+      connGetCalls.push({ id, userId });
+      return id === "conn-1"
+        ? { id: "conn-1", name: "Primary", provider: "openai", model: "gpt-4o", is_default: true }
+        : null;
+    };
+
+    const origChatsGet = harness.api.chats.get;
+    harness.api.chats.get = async (chatId, userId) => {
+      await chatsGetGate;
+      chatsGetDone = true;
+      return origChatsGet(chatId, userId);
+    };
+
+    (harness.api as unknown as {
+      characters: { get: (id: string) => Promise<{ id: string; name: string }> };
+    }).characters = {
+      get: async (id) => {
+        await characterGate;
+        characterResolved = true;
+        return { id, name: "Slow Char" };
+      },
+    };
+
+    const origBlocksList = harness.api.presets.blocks.list;
+    harness.api.presets.blocks.list = async (id, userId) => {
+      blocksListCalls += 1;
+      return origBlocksList(id, userId);
+    };
+
+    const store = new SettingsStore(harness.api);
+    const settings = createDefaultSettings();
+    settings.actions.guided_response.presetId = "p-custom";
+    await store.saveSettings(settings, "u1");
+
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+    const runPromise = runner.run(
+      {
+        actionId: "guided_response",
+        chatId: "chat-1",
+        activeConnectionId: "conn-1",
+        inputText: "Respond fast",
+      },
+      "u1",
+    );
+
+    // Let dryRun kick off while chats.get is still pending
+    await new Promise((r) => setTimeout(r, 10));
+    releaseChatsGet();
+
+    const res = await runPromise;
+    releaseCharacter();
+
+    expect(res.text).toBe("Fast!");
+    expect(connGetCalls).toEqual([{ id: "conn-1", userId: "u1" }]);
+    expect(harness.connectionListCalls).toHaveLength(0);
+    expect(dryRunStartedBeforeChatsGetDone).toBe(true);
+    expect(rawStreamStartedWhileCharacterPending).toBe(true);
+    expect(blocksListCalls).toBe(0);
+    runner.dispose();
+  });
+
+  test("concurrent native + guided swipe: suppresses midstream swipes[] clobber, waits for GENERATION_ENDED before final flush, prevents index collision, and supports abort/dispose", async () => {
+    const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Scenario A: Native swipe (slot 1) is active while guided swipe (slot 2) runs & finishes first.
+    // GG must suppress midstream swipes[] writes while native is active and wait for GENERATION_ENDED
+    // so native's committed swipes[1] is never overwritten back to "".
+    let releaseGuidedDone!: () => void;
+    const guidedDoneGate = new Promise<void>((resolve) => {
+      releaseGuidedDone = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "",
+            swipes: ["Original", ""],
+            swipe_id: 1,
+            swipe_dates: [100, 200],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Guided part 1" };
+        await waitMs(135);
+        yield { type: "token", token: " + part 2" };
+        await guidedDoneGate;
+        yield { type: "done", content: "Guided part 1 + part 2", finish_reason: "stop" };
+      },
+    });
+
+    const { runner } = registerBackend(harness.api);
+
+    // Native swipe starts on a1 slot 1
+    harness.triggerEvent("GENERATION_STARTED", {
+      generationId: "native-gen-1",
+      chatId: "chat-1",
+      targetMessageId: "a1",
+      targetSwipeId: 1,
+      generationType: "swipe",
+    });
+
+    const guidedPromise = runner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+
+    // Wait for pendingSwipeSlotWrite (slot 2) + midstream window to pass
+    while (harness.updateMessageCalls.length < 1) {
+      await waitMs(5);
+    }
+    await waitMs(160);
+    // Only the initial slot creation write should have happened; midstream swipes[] flushes suppressed while native is active
+    expect(harness.updateMessageCalls.length).toBe(1);
+
+    // Guided stream finishes BEFORE native finishes -> GG must wait for GENERATION_ENDED
+    releaseGuidedDone();
+    await waitMs(30);
+    expect(harness.updateMessageCalls.length).toBe(1);
+
+    // Native swipe commits its text to DB and emits GENERATION_ENDED
+    const msg = harness.chatMessages.get("chat-1")![1]!;
+    msg.swipes[1] = "Native swipe full text";
+    harness.triggerEvent("GENERATION_ENDED", {
+      generationId: "native-gen-1",
+      chatId: "chat-1",
+      messageId: "a1",
+      content: "Native swipe full text",
+    });
+
+    const res = await guidedPromise;
+    expect(res.aborted).toBe(false);
+    expect(res.swipeId).toBe(2);
+    expect(msg.swipes).toEqual([
+      "Original",
+      "Native swipe full text",
+      "Guided part 1 + part 2",
+    ]);
+
+    // Scenario B: Index collision prevention when GENERATION_STARTED arrives with targetSwipeId=1
+    // before swipes[1] is visible in getMessages.
+    const collisionHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "Original",
+            swipes: ["Original"],
+            swipe_id: 0,
+            swipe_dates: [100],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Guided non-colliding" };
+        yield { type: "done", content: "Guided non-colliding", finish_reason: "stop" };
+      },
+    });
+    const { runner: collisionRunner } = registerBackend(collisionHarness.api);
+    collisionHarness.triggerEvent("GENERATION_STARTED", {
+      generationId: "native-gen-2",
+      chatId: "chat-1",
+      targetMessageId: "a1",
+      targetSwipeId: 1,
+      generationType: "swipe",
+    });
+
+    const collisionPromise = collisionRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await waitMs(30);
+    const colMsg = collisionHarness.chatMessages.get("chat-1")![1]!;
+    colMsg.swipes[1] = "Native slot 1";
+    collisionHarness.triggerEvent("GENERATION_ENDED", {
+      generationId: "native-gen-2",
+      chatId: "chat-1",
+      messageId: "a1",
+    });
+
+    const colRes = await collisionPromise;
+    expect(colRes.swipeId).toBe(2);
+    expect(colMsg.swipes).toEqual(["Original", "Native slot 1", "Guided non-colliding"]);
+
+    // Scenario C: Aborting while waiting on an active native generation unblocks immediately
+    const abortHarness = createSpindleHarness({
+      chats: {
+        "chat-1": [
+          makeMessage({ id: "u1", role: "user", content: "Prompt" }),
+          makeMessage({
+            id: "a1",
+            role: "assistant",
+            content: "",
+            swipes: ["Original", ""],
+            swipe_id: 1,
+            swipe_dates: [100, 200],
+          }),
+        ],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "Partial" };
+        yield { type: "done", content: "Partial", finish_reason: "stop" };
+      },
+    });
+    const { runner: abortRunner } = registerBackend(abortHarness.api);
+    abortHarness.triggerEvent("GENERATION_STARTED", {
+      generationId: "native-gen-stuck",
+      chatId: "chat-1",
+      targetMessageId: "a1",
+      targetSwipeId: 1,
+      generationType: "swipe",
+    });
+
+    const abortPromise = abortRunner.run(
+      { actionId: "guided_swipe", chatId: "chat-1", inputText: "Steer" },
+      "u1",
+    );
+    await waitMs(30);
+    expect(abortRunner.abortCurrent("u1", undefined, "chat-1")).toBe(true);
+    const abortRes = await abortPromise;
+    expect(abortRes.aborted).toBe(true);
+
+    runner.dispose();
+    collisionRunner.dispose();
+    abortRunner.dispose();
   });
 });

@@ -93,9 +93,32 @@ interface StreamTargetState {
   latestExtra?: Record<string, unknown>;
 }
 
+interface ChatGetMessagesOptions {
+  tail?: number;
+  includeExtra?: boolean;
+}
+
+interface ActiveNativeGeneration {
+  generationId: string;
+  chatId: string;
+  messageId?: string;
+  swipeId?: number;
+  generationType?: string;
+  synthetic?: boolean;
+  startedAt: number;
+}
+
+interface NativeGenerationWaiter {
+  chatId: string;
+  messageId: string;
+  resolve: () => void;
+}
+
 interface SwipeStreamOptions {
   isViewingTargetSwipe(): boolean;
   isTargetDeleted?(): boolean;
+  isNativeGenerationActiveOnTarget?(): boolean;
+  waitForNativeGenerationOnTarget?(signal?: AbortSignal): Promise<void>;
   getTargetSwipeState?(): {
     swipeIndex: number;
     swipes: string[];
@@ -120,6 +143,7 @@ interface GuidedSwipeSession {
   getSwipeEventSeq(): number;
   syncFromLatestMessage(latest: ChatMessageWithRole): void;
   syncSwipesFromRefresh(swipes: readonly string[], swipeDates: readonly number[]): void;
+  mergeRefreshedSwipes(swipes: readonly string[], swipeDates: readonly number[]): void;
   markSlotCreated(): void;
   setTriggerFlush(trigger: (() => void) | null): void;
   setFinalizing(finalizing: boolean): void;
@@ -146,6 +170,10 @@ type OutputTransformer = (raw: {
 
 const STREAM_FLUSH_INTERVAL_MS = 120;
 const IMPERSONATE_FLUSH_INTERVAL_MS = 40;
+const DEFAULT_TAIL_READ_LIMIT = 10;
+const WIDER_TAIL_READ_LIMIT = 50;
+const NATIVE_GEN_STALE_TTL_MS = 10 * 60_000;
+const NATIVE_GEN_WAIT_TIMEOUT_MS = 60_000;
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
@@ -206,15 +234,238 @@ export class GuidedGenerationRunner {
   private disposed = false;
   private readonly pendingDryRunCaptures = new Map<string, PendingDryRunCapture>();
   private readonly chatDryRunQueues = new Map<string, Promise<unknown>>();
+  private readonly activeNativeGenerations = new Map<string, Map<string, ActiveNativeGeneration>>();
+  private readonly nativeGenWaiters = new Set<NativeGenerationWaiter>();
+  private readonly nativeGenListeners = new Set<(chatId: string, messageId?: string) => void>();
+  private readonly lifecycleDisposers: Array<() => void> = [];
 
   constructor(
     private readonly spindle: SpindleAPI,
     private readonly store: SettingsStore,
     private readonly emitFrontend: (event: BackendPushEvent, userId?: string) => void,
-  ) {}
+  ) {
+    this.registerNativeGenerationListeners();
+  }
+
+  private registerNativeGenerationListeners(): void {
+    if (typeof this.spindle.on !== "function") return;
+
+    const recordStart = (rawPayload: unknown) => {
+      if (this.disposed || !rawPayload || typeof rawPayload !== "object") return;
+      const payload = rawPayload as Record<string, unknown>;
+      const chatId = typeof payload.chatId === "string" && payload.chatId ? payload.chatId : null;
+      if (!chatId) return;
+      const hasExplicitGenId =
+        typeof payload.generationId === "string" && payload.generationId.length > 0;
+      const generationId = hasExplicitGenId
+        ? (payload.generationId as string)
+        : `gen-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const messageId =
+        typeof payload.targetMessageId === "string" && payload.targetMessageId
+          ? payload.targetMessageId
+          : typeof payload.messageId === "string" && payload.messageId
+            ? payload.messageId
+            : undefined;
+      const rawSwipeId =
+        typeof payload.targetSwipeId === "number" && Number.isFinite(payload.targetSwipeId)
+          ? Math.floor(payload.targetSwipeId)
+          : typeof payload.swipeId === "number" && Number.isFinite(payload.swipeId)
+            ? Math.floor(payload.swipeId)
+            : undefined;
+      const generationType =
+        typeof payload.generationType === "string" ? payload.generationType : undefined;
+
+      let chatGens = this.activeNativeGenerations.get(chatId);
+      if (!chatGens) {
+        chatGens = new Map<string, ActiveNativeGeneration>();
+        this.activeNativeGenerations.set(chatId, chatGens);
+      }
+      chatGens.set(generationId, {
+        generationId,
+        chatId,
+        ...(messageId ? { messageId } : {}),
+        ...(rawSwipeId !== undefined ? { swipeId: rawSwipeId } : {}),
+        ...(generationType ? { generationType } : {}),
+        ...(!hasExplicitGenId ? { synthetic: true } : {}),
+        startedAt: Date.now(),
+      });
+    };
+
+    const recordEnd = (rawPayload: unknown) => {
+      if (!rawPayload || typeof rawPayload !== "object") return;
+      const payload = rawPayload as Record<string, unknown>;
+      const chatId = typeof payload.chatId === "string" && payload.chatId ? payload.chatId : null;
+      if (!chatId) return;
+      const generationId =
+        typeof payload.generationId === "string" && payload.generationId
+          ? payload.generationId
+          : undefined;
+      const payloadMessageId =
+        typeof payload.messageId === "string" && payload.messageId
+          ? payload.messageId
+          : typeof payload.targetMessageId === "string" && payload.targetMessageId
+            ? payload.targetMessageId
+            : undefined;
+
+      const chatGens = this.activeNativeGenerations.get(chatId);
+      let clearedMessageId = payloadMessageId;
+      if (chatGens) {
+        if (generationId && chatGens.has(generationId)) {
+          const existing = chatGens.get(generationId);
+          clearedMessageId = clearedMessageId ?? existing?.messageId;
+          chatGens.delete(generationId);
+        } else if (!generationId) {
+          chatGens.clear();
+        } else {
+          for (const [id, entry] of [...chatGens.entries()]) {
+            if (
+              entry.synthetic ||
+              (payloadMessageId && (!entry.messageId || entry.messageId === payloadMessageId))
+            ) {
+              clearedMessageId = clearedMessageId ?? entry.messageId;
+              chatGens.delete(id);
+            }
+          }
+        }
+        if (chatGens.size === 0) {
+          this.activeNativeGenerations.delete(chatId);
+        }
+      }
+      this.notifyNativeGenFinished(chatId, clearedMessageId);
+    };
+
+    try {
+      const d1 = this.spindle.on("GENERATION_STARTED", recordStart);
+      if (typeof d1 === "function") this.lifecycleDisposers.push(d1);
+      const d2 = this.spindle.on("GENERATION_ENDED", recordEnd);
+      if (typeof d2 === "function") this.lifecycleDisposers.push(d2);
+      const d3 = this.spindle.on("GENERATION_STOPPED", recordEnd);
+      if (typeof d3 === "function") this.lifecycleDisposers.push(d3);
+    } catch {
+      // Ignore if host event bus is unavailable in tests or older hosts.
+    }
+  }
+
+  private pruneStaleNativeGenerations(
+    chatId: string,
+  ): Map<string, ActiveNativeGeneration> | undefined {
+    const chatGens = this.activeNativeGenerations.get(chatId);
+    if (!chatGens || chatGens.size === 0) return undefined;
+    const now = Date.now();
+    for (const [genId, entry] of chatGens.entries()) {
+      if (now - entry.startedAt > NATIVE_GEN_STALE_TTL_MS) {
+        chatGens.delete(genId);
+      }
+    }
+    if (chatGens.size === 0) {
+      this.activeNativeGenerations.delete(chatId);
+      return undefined;
+    }
+    return chatGens;
+  }
+
+  private hasActiveNativeGenerationOnMessage(chatId: string, messageId: string): boolean {
+    const chatGens = this.pruneStaleNativeGenerations(chatId);
+    if (!chatGens) return false;
+    for (const entry of chatGens.values()) {
+      if (!entry.messageId || entry.messageId === messageId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getMaxActiveNativeSwipeIdForMessage(chatId: string, messageId: string): number {
+    const chatGens = this.pruneStaleNativeGenerations(chatId);
+    if (!chatGens) return -1;
+    let maxSwipeId = -1;
+    for (const entry of chatGens.values()) {
+      if (
+        entry.messageId === messageId &&
+        typeof entry.swipeId === "number" &&
+        Number.isFinite(entry.swipeId) &&
+        entry.swipeId > maxSwipeId
+      ) {
+        maxSwipeId = entry.swipeId;
+      }
+    }
+    return maxSwipeId;
+  }
+
+  private notifyNativeGenFinished(chatId: string, messageId?: string): void {
+    for (const waiter of [...this.nativeGenWaiters]) {
+      if (waiter.chatId !== chatId) continue;
+      if (!this.hasActiveNativeGenerationOnMessage(chatId, waiter.messageId)) {
+        this.nativeGenWaiters.delete(waiter);
+        waiter.resolve();
+      }
+    }
+    for (const listener of [...this.nativeGenListeners]) {
+      try {
+        listener(chatId, messageId);
+      } catch {
+        // Ignore listener errors.
+      }
+    }
+  }
+
+  private waitForNativeGenerationOnMessage(
+    chatId: string,
+    messageId: string,
+    signal?: AbortSignal,
+    timeoutMs: number = NATIVE_GEN_WAIT_TIMEOUT_MS,
+  ): Promise<void> {
+    if (
+      this.disposed ||
+      signal?.aborted ||
+      !this.hasActiveNativeGenerationOnMessage(chatId, messageId)
+    ) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        this.nativeGenWaiters.delete(waiter);
+        signal?.removeEventListener("abort", finish);
+        resolve();
+      };
+
+      const waiter: NativeGenerationWaiter = {
+        chatId,
+        messageId,
+        resolve: finish,
+      };
+      this.nativeGenWaiters.add(waiter);
+      signal?.addEventListener("abort", finish, { once: true });
+      timer = setTimeout(finish, timeoutMs);
+    });
+  }
 
   dispose(): void {
     this.disposed = true;
+    for (const d of this.lifecycleDisposers.splice(0)) {
+      try {
+        d();
+      } catch {
+        // Ignore disposer errors.
+      }
+    }
+    this.activeNativeGenerations.clear();
+    for (const waiter of [...this.nativeGenWaiters]) {
+      waiter.resolve();
+    }
+    this.nativeGenWaiters.clear();
+    this.nativeGenListeners.clear();
+
     for (const userRuns of this.activeRuns.values()) {
       for (const run of userRuns.values()) {
         run.controller.abort();
@@ -535,130 +786,312 @@ export class GuidedGenerationRunner {
         throw new Error("Enter guidance in the composer before running Guided Response.");
       }
 
-      const { chatId, characterId, avatarUrl } = await this.resolveChatBase(
-        requestedChatId,
-        userId,
-      );
-      resolvedChatId = chatId;
-      pendingEntry.chatId = chatId;
-      if (this.isChatBusy(key, chatId, pendingEntry)) {
-        emitErrorStatus = false;
-        throw new Error(
-          "A Guided Generations action is already running. Stop it before starting another.",
-        );
-      }
-
-      runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-
-      if (controller.signal.aborted) {
-        wasAborted = true;
-        return {
-          runId,
-          actionId: input.actionId,
-          chatId,
-          aborted: true,
-          text: "",
-        };
-      }
-
-      this.setActiveRun(key, {
-        state: {
-          runId,
-          actionId: input.actionId,
-          chatId,
-          startedAt: Date.now(),
-          ...(input.actionId === "guided_swipe" && input.backgroundSwipe === true
-            ? { backgroundSwipe: true }
-            : {}),
-          ...(characterId ? { characterId } : {}),
-          ...(avatarUrl ? { avatarUrl } : {}),
-        },
-        controller,
-      });
-      this.removePendingRun(key, pendingEntry);
-      this.emitStatus(userId, runId);
-
-      if (trimmedInput && settings.inputRecovery.enabled) {
-        void this.store
-          .pushRecovery(
-            {
-              text: input.inputText,
-              actionId: input.actionId,
-              chatId,
-            },
-            userId,
-          )
-          .then((recovery) => {
-            if (!this.disposed) {
-              this.emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
-            }
-          })
-          .catch((err) => {
-            this.spindle.log?.warn?.(
-              `[GuidedGenerations] Failed persisting input recovery: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
-          });
-      }
-
       const mayHaveGuidance =
         trimmedInput.length > 0 ||
         (input.actionId === "guided_impersonate" && config.instructionTemplate.trim().length > 0);
 
-      const [
-        characterName,
-        resolvedConnection,
-        presetContext,
-        preTargetMessage,
-        prefetchedTrailingAssistant,
-        prefetchedPromptScripts,
-      ] = await Promise.all([
-        this.resolveCharacterName(characterId, userId),
-        this.resolveConnection(config.connectionId, input.activeConnectionId, userId),
-        (async (): Promise<{
-          presetId: string | null;
-          presetName?: string;
-          presetStreaming?: boolean;
-        }> => {
-          let preverifiedPreset:
-            | { id: string; name?: string; parameters?: Record<string, unknown> }
-            | null
-            | undefined;
-          if (
-            input.actionId === "guided_regenerate" &&
-            config.presetId &&
-            this.spindle.permissions.has("presets")
-          ) {
-            preverifiedPreset = await this.spindle.presets.get(config.presetId, userId);
-            if (!preverifiedPreset) {
-              throw new Error(
-                "Selected preset for Guided Regenerate no longer exists. Choose another in Settings.",
-              );
+      const resolvePresetForChat = async (
+        targetChatId: string,
+      ): Promise<{
+        presetId: string | null;
+        presetName?: string;
+        presetStreaming?: boolean;
+        promptOrder?: PromptBlockSnapshotDTO[];
+      }> => {
+        let preverifiedPreset:
+          | {
+              id: string;
+              name?: string;
+              parameters?: Record<string, unknown>;
+              prompt_order?: PromptBlockSnapshotDTO[];
             }
+          | null
+          | undefined;
+        if (
+          input.actionId === "guided_regenerate" &&
+          config.presetId &&
+          this.spindle.permissions.has("presets")
+        ) {
+          preverifiedPreset = await this.spindle.presets.get(config.presetId, userId);
+          if (!preverifiedPreset) {
+            throw new Error(
+              "Selected preset for Guided Regenerate no longer exists. Choose another in Settings.",
+            );
           }
-          return input.actionId !== "guided_impersonate"
-            ? this.resolvePresetContext(config.presetId, chatId, userId, preverifiedPreset)
-            : { presetId: null };
-        })(),
-        input.actionId === "guided_continue" || input.actionId === "guided_swipe"
-          ? this.requireLastAssistantMessage(chatId)
-          : Promise.resolve(null as ChatMessageWithRole | null),
-        input.actionId === "guided_regenerate"
-          ? this.findTrailingAssistantMessage(chatId)
-          : Promise.resolve(null as ChatMessageWithRole | null),
-        config.applyRegex && mayHaveGuidance
-          ? fetchActiveRegexScripts(this.spindle, {
-              target: "prompt",
-              characterId,
-              chatId,
-              userId,
-            }).catch(() => [] as RegexScriptDTO[])
-          : Promise.resolve(undefined as RegexScriptDTO[] | undefined),
-      ]);
+        }
+        return input.actionId !== "guided_impersonate"
+          ? this.resolvePresetContext(config.presetId, targetChatId, userId, preverifiedPreset)
+          : { presetId: null };
+      };
 
-      if (characterName) {
-        this.updateActiveRunState(userId, runId, { characterName });
+      let chatId: string;
+      let characterId: string | undefined;
+      let avatarUrl: string | undefined;
+      let resolvedConnection: ConnectionProfileDTO | undefined;
+      let presetContext: {
+        presetId: string | null;
+        presetName?: string;
+        presetStreaming?: boolean;
+        promptOrder?: PromptBlockSnapshotDTO[];
+      };
+      let preTargetMessage: ChatMessageWithRole | null;
+      let prefetchedTrailingAssistant: ChatMessageWithRole | null;
+      let prefetchedPromptScripts: RegexScriptDTO[] | undefined;
+      let earlyDryRunPromise:
+        | Promise<{
+            result: DryRunResultWithRequestMessages;
+            capturedMessages?: AssembledLlmMessageDTO[];
+          }>
+        | undefined;
+      let earlyDryRunConnectionId: string | undefined;
+
+      if (requestedChatId) {
+        const earlyConnId = config.connectionId || input.activeConnectionId || undefined;
+        const canLaunchEarlyDryRun =
+          Boolean(earlyConnId) &&
+          !controller.signal.aborted &&
+          (input.actionId === "guided_response" ||
+            input.actionId === "guided_impersonate" ||
+            input.actionId === "guided_swipe");
+        if (canLaunchEarlyDryRun && earlyConnId) {
+          earlyDryRunConnectionId = earlyConnId;
+          const earlyDryRunInput = buildDryRunInput({
+            chatId: requestedChatId,
+            actionId: input.actionId,
+            config,
+            activeConnectionId: earlyConnId,
+          });
+          earlyDryRunPromise = this.runDryRunWithCapture(
+            requestedChatId,
+            earlyDryRunInput,
+            userId,
+          );
+          // Prevent unhandled rejection if an earlier validation fails before we await it.
+          void earlyDryRunPromise.catch(() => undefined);
+        }
+
+        const chatBasePromise = this.resolveChatBase(requestedChatId, userId);
+        const promptScriptsPromise =
+          config.applyRegex && mayHaveGuidance
+            ? chatBasePromise
+                .then((base) =>
+                  fetchActiveRegexScripts(this.spindle, {
+                    target: "prompt",
+                    characterId: base.characterId,
+                    chatId: base.chatId,
+                    userId,
+                  }),
+                )
+                .catch(() => [] as RegexScriptDTO[])
+            : Promise.resolve(undefined as RegexScriptDTO[] | undefined);
+
+        const connectionPromise = this.resolveConnection(
+          config.connectionId,
+          input.activeConnectionId,
+          userId,
+        );
+        const presetPromise = resolvePresetForChat(requestedChatId);
+        const preTargetPromise =
+          input.actionId === "guided_continue" || input.actionId === "guided_swipe"
+            ? this.requireLastAssistantMessage(requestedChatId, { includeExtra: true })
+            : Promise.resolve(null as ChatMessageWithRole | null);
+        const trailingAssistantPromise =
+          input.actionId === "guided_regenerate"
+            ? this.findTrailingAssistantMessage(requestedChatId, { includeExtra: true })
+            : Promise.resolve(null as ChatMessageWithRole | null);
+
+        // Suppress unhandled rejections if chatBasePromise rejects before Promise.all awaits others.
+        void connectionPromise.catch(() => undefined);
+        void presetPromise.catch(() => undefined);
+        void preTargetPromise.catch(() => undefined);
+        void trailingAssistantPromise.catch(() => undefined);
+
+        const base = await chatBasePromise;
+        chatId = base.chatId;
+        characterId = base.characterId;
+        avatarUrl = base.avatarUrl;
+        resolvedChatId = chatId;
+        pendingEntry.chatId = chatId;
+        if (this.isChatBusy(key, chatId, pendingEntry)) {
+          emitErrorStatus = false;
+          throw new Error(
+            "A Guided Generations action is already running. Stop it before starting another.",
+          );
+        }
+
+        runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+        if (controller.signal.aborted) {
+          wasAborted = true;
+          return {
+            runId,
+            actionId: input.actionId,
+            chatId,
+            aborted: true,
+            text: "",
+          };
+        }
+
+        this.setActiveRun(key, {
+          state: {
+            runId,
+            actionId: input.actionId,
+            chatId,
+            startedAt: Date.now(),
+            ...(input.actionId === "guided_swipe" && input.backgroundSwipe === true
+              ? { backgroundSwipe: true }
+              : {}),
+            ...(characterId ? { characterId } : {}),
+            ...(avatarUrl ? { avatarUrl } : {}),
+          },
+          controller,
+        });
+        this.removePendingRun(key, pendingEntry);
+        this.emitStatus(userId, runId);
+
+        if (trimmedInput && settings.inputRecovery.enabled) {
+          void this.store
+            .pushRecovery(
+              {
+                text: input.inputText,
+                actionId: input.actionId,
+                chatId,
+              },
+              userId,
+            )
+            .then((recovery) => {
+              if (!this.disposed) {
+                this.emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
+              }
+            })
+            .catch((err) => {
+              this.spindle.log?.warn?.(
+                `[GuidedGenerations] Failed persisting input recovery: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            });
+        }
+
+        const activeRunIdForChar = runId;
+        void this.resolveCharacterName(characterId, userId).then((characterName) => {
+          if (characterName && !this.disposed) {
+            this.updateActiveRunState(userId, activeRunIdForChar, { characterName });
+          }
+        });
+
+        [
+          resolvedConnection,
+          presetContext,
+          preTargetMessage,
+          prefetchedTrailingAssistant,
+          prefetchedPromptScripts,
+        ] = await Promise.all([
+          connectionPromise,
+          presetPromise,
+          preTargetPromise,
+          trailingAssistantPromise,
+          promptScriptsPromise,
+        ]);
+      } else {
+        const base = await this.resolveChatBase(requestedChatId, userId);
+        chatId = base.chatId;
+        characterId = base.characterId;
+        avatarUrl = base.avatarUrl;
+        resolvedChatId = chatId;
+        pendingEntry.chatId = chatId;
+        if (this.isChatBusy(key, chatId, pendingEntry)) {
+          emitErrorStatus = false;
+          throw new Error(
+            "A Guided Generations action is already running. Stop it before starting another.",
+          );
+        }
+
+        runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+        if (controller.signal.aborted) {
+          wasAborted = true;
+          return {
+            runId,
+            actionId: input.actionId,
+            chatId,
+            aborted: true,
+            text: "",
+          };
+        }
+
+        this.setActiveRun(key, {
+          state: {
+            runId,
+            actionId: input.actionId,
+            chatId,
+            startedAt: Date.now(),
+            ...(input.actionId === "guided_swipe" && input.backgroundSwipe === true
+              ? { backgroundSwipe: true }
+              : {}),
+            ...(characterId ? { characterId } : {}),
+            ...(avatarUrl ? { avatarUrl } : {}),
+          },
+          controller,
+        });
+        this.removePendingRun(key, pendingEntry);
+        this.emitStatus(userId, runId);
+
+        if (trimmedInput && settings.inputRecovery.enabled) {
+          void this.store
+            .pushRecovery(
+              {
+                text: input.inputText,
+                actionId: input.actionId,
+                chatId,
+              },
+              userId,
+            )
+            .then((recovery) => {
+              if (!this.disposed) {
+                this.emitFrontend({ type: "gg:recovery-updated", recovery }, userId);
+              }
+            })
+            .catch((err) => {
+              this.spindle.log?.warn?.(
+                `[GuidedGenerations] Failed persisting input recovery: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            });
+        }
+
+        const activeRunIdForChar = runId;
+        void this.resolveCharacterName(characterId, userId).then((characterName) => {
+          if (characterName && !this.disposed) {
+            this.updateActiveRunState(userId, activeRunIdForChar, { characterName });
+          }
+        });
+
+        [
+          resolvedConnection,
+          presetContext,
+          preTargetMessage,
+          prefetchedTrailingAssistant,
+          prefetchedPromptScripts,
+        ] = await Promise.all([
+          this.resolveConnection(config.connectionId, input.activeConnectionId, userId),
+          resolvePresetForChat(chatId),
+          input.actionId === "guided_continue" || input.actionId === "guided_swipe"
+            ? this.requireLastAssistantMessage(chatId, { includeExtra: true })
+            : Promise.resolve(null as ChatMessageWithRole | null),
+          input.actionId === "guided_regenerate"
+            ? this.findTrailingAssistantMessage(chatId, { includeExtra: true })
+            : Promise.resolve(null as ChatMessageWithRole | null),
+          config.applyRegex && mayHaveGuidance
+            ? fetchActiveRegexScripts(this.spindle, {
+                target: "prompt",
+                characterId,
+                chatId,
+                userId,
+              }).catch(() => [] as RegexScriptDTO[])
+            : Promise.resolve(undefined as RegexScriptDTO[] | undefined),
+        ]);
       }
 
       const connectionId = resolvedConnection?.id;
@@ -706,6 +1139,7 @@ export class GuidedGenerationRunner {
       let handoffToAssistantExecution = false;
       let pendingBlankSlotCreate = false;
       let pendingSwipeSlotWrite: (() => Promise<void>) | null = null;
+      let pendingSlotWritePromise: Promise<void> | null = null;
 
       const activeRunId = runId;
       const createBlankAssistantSlot = async () => {
@@ -867,8 +1301,13 @@ export class GuidedGenerationRunner {
           { chatId, characterId, userId },
         );
 
+        const dryRunPromise =
+          earlyDryRunPromise && earlyDryRunConnectionId === connectionId
+            ? earlyDryRunPromise
+            : this.runDryRunWithCapture(chatId, dryRunInput, userId);
+
         const [dryRunCapture, prefetchedResolvedTemplate] = await Promise.all([
-          this.runDryRunWithCapture(chatId, dryRunInput, userId),
+          dryRunPromise,
           resolvedTemplatePromise,
         ]);
         const dryRunResult = dryRunCapture.result;
@@ -893,38 +1332,42 @@ export class GuidedGenerationRunner {
           };
         }
 
-        if (pendingBlankSlotCreate) {
-          await createBlankAssistantSlot();
-        } else if (pendingSwipeSlotWrite) {
-          await pendingSwipeSlotWrite();
-        }
+        const slotWritePromise = pendingBlankSlotCreate
+          ? createBlankAssistantSlot()
+          : pendingSwipeSlotWrite
+            ? pendingSwipeSlotWrite()
+            : Promise.resolve();
+        pendingSlotWritePromise = slotWritePromise;
 
-        const {
-          rawInput,
-          transformResponseOutput,
-          transformImpersonateOutput,
-        } = await this.prepareRawGenerationInput({
-          actionId: input.actionId,
-          chatId,
-          characterId,
-          userId,
-          config,
-          inputText: input.inputText,
-          connectionId,
-          resolvedConnection,
-          resolvedPresetId,
-          presetStreaming: presetContext.presetStreaming,
-          dryRunResult,
-          capturedMessages,
-          signal: controller.signal,
-          createdMessageId,
-          targetAssistantId,
-          skipBlankAssistantStrip: pendingBlankSlotCreate,
-          targetSwipeIsBlank,
-          prefetchedResolvedTemplate,
-          prefetchedPromptScripts,
-          responseScriptsPromise,
-        });
+        const [
+          ,
+          { rawInput, transformResponseOutput, transformImpersonateOutput },
+        ] = await Promise.all([
+          slotWritePromise,
+          this.prepareRawGenerationInput({
+            actionId: input.actionId,
+            chatId,
+            characterId,
+            userId,
+            config,
+            inputText: input.inputText,
+            connectionId,
+            resolvedConnection,
+            resolvedPresetId,
+            presetStreaming: presetContext.presetStreaming,
+            prefetchedPresetBlocks: presetContext.promptOrder,
+            dryRunResult,
+            capturedMessages,
+            signal: controller.signal,
+            createdMessageId,
+            targetAssistantId,
+            skipBlankAssistantStrip: pendingBlankSlotCreate,
+            targetSwipeIsBlank,
+            prefetchedResolvedTemplate,
+            prefetchedPromptScripts,
+            responseScriptsPromise,
+          }),
+        ]);
 
         let result: ActionRunResult;
         switch (input.actionId) {
@@ -989,6 +1432,9 @@ export class GuidedGenerationRunner {
         wasAborted = result.aborted;
         return result;
       } catch (error) {
+        if (pendingSlotWritePromise) {
+          await pendingSlotWritePromise.catch(() => undefined);
+        }
         if (!handoffToAssistantExecution) {
           if (regeneratedSnapshot) {
             await this.restoreTrailingAssistant(
@@ -1079,7 +1525,7 @@ export class GuidedGenerationRunner {
           "A Guided Generations action is already running. Stop it before removing a continue.",
         );
       }
-      const target = await this.requireLastAssistantMessage(chatId);
+      const target = await this.requireLastAssistantMessage(chatId, { includeExtra: true });
       const { swipes, swipeDates, activeIndex } = normalizeMessageSwipes(target);
       const currentText = swipes[activeIndex] ?? target.content ?? "";
 
@@ -1215,7 +1661,7 @@ export class GuidedGenerationRunner {
         };
       }
 
-      const target = await this.requireLastAssistantMessage(chatId);
+      const target = await this.requireLastAssistantMessage(chatId, { includeExtra: true });
       const { swipes, swipeDates, activeIndex } = normalizeMessageSwipes(target);
       const currentText = swipes[activeIndex] ?? target.content ?? "";
 
@@ -1393,6 +1839,7 @@ export class GuidedGenerationRunner {
           resolvedConnection,
           resolvedPresetId,
           presetStreaming: presetContext.presetStreaming,
+          prefetchedPresetBlocks: presetContext.promptOrder,
           dryRunResult: dryRunCapture.result,
           capturedMessages: dryRunCapture.capturedMessages,
           signal: controller.signal,
@@ -1557,6 +2004,7 @@ export class GuidedGenerationRunner {
     resolvedConnection?: ConnectionProfileDTO;
     resolvedPresetId?: string | null;
     presetStreaming?: boolean;
+    prefetchedPresetBlocks?: PromptBlockSnapshotDTO[];
     dryRunResult: DryRunResultWithRequestMessages;
     capturedMessages?: AssembledLlmMessageDTO[];
     signal: AbortSignal;
@@ -1583,6 +2031,7 @@ export class GuidedGenerationRunner {
       resolvedConnection,
       resolvedPresetId,
       presetStreaming,
+      prefetchedPresetBlocks,
       dryRunResult,
       capturedMessages,
       signal,
@@ -1616,7 +2065,13 @@ export class GuidedGenerationRunner {
     if (!isChatHistory) {
       const effectivePresetId =
         config.presetId ?? resolvedPresetId ?? resolvedConnection?.preset_id ?? null;
-      const presetBlocks = await this.fetchPresetBlocksFallback(effectivePresetId, userId);
+      const presetBlocks =
+        prefetchedPresetBlocks &&
+        prefetchedPresetBlocks.length > 0 &&
+        effectivePresetId &&
+        effectivePresetId === resolvedPresetId
+          ? prefetchedPresetBlocks
+          : await this.fetchPresetBlocksFallback(effectivePresetId, userId);
       if (presetBlocks && presetBlocks.length > 0) {
         isChatHistory = resolveChatHistoryFlags(rawAssembled, {
           breakdown: dryRunResult.breakdown,
@@ -2154,6 +2609,39 @@ export class GuidedGenerationRunner {
     activeConnectionId?: string | null,
     userId?: string,
   ): Promise<ConnectionProfileDTO | undefined> {
+    const getConn = (
+      this.spindle.connections as unknown as {
+        get?: (connectionId: string, userId?: string) => Promise<ConnectionProfileDTO | null>;
+      }
+    )?.get;
+
+    if (configuredConnectionId && typeof getConn === "function") {
+      try {
+        const found = await getConn.call(this.spindle.connections, configuredConnectionId, userId);
+        if (found) return found;
+        throw new Error(
+          "Selected API connection profile for this action no longer exists. Choose another in Settings.",
+        );
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          err.message.includes("Selected API connection profile for this action no longer exists")
+        ) {
+          throw err;
+        }
+        // Fall through to connections.list() if get() is unsupported or failed transiently.
+      }
+    }
+
+    if (!configuredConnectionId && activeConnectionId && typeof getConn === "function") {
+      try {
+        const active = await getConn.call(this.spindle.connections, activeConnectionId, userId);
+        if (active) return active;
+      } catch {
+        // Fall through to connections.list().
+      }
+    }
+
     const connections = await this.spindle.connections.list(userId);
     if (configuredConnectionId) {
       const found = connections.find((c) => c.id === configuredConnectionId);
@@ -2177,8 +2665,18 @@ export class GuidedGenerationRunner {
     configuredPresetId: string | null,
     chatId: string,
     userId?: string,
-    preverifiedPreset?: { id: string; name?: string; parameters?: Record<string, unknown> } | null,
-  ): Promise<{ presetId: string | null; presetName?: string; presetStreaming?: boolean }> {
+    preverifiedPreset?: {
+      id: string;
+      name?: string;
+      parameters?: Record<string, unknown>;
+      prompt_order?: PromptBlockSnapshotDTO[];
+    } | null,
+  ): Promise<{
+    presetId: string | null;
+    presetName?: string;
+    presetStreaming?: boolean;
+    promptOrder?: PromptBlockSnapshotDTO[];
+  }> {
     if (!this.spindle.permissions?.has?.("presets")) {
       return { presetId: null };
     }
@@ -2193,10 +2691,15 @@ export class GuidedGenerationRunner {
             ? preverifiedPreset.name.trim()
             : undefined;
         const presetStreaming = extractPresetStreamingOverride(preverifiedPreset);
+        const promptOrder =
+          Array.isArray(preverifiedPreset.prompt_order) && preverifiedPreset.prompt_order.length > 0
+            ? preverifiedPreset.prompt_order
+            : undefined;
         return {
           presetId: trimmedConfigured,
           ...(name ? { presetName: name } : {}),
           ...(presetStreaming !== undefined ? { presetStreaming } : {}),
+          ...(promptOrder ? { promptOrder } : {}),
         };
       }
       if (typeof this.spindle.presets?.get === "function") {
@@ -2208,10 +2711,15 @@ export class GuidedGenerationRunner {
               ? preset.name.trim()
               : undefined;
           const presetStreaming = extractPresetStreamingOverride(preset);
+          const promptOrder =
+            Array.isArray(preset.prompt_order) && preset.prompt_order.length > 0
+              ? preset.prompt_order
+              : undefined;
           return {
             presetId: trimmedConfigured,
             ...(name ? { presetName: name } : {}),
             ...(presetStreaming !== undefined ? { presetStreaming } : {}),
+            ...(promptOrder ? { promptOrder } : {}),
           };
         } catch {
           return { presetId: null };
@@ -2359,10 +2867,22 @@ export class GuidedGenerationRunner {
       if (!slotCreated || targetDeleted) return false;
       if (!Array.isArray(incomingSwipes) || incomingSwipes.length === 0) return false;
       const normalizedIncoming = incomingSwipes.map((s) => (typeof s === "string" ? s : ""));
-      const mergedSwipes =
-        normalizedIncoming.length > targetSwipeIndex
-          ? normalizedIncoming
-          : [...normalizedIncoming, ...slotSwipes.slice(normalizedIncoming.length)];
+      const mergedLen = Math.max(normalizedIncoming.length, targetSwipeIndex + 1);
+      const mergedSwipes: string[] = [];
+      for (let idx = 0; idx < mergedLen; idx += 1) {
+        const incoming = idx < normalizedIncoming.length ? normalizedIncoming[idx]! : undefined;
+        const existing = idx < slotSwipes.length ? slotSwipes[idx]! : "";
+        if (idx === targetSwipeIndex) {
+          mergedSwipes.push(incoming !== undefined && incoming.length > 0 ? incoming : existing);
+        } else if (incoming !== undefined && incoming.length > 0) {
+          mergedSwipes.push(incoming);
+        } else if (existing.length > 0 && idx < normalizedIncoming.length) {
+          // Never allow a stale "" to clobber a known non-empty sibling swipe.
+          mergedSwipes.push(existing);
+        } else {
+          mergedSwipes.push(incoming ?? existing);
+        }
+      }
       const fallbackDate = Math.floor(Date.now() / 1000);
       const rawDates = Array.isArray(incomingDates) ? incomingDates : undefined;
       const mergedDates = mergedSwipes.map((_, idx) => {
@@ -2465,6 +2985,38 @@ export class GuidedGenerationRunner {
       }
     });
 
+    const messageEditedDisposer = this.spindle.on?.("MESSAGE_EDITED", (payload, eventUserId) => {
+      if (sessionUserId && eventUserId && eventUserId !== sessionUserId) {
+        return;
+      }
+      const event = payload as { chatId?: string; message?: ChatMessageWithRole } | undefined;
+      if (!event || event.chatId !== chatId || event.message?.id !== targetMessage.id) {
+        return;
+      }
+      const mergedSwipes = mergeExternalSwipes(
+        event.message?.swipes,
+        event.message?.swipe_dates,
+      );
+      if (mergedSwipes) {
+        swipeEventSeq += 1;
+      }
+    });
+
+    const onNativeGenDone = (endedChatId: string, endedMessageId?: string) => {
+      if (endedChatId !== chatId) return;
+      if (endedMessageId && endedMessageId !== targetMessage.id) return;
+      if (
+        !finalizing &&
+        !targetDeleted &&
+        slotCreated &&
+        currentViewedSwipeId === targetSwipeIndex &&
+        !this.hasActiveNativeGenerationOnMessage(chatId, targetMessage.id)
+      ) {
+        triggerFlush?.();
+      }
+    };
+    this.nativeGenListeners.add(onNativeGenDone);
+
     return {
       targetAssistantId: targetMessage.id,
       get initialSwipeId() {
@@ -2499,16 +3051,30 @@ export class GuidedGenerationRunner {
         if (!hadEvents) {
           currentViewedSwipeId = latestNorm.activeIndex;
         }
-        targetSwipeIndex = latestNorm.swipes.length;
-        slotSwipes = [...latestNorm.swipes, ""];
-        slotSwipeDates = [...latestNorm.swipeDates, Math.floor(Date.now() / 1000)];
+        const maxActiveNativeSwipeId = this.getMaxActiveNativeSwipeIdForMessage(
+          chatId,
+          targetMessage.id,
+        );
+        targetSwipeIndex = Math.max(latestNorm.swipes.length, maxActiveNativeSwipeId + 1);
+        const nowSec = Math.floor(Date.now() / 1000);
+        slotSwipes = [...latestNorm.swipes];
+        slotSwipeDates = [...latestNorm.swipeDates];
+        while (slotSwipes.length <= targetSwipeIndex) {
+          slotSwipes.push("");
+        }
+        while (slotSwipeDates.length <= targetSwipeIndex) {
+          slotSwipeDates.push(nowSec);
+        }
         initialExtra = latest.extra ? this.cloneRecord(latest.extra) : {};
         initialMetadata = latest.metadata ? this.cloneRecord(latest.metadata) : undefined;
       },
       syncSwipesFromRefresh: (nextSwipes: readonly string[], nextSwipeDates: readonly number[]) => {
         if (!slotCreated || targetDeleted) return;
-        slotSwipes = [...nextSwipes];
-        slotSwipeDates = [...nextSwipeDates];
+        mergeExternalSwipes(nextSwipes, nextSwipeDates);
+      },
+      mergeRefreshedSwipes: (nextSwipes: readonly string[], nextSwipeDates: readonly number[]) => {
+        if (!slotCreated || targetDeleted) return;
+        mergeExternalSwipes(nextSwipes, nextSwipeDates);
       },
       markSlotCreated: () => {
         slotCreated = true;
@@ -2520,11 +3086,15 @@ export class GuidedGenerationRunner {
         finalizing = value;
       },
       dispose: () => {
+        this.nativeGenListeners.delete(onNativeGenDone);
         if (typeof swipeDisposer === "function") {
           swipeDisposer();
         }
         if (typeof swipeEditedDisposer === "function") {
           swipeEditedDisposer();
+        }
+        if (typeof messageEditedDisposer === "function") {
+          messageEditedDisposer();
         }
       },
     };
@@ -2536,8 +3106,9 @@ export class GuidedGenerationRunner {
   ): Promise<void> {
     if (swipeSession.isTargetDeleted()) return;
     try {
-      const messages = await this.spindle.chat.getMessages(chatId);
-      const current = messages.find((m) => m.id === swipeSession.targetAssistantId);
+      const current = await this.findMessageById(chatId, swipeSession.targetAssistantId, {
+        includeExtra: false,
+      });
       if (!current) return;
       const normalized = normalizeMessageSwipes(current);
       const targetIdx = swipeSession.getTargetSwipeIndex();
@@ -2700,10 +3271,9 @@ export class GuidedGenerationRunner {
     },
   ): Promise<void> {
     try {
-      const latest = await this.spindle.chat
-        .getMessages(chatId)
-        .then((msgs) => msgs.find((m) => m.id === preRegen.messageId))
-        .catch(() => undefined);
+      const latest = await this.findMessageById(chatId, preRegen.messageId, {
+        includeExtra: false,
+      }).catch(() => undefined);
       const normalized = latest ? normalizeMessageSwipes(latest) : null;
       const swipes =
         normalized && normalized.swipes.length > preRegen.swipeIndex
@@ -2874,30 +3444,11 @@ export class GuidedGenerationRunner {
       chatId,
       rawInput,
       signal,
-      async () => {
-        const latest = await this.readTargetMessageOrThrow(chatId, targetId);
-        const latestNorm = normalizeMessageSwipes(latest);
-        const swipes =
-          latestNorm.swipes.length > baseTarget.swipeIndex
-            ? latestNorm.swipes
-            : [
-                ...latestNorm.swipes,
-                ...baseTarget.swipes.slice(latestNorm.swipes.length),
-              ];
-        const swipeDates =
-          latestNorm.swipeDates.length > baseTarget.swipeIndex
-            ? latestNorm.swipeDates
-            : [
-                ...latestNorm.swipeDates,
-                ...baseTarget.swipeDates.slice(latestNorm.swipeDates.length),
-              ];
-        return {
-          ...baseTarget,
-          messageId: latest.id,
-          swipes,
-          swipeDates,
-        };
-      },
+      async () => ({
+        ...baseTarget,
+        swipes: [...baseTarget.swipes],
+        swipeDates: [...baseTarget.swipeDates],
+      }),
       async (current) => this.refreshSwipeTarget(chatId, current),
       transformOutput,
       undefined,
@@ -2950,39 +3501,15 @@ export class GuidedGenerationRunner {
       chatId,
       rawInput,
       signal,
-      async () => {
-        const baseTarget: StreamTargetState = {
-          messageId: swipeSession.targetAssistantId,
-          swipes: swipeSession.swipes,
-          swipeIndex: swipeSession.getTargetSwipeIndex(),
-          swipeDates: swipeSession.swipeDates,
-          baseText: "",
-          latestSwipeId: swipeSession.getCurrentViewedSwipeId(),
-          latestExtra: swipeSession.initialExtra,
-        };
-        const seqBeforeRead = swipeSession.getSwipeEventSeq();
-        const refreshed = await this.refreshSwipeTarget(
-          chatId,
-          baseTarget,
-          () => swipeSession.isTargetDeleted(),
-        );
-        if (swipeSession.isTargetDeleted()) {
-          return refreshed;
-        }
-        if (swipeSession.getSwipeEventSeq() === seqBeforeRead) {
-          swipeSession.syncSwipesFromRefresh(refreshed.swipes, refreshed.swipeDates);
-          if (refreshed.latestSwipeId !== undefined) {
-            swipeSession.setCurrentViewedSwipeId(refreshed.latestSwipeId);
-          }
-          return refreshed;
-        }
-        return {
-          ...refreshed,
-          swipeIndex: swipeSession.getTargetSwipeIndex(),
-          swipes: swipeSession.swipes,
-          swipeDates: swipeSession.swipeDates,
-        };
-      },
+      async () => ({
+        messageId: swipeSession.targetAssistantId,
+        swipes: swipeSession.swipes,
+        swipeIndex: swipeSession.getTargetSwipeIndex(),
+        swipeDates: swipeSession.swipeDates,
+        baseText: "",
+        latestSwipeId: swipeSession.getCurrentViewedSwipeId(),
+        latestExtra: swipeSession.initialExtra,
+      }),
       async (current, refreshOptions) => {
         if (swipeSession.isTargetDeleted()) {
           return current;
@@ -3006,8 +3533,14 @@ export class GuidedGenerationRunner {
           if (refreshed.latestSwipeId !== undefined) {
             swipeSession.setCurrentViewedSwipeId(refreshed.latestSwipeId);
           }
-          return refreshed;
+          return {
+            ...refreshed,
+            swipeIndex: swipeSession.getTargetSwipeIndex(),
+            swipes: swipeSession.swipes,
+            swipeDates: swipeSession.swipeDates,
+          };
         }
+        swipeSession.mergeRefreshedSwipes(refreshed.swipes, refreshed.swipeDates);
         return {
           ...refreshed,
           swipeIndex: swipeSession.getTargetSwipeIndex(),
@@ -3021,6 +3554,14 @@ export class GuidedGenerationRunner {
           !swipeSession.isTargetDeleted() &&
           swipeSession.getCurrentViewedSwipeId() === swipeSession.getTargetSwipeIndex(),
         isTargetDeleted: () => swipeSession.isTargetDeleted(),
+        isNativeGenerationActiveOnTarget: () =>
+          this.hasActiveNativeGenerationOnMessage(chatId, swipeSession.targetAssistantId),
+        waitForNativeGenerationOnTarget: (waitSignal) =>
+          this.waitForNativeGenerationOnMessage(
+            chatId,
+            swipeSession.targetAssistantId,
+            waitSignal,
+          ),
         getTargetSwipeState: () => ({
           swipeIndex: swipeSession.getTargetSwipeIndex(),
           swipes: swipeSession.swipes,
@@ -3247,6 +3788,9 @@ export class GuidedGenerationRunner {
       if (swipeOptions?.isTargetDeleted?.()) {
         return;
       }
+      if (swipeOptions?.isNativeGenerationActiveOnTarget?.()) {
+        return;
+      }
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
         return;
       }
@@ -3269,6 +3813,9 @@ export class GuidedGenerationRunner {
         target = effectiveTarget;
       }
       if (finalizing || swipeOptions?.isTargetDeleted?.()) {
+        return;
+      }
+      if (swipeOptions?.isNativeGenerationActiveOnTarget?.()) {
         return;
       }
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
@@ -3344,7 +3891,11 @@ export class GuidedGenerationRunner {
             pendingMidstreamSkipRefresh = true;
             break;
           }
-          if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
+          if (
+            swipeOptions &&
+            (!swipeOptions.isViewingTargetSwipe() ||
+              swipeOptions.isNativeGenerationActiveOnTarget?.())
+          ) {
             midstreamDirty = false;
             pendingMidstreamForce = false;
             pendingMidstreamSkipRefresh = true;
@@ -3475,6 +4026,7 @@ export class GuidedGenerationRunner {
     const maybeFlush = (force: boolean, skipRefresh = false) => {
       if (finalizing || !target) return;
       if (swipeOptions?.isTargetDeleted?.()) return;
+      if (swipeOptions?.isNativeGenerationActiveOnTarget?.()) return;
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) return;
       const liveSwipeState = swipeOptions?.getTargetSwipeState?.();
       if (liveSwipeState) {
@@ -3618,6 +4170,9 @@ export class GuidedGenerationRunner {
           (deltaText.length > 0 || reasoningText.length > 0)
         ) {
           await waitForInFlightFlush();
+          if (swipeOptions?.waitForNativeGenerationOnTarget && !swipeOptions.isTargetDeleted?.()) {
+            await swipeOptions.waitForNativeGenerationOnTarget(signal);
+          }
           if (refreshTarget && !swipeOptions?.isTargetDeleted?.()) {
             target = await refreshTarget(target, { isFinal: true }).catch(() => target!);
           }
@@ -3689,6 +4244,10 @@ export class GuidedGenerationRunner {
 
     await waitForInFlightFlush();
 
+    if (swipeOptions?.waitForNativeGenerationOnTarget && !swipeOptions.isTargetDeleted?.()) {
+      await swipeOptions.waitForNativeGenerationOnTarget(signal);
+    }
+
     if (refreshTarget) {
       resolvedTarget = await refreshTarget(resolvedTarget, { isFinal: true });
       target = resolvedTarget;
@@ -3739,6 +4298,65 @@ export class GuidedGenerationRunner {
     };
   }
 
+  private async getChatMessagesWithOptions(
+    chatId: string,
+    options?: ChatGetMessagesOptions,
+  ): Promise<ChatMessageWithRole[]> {
+    const getMessagesFn = this.spindle.chat.getMessages as (
+      chatId: string,
+      options?: ChatGetMessagesOptions,
+    ) => Promise<ChatMessageWithRole[]>;
+    if (!options) {
+      return getMessagesFn.call(this.spindle.chat, chatId);
+    }
+    try {
+      return await getMessagesFn.call(this.spindle.chat, chatId, options);
+    } catch {
+      return getMessagesFn.call(this.spindle.chat, chatId);
+    }
+  }
+
+  private async findMessageById(
+    chatId: string,
+    targetId: string,
+    options?: { includeExtra?: boolean; requireAssistant?: boolean },
+  ): Promise<ChatMessageWithRole | null> {
+    const includeExtra = options?.includeExtra ?? false;
+    const requireAssistant = options?.requireAssistant ?? false;
+    const matchIn = (messages: readonly ChatMessageWithRole[]): ChatMessageWithRole | null => {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const candidate = messages[i];
+        if (
+          candidate &&
+          candidate.id === targetId &&
+          (!requireAssistant || isAssistantMessage(candidate))
+        ) {
+          return candidate;
+        }
+      }
+      return null;
+    };
+
+    const tailMsgs = await this.getChatMessagesWithOptions(chatId, {
+      tail: DEFAULT_TAIL_READ_LIMIT,
+      includeExtra,
+    });
+    const inTail = matchIn(tailMsgs);
+    if (inTail) return inTail;
+    if (tailMsgs.length < DEFAULT_TAIL_READ_LIMIT) return null;
+
+    const widerMsgs = await this.getChatMessagesWithOptions(chatId, {
+      tail: WIDER_TAIL_READ_LIMIT,
+      includeExtra,
+    });
+    const inWider = matchIn(widerMsgs);
+    if (inWider) return inWider;
+    if (widerMsgs.length < WIDER_TAIL_READ_LIMIT) return null;
+
+    const fullMsgs = await this.getChatMessagesWithOptions(chatId);
+    return matchIn(fullMsgs);
+  }
+
   private async refreshSwipeTarget(
     chatId: string,
     current: StreamTargetState,
@@ -3749,30 +4367,41 @@ export class GuidedGenerationRunner {
       return current;
     }
     try {
-      const messages = await this.spindle.chat.getMessages(chatId);
+      const latest = await this.findMessageById(chatId, current.messageId, {
+        includeExtra: Boolean(options?.includeExtra),
+      });
       if (isTargetDeleted?.()) {
         return current;
       }
-      let latest: ChatMessageWithRole | undefined;
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i]?.id === current.messageId) {
-          latest = messages[i];
-          break;
-        }
-      }
       if (!latest) return current;
       const normalized = normalizeMessageSwipes(latest);
-      const swipes =
-        normalized.swipes.length > current.swipeIndex
-          ? normalized.swipes
-          : [...normalized.swipes, ...current.swipes.slice(normalized.swipes.length)];
-      const swipeDates =
-        normalized.swipeDates.length > current.swipeIndex
-          ? normalized.swipeDates
-          : [
-              ...normalized.swipeDates,
-              ...current.swipeDates.slice(normalized.swipeDates.length),
-            ];
+      const mergedLen = Math.max(normalized.swipes.length, current.swipeIndex + 1);
+      const swipes: string[] = [];
+      for (let idx = 0; idx < mergedLen; idx += 1) {
+        const incoming = idx < normalized.swipes.length ? normalized.swipes[idx]! : undefined;
+        const existing = idx < current.swipes.length ? current.swipes[idx]! : "";
+        if (idx === current.swipeIndex) {
+          swipes.push(incoming !== undefined && incoming.length > 0 ? incoming : existing);
+        } else if (incoming !== undefined && incoming.length > 0) {
+          swipes.push(incoming);
+        } else if (existing.length > 0 && idx < normalized.swipes.length) {
+          swipes.push(existing);
+        } else {
+          swipes.push(incoming ?? existing);
+        }
+      }
+      const fallbackDate = Math.floor(Date.now() / 1000);
+      const swipeDates = swipes.map((_, idx) => {
+        const incomingDate = normalized.swipeDates[idx];
+        if (typeof incomingDate === "number" && Number.isFinite(incomingDate)) {
+          return incomingDate;
+        }
+        const existingDate = current.swipeDates[idx];
+        if (typeof existingDate === "number" && Number.isFinite(existingDate)) {
+          return existingDate;
+        }
+        return fallbackDate;
+      });
       return {
         ...current,
         swipes,
@@ -3790,34 +4419,55 @@ export class GuidedGenerationRunner {
   private async readTargetMessageOrThrow(
     chatId: string,
     targetId: string,
+    options?: { includeExtra?: boolean },
   ): Promise<ChatMessageWithRole> {
-    const messages = await this.spindle.chat.getMessages(chatId);
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const candidate = messages[i];
-      if (candidate && candidate.id === targetId && isAssistantMessage(candidate)) {
-        return candidate;
-      }
+    const found = await this.findMessageById(chatId, targetId, {
+      includeExtra: options?.includeExtra ?? false,
+      requireAssistant: true,
+    });
+    if (found) {
+      return found;
     }
     throw new Error("Target assistant message is no longer available in this chat.");
   }
 
   private async findTrailingAssistantMessage(
     chatId: string,
+    options?: { includeExtra?: boolean },
   ): Promise<ChatMessageWithRole | null> {
-    const messages = await this.spindle.chat.getMessages(chatId);
+    const messages = await this.getChatMessagesWithOptions(chatId, {
+      tail: 1,
+      includeExtra: options?.includeExtra ?? true,
+    });
     const last = messages[messages.length - 1];
     return isAssistantMessage(last) ? (last ?? null) : null;
   }
 
   private async requireLastAssistantMessage(
     chatId: string,
+    options?: { includeExtra?: boolean },
   ): Promise<ChatMessageWithRole> {
-    const messages = await this.spindle.chat.getMessages(chatId);
-    const target = findLastAssistantMessage(messages);
-    if (!target) {
-      throw new Error("No assistant message found in this chat to continue or swipe.");
+    const includeExtra = options?.includeExtra ?? false;
+    const tailMsgs = await this.getChatMessagesWithOptions(chatId, {
+      tail: DEFAULT_TAIL_READ_LIMIT,
+      includeExtra,
+    });
+    const inTail = findLastAssistantMessage(tailMsgs);
+    if (inTail) return inTail;
+    if (tailMsgs.length >= DEFAULT_TAIL_READ_LIMIT) {
+      const widerMsgs = await this.getChatMessagesWithOptions(chatId, {
+        tail: WIDER_TAIL_READ_LIMIT,
+        includeExtra,
+      });
+      const inWider = findLastAssistantMessage(widerMsgs);
+      if (inWider) return inWider;
+      if (widerMsgs.length >= WIDER_TAIL_READ_LIMIT) {
+        const fullMsgs = await this.getChatMessagesWithOptions(chatId);
+        const inFull = findLastAssistantMessage(fullMsgs);
+        if (inFull) return inFull;
+      }
     }
-    return target;
+    throw new Error("No assistant message found in this chat to continue or swipe.");
   }
 
   private emitStatus(userId?: string, runId?: string): void {

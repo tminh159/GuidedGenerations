@@ -747,6 +747,69 @@ export class GuidedGenerationRunner {
     return fresh.map((entry) => ({ ...entry }));
   }
 
+  private async dispatchRunPushNotification(args: {
+    userId?: string;
+    chatId: string;
+    status: "done" | "error";
+    content?: string;
+    errorMessage?: string;
+    characterId?: string;
+    characterName?: string;
+  }): Promise<void> {
+    try {
+      if (
+        this.disposed ||
+        !this.spindle.permissions?.has?.("push_notification") ||
+        typeof this.spindle.push?.send !== "function"
+      ) {
+        return;
+      }
+
+      if (typeof this.spindle.push.getStatus === "function") {
+        const status = await this.spindle.push.getStatus(args.userId);
+        if (!status?.available) {
+          return;
+        }
+      }
+
+      let characterName =
+        typeof args.characterName === "string" && args.characterName.trim().length > 0
+          ? args.characterName.trim()
+          : undefined;
+      if (!characterName && args.characterId) {
+        characterName = await this.resolveCharacterName(args.characterId, args.userId);
+      }
+
+      const icon = args.characterId
+        ? `/api/v1/characters/${encodeURIComponent(args.characterId)}/avatar?size=sm`
+        : undefined;
+      const url = `/chat/${args.chatId}`;
+
+      const isError = args.status === "error";
+      const title = isError ? "Generation Failed" : characterName || "Lumiverse";
+      const body = isError
+        ? (args.errorMessage?.trim() || "The generation ended with an unknown error.").slice(0, 240)
+        : (args.content?.trim() || "Your generation finished.").slice(0, 120);
+      const tag = isError
+        ? `generation-error-${args.chatId}`
+        : `generation-${args.chatId}`;
+
+      await this.spindle.push.send(
+        {
+          title,
+          body,
+          tag,
+          url,
+          rawTitle: true,
+          ...(icon ? { icon } : {}),
+        },
+        args.userId,
+      );
+    } catch {
+      // Push failures must never break generation cleanup or surface as run errors.
+    }
+  }
+
   private handleTerminalRunError(args: {
     key: string;
     userId?: string;
@@ -769,6 +832,7 @@ export class GuidedGenerationRunner {
       error,
       emitErrorStatus,
     } = args;
+    const activeState = runId ? this.activeRuns.get(key)?.get(runId)?.state : undefined;
     if (runId) {
       this.deleteActiveRun(key, runId);
     }
@@ -783,6 +847,14 @@ export class GuidedGenerationRunner {
         error: message,
         startedAt: startedAt ?? finishedAt,
         finishedAt,
+      });
+      void this.dispatchRunPushNotification({
+        userId,
+        chatId: resolvedChatId,
+        status: "error",
+        errorMessage: message,
+        characterId: activeState?.characterId,
+        characterName: activeState?.characterName,
       });
     }
     if (emitErrorStatus) {
@@ -809,6 +881,7 @@ export class GuidedGenerationRunner {
     pendingEntry: PendingRun;
     controller: AbortController;
     wasAborted: boolean;
+    completedText?: string;
   }): void {
     const {
       key,
@@ -819,9 +892,11 @@ export class GuidedGenerationRunner {
       startedAt,
       pendingEntry,
       controller,
+      completedText,
     } = args;
     this.removePendingRun(key, pendingEntry);
     const wasAborted = args.wasAborted || controller.signal.aborted;
+    const activeState = runId ? this.activeRuns.get(key)?.get(runId)?.state : undefined;
     const deletedActive = Boolean(runId && this.deleteActiveRun(key, runId));
     if (runId && resolvedChatId && (deletedActive || wasAborted)) {
       const finishedAt = Date.now();
@@ -835,6 +910,16 @@ export class GuidedGenerationRunner {
       });
     }
     if (deletedActive) {
+      if (!wasAborted && resolvedChatId) {
+        void this.dispatchRunPushNotification({
+          userId,
+          chatId: resolvedChatId,
+          status: "done",
+          content: completedText,
+          characterId: activeState?.characterId,
+          characterName: activeState?.characterName,
+        });
+      }
       this.emitFrontend(
         {
           type: "gg:status",
@@ -926,6 +1011,7 @@ export class GuidedGenerationRunner {
     let runStartedAt: number | undefined;
     let resolvedChatId: string | undefined;
     let wasAborted = false;
+    let completedText: string | undefined;
     let emitErrorStatus = true;
 
     try {
@@ -1586,6 +1672,7 @@ export class GuidedGenerationRunner {
           }
         }
         wasAborted = result.aborted;
+        completedText = result.text;
         return result;
       } catch (error) {
         if (pendingSlotWritePromise) {
@@ -1633,6 +1720,7 @@ export class GuidedGenerationRunner {
         pendingEntry,
         controller,
         wasAborted,
+        completedText,
       });
     }
   }
@@ -1775,6 +1863,7 @@ export class GuidedGenerationRunner {
     let runStartedAt: number | undefined;
     let resolvedChatId: string | undefined;
     let wasAborted = false;
+    let completedText: string | undefined;
     let emitErrorStatus = true;
 
     try {
@@ -2138,6 +2227,7 @@ export class GuidedGenerationRunner {
         });
 
         wasAborted = streamRes.aborted;
+        completedText = streamRes.finalText;
         return {
           runId,
           actionId: "guided_continue",
@@ -2184,6 +2274,7 @@ export class GuidedGenerationRunner {
         pendingEntry,
         controller,
         wasAborted,
+        completedText,
       });
     }
   }

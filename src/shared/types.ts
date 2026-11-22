@@ -123,6 +123,7 @@ export interface ExtensionBootstrapView {
     presets: boolean;
     regex_scripts: boolean;
     interceptor: boolean;
+    push_notification?: boolean;
   };
   catalogWarnings?: string[];
 }

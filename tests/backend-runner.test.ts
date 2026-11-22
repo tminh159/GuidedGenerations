@@ -64,12 +64,16 @@ interface HarnessOptions {
       | "characters"
       | "presets"
       | "regex_scripts"
-      | "interceptor",
+      | "interceptor"
+      | "push_notification",
       boolean
     >
   >;
   chats?: Record<string, ChatMessageWithRole[]>;
   chatCharacterIds?: Record<string, string>;
+  characterNames?: Record<string, string>;
+  pushAvailable?: boolean;
+  pushSendThrows?: boolean;
   activeChatByUser?: Record<string, string | null>;
   presets?: Record<
     string,
@@ -132,6 +136,7 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     presets: true,
     regex_scripts: true,
     interceptor: true,
+    push_notification: false,
     ...options.permissions,
   };
 
@@ -166,6 +171,19 @@ function createSpindleHarness(options: HarnessOptions = {}) {
   const regexGetActiveCalls: Array<Record<string, unknown>> = [];
   const macroResolveCalls: Array<{ template: string; opts?: Record<string, unknown> }> = [];
   const countTextCalls: Array<{ text: string; opts?: Record<string, unknown> }> = [];
+  const pushStatusCalls: Array<{ userId?: string }> = [];
+  const pushSendCalls: Array<{
+    input: {
+      title: string;
+      body: string;
+      tag?: string;
+      url?: string;
+      icon?: string;
+      rawTitle?: boolean;
+      image?: string;
+    };
+    userId?: string;
+  }> = [];
   const updateMessageCalls: Array<{
     chatId: string;
     messageId: string;
@@ -357,6 +375,40 @@ function createSpindleHarness(options: HarnessOptions = {}) {
                 : {}),
             }
           : null;
+      },
+    },
+    characters: {
+      get: async (characterId: string) => {
+        const name = options.characterNames?.[characterId];
+        return name ? { id: characterId, name } : null;
+      },
+    },
+    push: {
+      getStatus: async (userId?: string) => {
+        pushStatusCalls.push({ userId });
+        const available = options.pushAvailable !== false;
+        return {
+          available,
+          subscriptionCount: available ? 1 : 0,
+        };
+      },
+      send: async (
+        input: {
+          title: string;
+          body: string;
+          tag?: string;
+          url?: string;
+          icon?: string;
+          rawTitle?: boolean;
+          image?: string;
+        },
+        userId?: string,
+      ) => {
+        pushSendCalls.push({ input, userId });
+        if (options.pushSendThrows) {
+          throw new Error("Push transport failed");
+        }
+        return { sent: 1 };
       },
     },
     chat: {
@@ -595,6 +647,8 @@ function createSpindleHarness(options: HarnessOptions = {}) {
     regexGetActiveCalls,
     macroResolveCalls,
     countTextCalls,
+    pushStatusCalls,
+    pushSendCalls,
     updateMessageCalls,
     triggerFrontendMessage: (payload: unknown, userId: string) => {
       frontendMessageHandler?.(payload, userId);
@@ -1286,6 +1340,7 @@ describe("backend handleRpc orchestration", () => {
         presets: true,
         regex_scripts: true,
         interceptor: false,
+        push_notification: false,
       });
     });
   });
@@ -9207,5 +9262,197 @@ describe("bounded tail reads, startup parallelization, and concurrent native swi
     expect(regenRes.text).toBe("Base text fresh");
     expect(regenMsg.swipes).toEqual(["Base text fresh"]);
     expect(regenMsg.swipe_id).toBe(0);
+  });
+});
+
+describe("native push notifications via spindle.push", () => {
+  const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+  test("sends native push notification on successful completion with character title, avatar, and chat URL", async () => {
+    const longReply = "A".repeat(160);
+    const harness = createSpindleHarness({
+      permissions: { push_notification: true },
+      chatCharacterIds: { "chat-42": "char-7" },
+      characterNames: { "char-7": "Aria" },
+      chats: {
+        "chat-42": [makeMessage({ id: "u1", chat_id: "chat-42", role: "user", content: "Hi" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: longReply };
+        yield { type: "done", content: longReply, finish_reason: "stop" };
+      },
+    });
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    const res = await runner.run(
+      { actionId: "guided_response", chatId: "chat-42", inputText: "Respond" },
+      "user-9",
+    );
+    expect(res.aborted).toBe(false);
+    await flushAsync();
+
+    expect(harness.pushStatusCalls).toEqual([{ userId: "user-9" }]);
+    expect(harness.pushSendCalls).toEqual([
+      {
+        userId: "user-9",
+        input: {
+          title: "Aria",
+          body: "A".repeat(120),
+          tag: "generation-chat-42",
+          url: "/chat/chat-42",
+          rawTitle: true,
+          icon: "/api/v1/characters/char-7/avatar?size=sm",
+        },
+      },
+    ]);
+  });
+
+  test("sends Generation Failed push notification when a started run errors", async () => {
+    const harness = createSpindleHarness({
+      permissions: { push_notification: true },
+      chats: {
+        "chat-err": [makeMessage({ id: "u1", chat_id: "chat-err", role: "user", content: "Hi" })],
+      },
+      rawStreamImpl: async function* () {
+        yield { type: "token", token: "" };
+        throw new Error("Upstream model timed out");
+      },
+    });
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    await expect(
+      runner.run({ actionId: "guided_response", chatId: "chat-err", inputText: "Go" }, "user-2"),
+    ).rejects.toThrow("Upstream model timed out");
+    await flushAsync();
+
+    expect(harness.pushSendCalls).toEqual([
+      {
+        userId: "user-2",
+        input: {
+          title: "Generation Failed",
+          body: "Upstream model timed out",
+          tag: "generation-error-chat-err",
+          url: "/chat/chat-err",
+          rawTitle: true,
+        },
+      },
+    ]);
+  });
+
+  test("does not send push notification when a run is aborted", async () => {
+    let releaseStream!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    let markStarted!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+
+    const harness = createSpindleHarness({
+      permissions: { push_notification: true },
+      chats: {
+        "chat-abort": [makeMessage({ id: "u1", chat_id: "chat-abort", role: "user", content: "Hi" })],
+      },
+      rawStreamImpl: async function* (input) {
+        yield { type: "token", token: "Partial" };
+        markStarted();
+        await gate;
+        if (input.signal?.aborted) {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+        yield { type: "done", content: "Partial", finish_reason: "stop" };
+      },
+    });
+    const store = new SettingsStore(harness.api);
+    const runner = new GuidedGenerationRunner(harness.api, store, () => {});
+
+    const runPromise = runner.run(
+      { actionId: "guided_response", chatId: "chat-abort", inputText: "Go" },
+      "user-3",
+    );
+    await startedPromise;
+    expect(runner.abortCurrent("user-3", undefined, "chat-abort")).toBe(true);
+    releaseStream();
+
+    const res = await runPromise;
+    expect(res.aborted).toBe(true);
+    await flushAsync();
+
+    expect(harness.pushSendCalls).toEqual([]);
+  });
+
+  test("skips push when push_notification permission is missing or push is unavailable, and swallows send errors", async () => {
+    const noPermHarness = createSpindleHarness({
+      permissions: { push_notification: false },
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hi" })],
+      },
+    });
+    const noPermRunner = new GuidedGenerationRunner(
+      noPermHarness.api,
+      new SettingsStore(noPermHarness.api),
+      () => {},
+    );
+    await noPermRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+    await flushAsync();
+    expect(noPermHarness.pushStatusCalls).toEqual([]);
+    expect(noPermHarness.pushSendCalls).toEqual([]);
+
+    const unavailHarness = createSpindleHarness({
+      permissions: { push_notification: true },
+      pushAvailable: false,
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hi" })],
+      },
+    });
+    const unavailRunner = new GuidedGenerationRunner(
+      unavailHarness.api,
+      new SettingsStore(unavailHarness.api),
+      () => {},
+    );
+    await unavailRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+    await flushAsync();
+    expect(unavailHarness.pushStatusCalls).toEqual([{ userId: "u1" }]);
+    expect(unavailHarness.pushSendCalls).toEqual([]);
+
+    const throwHarness = createSpindleHarness({
+      permissions: { push_notification: true },
+      pushSendThrows: true,
+      chats: {
+        "chat-1": [makeMessage({ id: "u1", role: "user", content: "Hi" })],
+      },
+    });
+    const throwRunner = new GuidedGenerationRunner(
+      throwHarness.api,
+      new SettingsStore(throwHarness.api),
+      () => {},
+    );
+    const res = await throwRunner.run(
+      { actionId: "guided_response", chatId: "chat-1", inputText: "Go" },
+      "u1",
+    );
+    expect(res.aborted).toBe(false);
+    await flushAsync();
+    expect(throwHarness.pushSendCalls).toHaveLength(1);
+  });
+
+  test("get_bootstrap reports push_notification permission state", async () => {
+    const harness = createSpindleHarness({
+      permissions: { push_notification: true },
+    });
+    const { buildBootstrapView } = registerBackend(harness.api);
+    const view = await buildBootstrapView("u1");
+    expect(view.permissions.push_notification).toBe(true);
   });
 });

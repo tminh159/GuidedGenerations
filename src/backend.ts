@@ -90,6 +90,7 @@ export function registerBackend(api: SpindleAPI) {
         presets: api.permissions.has("presets"),
         regex_scripts: api.permissions.has("regex_scripts"),
         interceptor: api.permissions.has("interceptor"),
+        push_notification: api.permissions.has("push_notification"),
       },
       ...(catalogs.warnings.length > 0 ? { catalogWarnings: catalogs.warnings } : {}),
     };

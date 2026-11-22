@@ -5,11 +5,9 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "strict": true,
-    "outDir": "dist",
-    "rootDir": ".",
     "noEmit": true,
-    "declaration": false,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["bun-types"]
   },
   "include": ["src", "tests"],
   "exclude": ["dist", "storage"]

@@ -253,12 +253,46 @@ function validateFlags(flags: string): boolean {
   return true;
 }
 
+function hasClassLiteralOverlap(
+  classTokens: readonly string[],
+  branches: readonly string[],
+): boolean {
+  if (classTokens.length === 0 || branches.length === 0) return false;
+  for (const token of classTokens) {
+    const needsUnicode = token.startsWith("\\p") || token.startsWith("\\P");
+    let re: RegExp;
+    try {
+      re = new RegExp(`^(?:${token})`, needsUnicode ? "iu" : "i");
+    } catch {
+      return true;
+    }
+    for (const branch of branches) {
+      if (!branch) return true;
+      const firstCp = String.fromCodePoint(branch.codePointAt(0)!);
+      if (re.test(firstCp)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function hasOverlappingAlternationBranches(
   branches: readonly string[],
   hasEmptyBranch: boolean,
   hasCharClassOrShorthandOverlap: boolean,
+  classBranchTokens: readonly string[] = [],
+  totalBranches = 0,
 ): boolean {
   if (hasEmptyBranch || hasCharClassOrShorthandOverlap) return true;
+  if (classBranchTokens.length > 0) {
+    if (hasClassLiteralOverlap(classBranchTokens, branches)) {
+      return true;
+    }
+    if (totalBranches > classBranchTokens.length + branches.length) {
+      return true;
+    }
+  }
   if (branches.length < 2) {
     return branches.length === 1 && !branches[0];
   }
@@ -285,12 +319,15 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
     hasWildcard: boolean;
     hasAlternation: boolean;
     hasOptionalElement: boolean;
-    mandatoryCount: number;
+    currentBranchMandatoryCount: number;
+    minBranchMandatoryCount: number;
     branches: string[];
     currentBranchPrefix: string;
     currentBranchOpen: boolean;
     hasEmptyBranch: boolean;
     classLikeBranches: number;
+    classBranchTokens: string[];
+    totalBranches: number;
   }
 
   const createFrame = (): GroupFrame => ({
@@ -298,16 +335,37 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
     hasWildcard: false,
     hasAlternation: false,
     hasOptionalElement: false,
-    mandatoryCount: 0,
+    currentBranchMandatoryCount: 0,
+    minBranchMandatoryCount: Number.POSITIVE_INFINITY,
     branches: [],
     currentBranchPrefix: "",
     currentBranchOpen: true,
     hasEmptyBranch: false,
     classLikeBranches: 0,
+    classBranchTokens: [],
+    totalBranches: 0,
   });
+
+  const decodeBranchEscape = (esc: string): string => {
+    switch (esc) {
+      case "n":
+        return "\n";
+      case "r":
+        return "\r";
+      case "t":
+        return "\t";
+      case "f":
+        return "\f";
+      case "v":
+        return "\v";
+      default:
+        return esc;
+    }
+  };
 
   const stack: GroupFrame[] = [createFrame()];
   let inCharClass = false;
+  let charClassStart = 0;
   let pendingWildClass = false;
   let lastWasQuantifiableAtom = false;
   let lastWasWildcard = false;
@@ -362,21 +420,23 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
         const close = pattern.indexOf("}", i + 3);
         if (close >= 0) advance = close - i + 1;
       }
+      const rawToken = pattern.slice(i, i + advance);
       i += advance;
       if (!inCharClass) {
         const isAnchor = esc === "b" || esc === "B";
         lastWasQuantifiableAtom = !isAnchor;
         lastWasWildcard = false;
         if (!isAnchor) {
-          top.mandatoryCount += 1;
+          top.currentBranchMandatoryCount += 1;
           lastAtomIsUnboundedQuantifiedWildcard = false;
           if (esc === "w" || esc === "W" || esc === "d" || esc === "D" || esc === "s" || esc === "S" || esc === "p" || esc === "P") {
             if (top.currentBranchOpen && top.currentBranchPrefix.length === 0) {
               top.classLikeBranches += 1;
+              top.classBranchTokens.push(rawToken);
             }
             top.currentBranchOpen = false;
           } else if (top.currentBranchOpen && top.currentBranchPrefix.length < 16) {
-            top.currentBranchPrefix += esc;
+            top.currentBranchPrefix += decodeBranchEscape(esc);
           }
         }
       }
@@ -392,9 +452,10 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
           lastAtomIsUnboundedQuantifiedWildcard = false;
         }
         pendingWildClass = false;
-        top.mandatoryCount += 1;
+        top.currentBranchMandatoryCount += 1;
         if (top.currentBranchOpen && top.currentBranchPrefix.length === 0) {
           top.classLikeBranches += 1;
+          top.classBranchTokens.push(pattern.slice(charClassStart, i + 1));
         }
         top.currentBranchOpen = false;
       }
@@ -404,6 +465,7 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
 
     if (ch === "[") {
       inCharClass = true;
+      charClassStart = i;
       WILD_CLASS_AT_RE.lastIndex = i;
       const isWildClass = WILD_CLASS_AT_RE.test(pattern);
       pendingWildClass = isWildClass;
@@ -442,15 +504,21 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
     if (ch === ")") {
       const closed = stack.length > 1 ? stack.pop()! : null;
       const parent = stack[stack.length - 1]!;
+      let closedMinMandatory = 0;
       if (closed) {
-        if (closed.currentBranchPrefix.length === 0 && closed.mandatoryCount === 0) {
+        closed.totalBranches += 1;
+        closedMinMandatory = Math.min(
+          closed.minBranchMandatoryCount,
+          closed.currentBranchMandatoryCount,
+        );
+        if (closed.currentBranchMandatoryCount === 0) {
           closed.hasEmptyBranch = true;
         } else if (closed.currentBranchPrefix.length > 0) {
           closed.branches.push(closed.currentBranchPrefix);
         }
         if (closed.hasInnerQuantifier) parent.hasInnerQuantifier = true;
         if (closed.hasWildcard) parent.hasWildcard = true;
-        if (closed.mandatoryCount > 0) parent.mandatoryCount += 1;
+        if (closedMinMandatory > 0) parent.currentBranchMandatoryCount += 1;
       }
       lastWasQuantifiableAtom = true;
       lastWasWildcard = false;
@@ -461,7 +529,7 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
         if (closed && q.maxMoreThanOne) {
           if (
             closed.hasInnerQuantifier &&
-            (q.unbounded || closed.hasWildcard || closed.hasOptionalElement || closed.mandatoryCount <= 1)
+            (q.unbounded || closed.hasWildcard || closed.hasOptionalElement || closedMinMandatory <= 1)
           ) {
             return true;
           }
@@ -473,6 +541,8 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
                 closed.branches,
                 closed.hasEmptyBranch,
                 closed.classLikeBranches > 1,
+                closed.classBranchTokens,
+                closed.totalBranches,
               ))
           ) {
             return true;
@@ -480,8 +550,11 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
         }
         if (q.min === 0) {
           parent.hasOptionalElement = true;
-          if (closed && closed.mandatoryCount > 0) {
-            parent.mandatoryCount = Math.max(0, parent.mandatoryCount - 1);
+          if (closed && closedMinMandatory > 0) {
+            parent.currentBranchMandatoryCount = Math.max(
+              0,
+              parent.currentBranchMandatoryCount - 1,
+            );
           }
         }
         if (q.maxMoreThanOne) {
@@ -495,11 +568,17 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
 
     if (ch === "|") {
       top.hasAlternation = true;
-      if (top.currentBranchPrefix.length === 0 && top.currentBranchOpen) {
+      top.totalBranches += 1;
+      top.minBranchMandatoryCount = Math.min(
+        top.minBranchMandatoryCount,
+        top.currentBranchMandatoryCount,
+      );
+      if (top.currentBranchMandatoryCount === 0) {
         top.hasEmptyBranch = true;
       } else if (top.currentBranchPrefix.length > 0) {
         top.branches.push(top.currentBranchPrefix);
       }
+      top.currentBranchMandatoryCount = 0;
       top.currentBranchPrefix = "";
       top.currentBranchOpen = true;
       lastWasQuantifiableAtom = false;
@@ -513,7 +592,7 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
     if (q && lastWasQuantifiableAtom) {
       if (q.min === 0) {
         top.hasOptionalElement = true;
-        top.mandatoryCount = Math.max(0, top.mandatoryCount - 1);
+        top.currentBranchMandatoryCount = Math.max(0, top.currentBranchMandatoryCount - 1);
       }
       if (q.maxMoreThanOne) {
         top.hasInnerQuantifier = true;
@@ -552,7 +631,7 @@ function isLikelyCatastrophicRegex(pattern: string): boolean {
       }
     }
 
-    top.mandatoryCount += 1;
+    top.currentBranchMandatoryCount += 1;
     lastWasQuantifiableAtom = true;
     i += 1;
   }

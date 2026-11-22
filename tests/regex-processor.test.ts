@@ -612,4 +612,81 @@ describe("regex-processor", () => {
       'Compute 2 * 3 * 4 then *whisper* and **bold** with "spaced" and <em data-x=" * keep * "> _under_ </em>',
     );
   });
+
+  test("applyRegexScripts blocks mixed class+literal overlapping alternations and empty-branch alternation groups while allowing disjoint class+literal alternations", async () => {
+    const mixedClassOverlap = makeScript({
+      id: "redos-class-literal",
+      find_regex: "([a-z]|a)+!",
+      replace_string: "REPLACED",
+    });
+    const mixedShorthandOverlap = makeScript({
+      id: "redos-shorthand-literal",
+      find_regex: "(\\w|a)+!",
+      replace_string: "REPLACED",
+    });
+    const reversedShorthandOverlap = makeScript({
+      id: "redos-literal-shorthand",
+      find_regex: "(a|\\w)+!",
+      replace_string: "REPLACED",
+    });
+    const whitespaceControlOverlap = makeScript({
+      id: "redos-ws-tab",
+      find_regex: "(\\s|\\t)+!",
+      replace_string: "REPLACED",
+    });
+    const trailingEmptyBranch = makeScript({
+      id: "redos-trailing-empty-branch",
+      find_regex: "(a|)+!",
+      replace_string: "REPLACED",
+    });
+    const leadingEmptyBranch = makeScript({
+      id: "redos-leading-empty-branch",
+      find_regex: "(|a)+!",
+      replace_string: "REPLACED",
+    });
+    const anchorOnlyBranch = makeScript({
+      id: "redos-anchor-only-branch",
+      find_regex: "(a|\\b)+!",
+      replace_string: "REPLACED",
+    });
+
+    const input = "a".repeat(30);
+    expect(
+      await applyRegexScripts(
+        input,
+        [
+          mixedClassOverlap,
+          mixedShorthandOverlap,
+          reversedShorthandOverlap,
+          whitespaceControlOverlap,
+          trailingEmptyBranch,
+          leadingEmptyBranch,
+          anchorOnlyBranch,
+        ],
+        "ai_output",
+        0,
+      ),
+    ).toBe(input);
+
+    // Disjoint class + literal alternations remain allowed
+    const safeDigitOrDash = makeScript({
+      id: "safe-digit-or-dash",
+      find_regex: "(\\d|-)+",
+      replace_string: "NUM",
+      flags: "g",
+    });
+    expect(await applyRegexScripts("code 12-34 ok", [safeDigitOrDash], "ai_output", 0)).toBe(
+      "code NUM ok",
+    );
+
+    const safeAlphaOrUnderscore = makeScript({
+      id: "safe-alpha-or-underscore",
+      find_regex: "([a-z]|_)+",
+      replace_string: "ID",
+      flags: "g",
+    });
+    expect(
+      await applyRegexScripts("foo_bar 123", [safeAlphaOrUnderscore], "ai_output", 0),
+    ).toBe("ID 123");
+  });
 });

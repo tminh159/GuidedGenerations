@@ -81,6 +81,7 @@ export function registerBackend(api: SpindleAPI) {
       recovery,
       activeRun: runner.getActiveRun(userId),
       activeRuns: runner.getActiveRuns(userId),
+      recentTerminalRuns: runner.getRecentTerminalRuns(userId),
       permissions: {
         generation: api.permissions.has("generation"),
         chats: api.permissions.has("chats"),

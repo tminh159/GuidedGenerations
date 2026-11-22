@@ -95,6 +95,18 @@ export interface ActiveRunState {
   avatarUrl?: string;
 }
 
+export type TerminalRunStatus = "done" | "aborted" | "error";
+
+export interface TerminalRunSummary {
+  runId: string;
+  actionId: GuidedActionId;
+  chatId: string;
+  status: TerminalRunStatus;
+  error?: string;
+  startedAt: number;
+  finishedAt: number;
+}
+
 export interface ExtensionBootstrapView {
   settings: GuidedGenerationsSettings;
   connections: ConnectionOptionSummary[];
@@ -102,6 +114,7 @@ export interface ExtensionBootstrapView {
   recovery: RecoveryEntry[];
   activeRun: ActiveRunState | null;
   activeRuns?: ActiveRunState[];
+  recentTerminalRuns?: TerminalRunSummary[];
   permissions: {
     generation: boolean;
     chats: boolean;

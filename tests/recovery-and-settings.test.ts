@@ -1753,6 +1753,16 @@ describe("InputToolbarController DOM behavior", () => {
         hasActiveChat: true,
       });
 
+      // Live refresh keeps recovery drop-up open and enables Clear History
+      const refreshedClearBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="clear_history"]',
+      )!;
+      expect(refreshedClearBtn).not.toBeNull();
+      expect(refreshedClearBtn.disabled).toBe(false);
+      // Close before re-opening with tight viewport rect
+      document.dispatchEvent(new Win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+
       // 2. Tight viewport clamps menuEl.style.maxHeight and .gg-dropup-history-list maxHeight
       const recBtn2 = actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
       recBtn2.getBoundingClientRect = () =>
@@ -2398,6 +2408,208 @@ describe("InputToolbarController DOM behavior", () => {
     } finally {
       streamCtrl.destroy();
       row.remove();
+    }
+  });
+
+  test("frontend audit fixes: recovery drop-up live refresh, scroll containment, open custom Select drawer protection, and theme-aware contrast CSS", async () => {
+    const Win = document.defaultView!;
+
+    // 1. Styles: no hardcoded pale #fecaca / #fde68a on running button or error/warn notices
+    expect(GUIDED_GENERATIONS_CSS).not.toContain("#fecaca");
+    expect(GUIDED_GENERATIONS_CSS).not.toContain("#fde68a");
+    expect(GUIDED_GENERATIONS_CSS).toMatch(/\.gg-btn\.is-running\s*\{[^}]*var\(--lumiverse-danger/);
+    expect(GUIDED_GENERATIONS_CSS).toMatch(/\.gg-notice\.is-error\s*\{[^}]*var\(--lumiverse-danger-text/);
+    expect(GUIDED_GENERATIONS_CSS).toMatch(/\.gg-notice\.is-warn\s*\{[^}]*var\(--lumiverse-warning-text/);
+
+    // 2. Drop-up live refreshRecovery() + scroll containment on unrelated vs ancestor/root scroll
+    const outerScrollHost = document.createElement("div");
+    const actionsMount = document.createElement("span");
+    outerScrollHost.append(actionsMount);
+    const unrelatedChatLog = document.createElement("div");
+    document.body.append(outerScrollHost, unrelatedChatLog);
+
+    const toolbar = new InputToolbarController(
+      { ui: { mount: () => actionsMount } } as unknown as SpindleFrontendContext,
+      {
+        onTriggerAction: () => {},
+        onAbortAction: () => {},
+        onRestoreLatest: () => {},
+        onRestoreEntry: () => {},
+        onClearRecovery: () => {},
+        onRemoveLastContinue: () => {},
+        onRegenerateLastContinue: () => {},
+      },
+    );
+
+    try {
+      const settings = createDefaultSettings();
+      const entry1: RecoveryEntry = {
+        id: "r1",
+        text: "First draft",
+        actionId: "guided_response",
+        chatId: "c1",
+        createdAt: 100,
+      };
+      const entry2: RecoveryEntry = {
+        id: "r2",
+        text: "Second draft",
+        actionId: "guided_swipe",
+        chatId: "c1",
+        createdAt: 200,
+      };
+      toolbar.render({ settings, activeRun: null, recovery: [entry1], hasActiveChat: true, chatId: "c1" });
+
+      const recBtn = actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="input_recovery"]')!;
+      let anchorTop = 400;
+      recBtn.getBoundingClientRect = () =>
+        ({
+          top: anchorTop,
+          bottom: anchorTop + 26,
+          left: 100,
+          right: 130,
+          width: 30,
+          height: 26,
+          x: 100,
+          y: anchorTop,
+          toJSON: () => ({}),
+        }) as DOMRect;
+
+      // Open recovery menu and switch to History view
+      recBtn.dispatchEvent(new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+      const historyBtn = document.body.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="history"]',
+      )!;
+      historyBtn.click();
+      expect(document.body.querySelectorAll('.gg-dropup-menu [data-gg-recovery-id]')).toHaveLength(1);
+
+      // Update recovery with new top entry -> menu stays OPEN, aria-expanded remains true, and History refreshes live
+      toolbar.render({ settings, activeRun: null, recovery: [entry2, entry1], hasActiveChat: true, chatId: "c1" });
+      expect(document.body.querySelector(".gg-dropup-menu")).not.toBeNull();
+      expect(recBtn.getAttribute("aria-expanded")).toBe("true");
+      const liveIds = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>('.gg-dropup-menu [data-gg-recovery-id]'),
+      ).map((el) => el.getAttribute("data-gg-recovery-id"));
+      expect(liveIds).toEqual(["r2", "r1"]);
+
+      // Unrelated container scroll (e.g. chat log auto-scroll) does NOT close the menu
+      unrelatedChatLog.dispatchEvent(new Win.Event("scroll", { bubbles: false }));
+      expect(document.body.querySelector(".gg-dropup-menu")).not.toBeNull();
+
+      // Ancestor container scroll (containing anchorBtn) DOES close the menu
+      outerScrollHost.dispatchEvent(new Win.Event("scroll", { bubbles: false }));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+
+      // Re-open, shift anchorBtn rect, then unrelated scroll DOES close because anchor moved
+      recBtn.dispatchEvent(new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+      expect(document.body.querySelector(".gg-dropup-menu")).not.toBeNull();
+      anchorTop = 320;
+      unrelatedChatLog.dispatchEvent(new Win.Event("scroll", { bubbles: false }));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+
+      // Re-open, document scroll DOES close
+      recBtn.dispatchEvent(new Win.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+      expect(document.body.querySelector(".gg-dropup-menu")).not.toBeNull();
+      document.dispatchEvent(new Win.Event("scroll", { bubbles: false }));
+      expect(document.body.querySelector(".gg-dropup-menu")).toBeNull();
+    } finally {
+      toolbar.destroy();
+      outerScrollHost.remove();
+      unrelatedChatLog.remove();
+    }
+
+    // 3. SettingsDrawerController defers re-renders while custom Spindle Select is open,
+    //    but does NOT block renders when only a .gg-card-header is expanded
+    const tabRoot = document.createElement("div");
+    document.body.append(tabRoot);
+    let selectTriggerEl: HTMLButtonElement | null = null;
+    const fakeDrawerCtx = {
+      ui: {
+        registerDrawerTab: () => ({
+          tabId: "gg-tab",
+          root: tabRoot,
+          onActivate: () => () => {},
+          destroy: () => {},
+        }),
+      },
+      components: {
+        mountSwitch: (slot: HTMLElement) => {
+          const btn = document.createElement("button");
+          btn.setAttribute("role", "switch");
+          slot.append(btn);
+          return { update: () => {}, destroy: () => btn.remove() };
+        },
+        mountSelect: (slot: HTMLElement) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.setAttribute("role", "combobox");
+          btn.setAttribute("aria-expanded", "false");
+          slot.append(btn);
+          if (!selectTriggerEl) selectTriggerEl = btn;
+          return { update: () => {}, destroy: () => btn.remove() };
+        },
+        mountNumberInput: (slot: HTMLElement) => {
+          const input = document.createElement("input");
+          slot.append(input);
+          return { update: () => {}, destroy: () => input.remove() };
+        },
+        mountTextArea: (slot: HTMLElement) => {
+          const ta = document.createElement("textarea");
+          slot.append(ta);
+          return { update: () => {}, destroy: () => ta.remove() };
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const drawer = new SettingsDrawerController(fakeDrawerCtx, {
+      onRefresh: () => {},
+      onSaveSettings: async () => {},
+      onRestoreEntry: () => {},
+      onClearRecovery: async () => {},
+    });
+
+    try {
+      const baseView: ExtensionBootstrapView = {
+        settings: createDefaultSettings(),
+        connections: [],
+        presets: [],
+        recovery: [],
+        activeRun: null,
+        permissions: {
+          generation: true,
+          chats: true,
+          chat_mutation: true,
+          presets: true,
+          regex_scripts: true,
+          interceptor: true,
+        },
+      };
+      drawer.render(baseView);
+      const firstRoot = tabRoot.querySelector(".gg-drawer");
+      expect(firstRoot).not.toBeNull();
+
+      // Open a section card (.gg-card-header[aria-expanded="true"]) -> non-forced render must still proceed
+      const cardHeader = tabRoot.querySelector<HTMLButtonElement>(".gg-card-header")!;
+      cardHeader.click();
+      expect(cardHeader.getAttribute("aria-expanded")).toBe("true");
+      drawer.render({ ...baseView, catalogWarnings: ["Warn 1"] });
+      const secondRoot = tabRoot.querySelector(".gg-drawer");
+      expect(secondRoot).not.toBe(firstRoot);
+
+      // Now open a custom Spindle Select ([role="combobox"][aria-expanded="true"]) -> non-forced render MUST defer
+      const combobox = tabRoot.querySelector<HTMLButtonElement>('[role="combobox"]')!;
+      combobox.setAttribute("aria-expanded", "true");
+      drawer.render({ ...baseView, catalogWarnings: ["Warn 2"] });
+      expect(tabRoot.querySelector(".gg-drawer")).toBe(secondRoot);
+      expect(combobox.isConnected).toBe(true);
+
+      // Close select and dispatch focusout -> deferred pendingView flushes
+      combobox.setAttribute("aria-expanded", "false");
+      tabRoot.dispatchEvent(new Win.FocusEvent("focusout", { bubbles: true, relatedTarget: null }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(tabRoot.querySelector(".gg-drawer")).not.toBe(secondRoot);
+    } finally {
+      drawer.destroy();
+      tabRoot.remove();
     }
   });
 });

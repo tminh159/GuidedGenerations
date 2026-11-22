@@ -36,6 +36,7 @@ export interface InputToolbarHandlers {
 export interface ToolbarRenderState {
   settings: GuidedGenerationsSettings;
   activeRun: ActiveRunState | null;
+  isBusy?: boolean;
   recovery: readonly RecoveryEntry[];
   hasActiveChat: boolean;
   chatId?: string | null;
@@ -47,6 +48,7 @@ interface ToolbarRenderSignature {
   enabledMask: number;
   hasActiveChat: boolean;
   hasActiveRun: boolean;
+  isBusy: boolean;
   activeRunId: string | null;
   activeRunActionId: GuidedActionId | null;
   hasRecovery: boolean;
@@ -81,6 +83,7 @@ function buildToolbarRenderSignature(
     enabledMask,
     hasActiveChat: Boolean(state.hasActiveChat),
     hasActiveRun: Boolean(state.activeRun),
+    isBusy: Boolean(state.isBusy || state.activeRun),
     activeRunId: state.activeRun?.runId ?? null,
     activeRunActionId: state.activeRun?.actionId ?? null,
     hasRecovery,
@@ -90,7 +93,7 @@ function buildToolbarRenderSignature(
   };
 }
 
-function areToolbarSignaturesEqual(
+function areCoreToolbarSignaturesEqual(
   a: ToolbarRenderSignature,
   b: ToolbarRenderSignature,
 ): boolean {
@@ -99,10 +102,9 @@ function areToolbarSignaturesEqual(
     a.enabledMask !== b.enabledMask ||
     a.hasActiveChat !== b.hasActiveChat ||
     a.hasActiveRun !== b.hasActiveRun ||
+    a.isBusy !== b.isBusy ||
     a.activeRunId !== b.activeRunId ||
     a.activeRunActionId !== b.activeRunActionId ||
-    a.hasRecovery !== b.hasRecovery ||
-    a.latestRecoveryPreview !== b.latestRecoveryPreview ||
     a.order.length !== b.order.length
   ) {
     return false;
@@ -111,6 +113,17 @@ function areToolbarSignaturesEqual(
     if (a.order[i] !== b.order[i]) return false;
   }
   return true;
+}
+
+function areToolbarSignaturesEqual(
+  a: ToolbarRenderSignature,
+  b: ToolbarRenderSignature,
+): boolean {
+  return (
+    areCoreToolbarSignaturesEqual(a, b) &&
+    a.hasRecovery === b.hasRecovery &&
+    a.latestRecoveryPreview === b.latestRecoveryPreview
+  );
 }
 
 const HOST_CLASSES = [
@@ -233,8 +246,17 @@ export class InputToolbarController {
       return;
     }
 
-    this.closeContinueMenu({ restoreFocus: false });
-    this.clearActiveHold();
+    const preserveRecoveryMenu =
+      !chatChanged &&
+      this.continueMenu?.kind === "recovery" &&
+      this.lastRenderSignature !== null &&
+      isAttachedToTarget &&
+      areCoreToolbarSignaturesEqual(this.lastRenderSignature, nextSignature);
+
+    if (!preserveRecoveryMenu) {
+      this.closeContinueMenu({ restoreFocus: false });
+      this.clearActiveHold();
+    }
     this.latestRecovery = state.recovery;
 
     const visibleIds: ToolbarOptionId[] = [];
@@ -263,7 +285,15 @@ export class InputToolbarController {
       this.applyRovingTabIndex();
       this.applyPlacement(nextSignature.placement, visibleIds.length > 0);
       this.lastRenderSignature = nextSignature;
+      if (preserveRecoveryMenu) {
+        this.continueMenu?.refreshRecovery?.();
+      }
       return;
+    }
+
+    if (preserveRecoveryMenu) {
+      this.closeContinueMenu({ restoreFocus: false });
+      this.clearActiveHold();
     }
 
     const activeEl = typeof document !== "undefined" ? document.activeElement : null;
@@ -420,7 +450,8 @@ export class InputToolbarController {
     const meta = ACTION_METADATA[actionId];
     const isThisRunning = state.activeRun?.actionId === actionId;
     const isOtherRunning = Boolean(state.activeRun) && !isThisRunning;
-    const disabled = !state.hasActiveChat || isOtherRunning;
+    const isBusyWithoutRun = Boolean(state.isBusy) && !state.activeRun;
+    const disabled = !state.hasActiveChat || isOtherRunning || isBusyWithoutRun;
 
     btn.classList.toggle("is-running", isThisRunning);
     btn.classList.toggle("is-dimmed", disabled);
@@ -608,7 +639,7 @@ export class InputToolbarController {
     };
 
     btn.addEventListener("pointerdown", (event) => {
-      if (btn.disabled || this.latestState?.activeRun) return;
+      if (btn.disabled || this.latestState?.activeRun || this.latestState?.isBusy) return;
       if (!event.isPrimary) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
 
@@ -679,7 +710,7 @@ export class InputToolbarController {
     });
 
     btn.addEventListener("keydown", (event) => {
-      if (btn.disabled || this.latestState?.activeRun) return;
+      if (btn.disabled || this.latestState?.activeRun || this.latestState?.isBusy) return;
       if (options.onShortcutKeyDown(event)) {
         event.preventDefault();
         event.stopPropagation();
@@ -783,12 +814,13 @@ export class InputToolbarController {
 
     document.body.append(menuEl);
     anchorBtn.setAttribute("aria-expanded", "true");
-    this.positionContinueMenu(menuEl, anchorBtn);
+    const initialAnchorRect = this.positionContinueMenu(menuEl, anchorBtn);
 
     const cleanup = this.attachDropupMenuLifecycle({
       menuEl,
       anchorBtn,
       items,
+      initialAnchorRect,
     });
 
     this.continueMenu = { kind: "continue", menuEl, anchorBtn, items, cleanup };
@@ -799,9 +831,10 @@ export class InputToolbarController {
     menuEl: HTMLDivElement;
     anchorBtn: HTMLButtonElement;
     items: HTMLButtonElement[];
+    initialAnchorRect: DOMRect;
     onBackKey?: () => boolean;
   }): () => void {
-    const { menuEl, anchorBtn, items, onBackKey } = options;
+    const { menuEl, anchorBtn, items, initialAnchorRect, onBackKey } = options;
     const openedAt = Date.now();
 
     const onMenuKeyDown = (event: KeyboardEvent) => {
@@ -878,7 +911,19 @@ export class InputToolbarController {
     const visualVp = win?.visualViewport ?? null;
     let lastVw = win?.innerWidth;
     let lastVh = win?.innerHeight;
+    let lastAnchorRect = initialAnchorRect;
     let resizeRafId: number | null = null;
+
+    const anchorPositionChanged = (): boolean => {
+      if (!anchorBtn.isConnected) return true;
+      const nextRect = anchorBtn.getBoundingClientRect();
+      return (
+        Math.abs(nextRect.left - lastAnchorRect.left) > 0.5 ||
+        Math.abs(nextRect.top - lastAnchorRect.top) > 0.5 ||
+        Math.abs(nextRect.right - lastAnchorRect.right) > 0.5 ||
+        Math.abs(nextRect.bottom - lastAnchorRect.bottom) > 0.5
+      );
+    };
 
     const scheduleReposition = () => {
       if (typeof requestAnimationFrame === "function") {
@@ -888,10 +933,10 @@ export class InputToolbarController {
           if (this.destroyed || !anchorBtn.isConnected || anchorBtn.disabled || !menuEl.isConnected) {
             return;
           }
-          this.positionContinueMenu(menuEl, anchorBtn);
+          lastAnchorRect = this.positionContinueMenu(menuEl, anchorBtn);
         });
       } else {
-        this.positionContinueMenu(menuEl, anchorBtn);
+        lastAnchorRect = this.positionContinueMenu(menuEl, anchorBtn);
       }
     };
 
@@ -921,8 +966,28 @@ export class InputToolbarController {
     };
 
     const onViewportScroll = (event: Event) => {
-      const target = event.target as Node | null;
-      if (target && menuEl.contains(target)) return;
+      const target = event.target as EventTarget | null;
+      if (
+        target &&
+        typeof (target as Node).nodeType === "number" &&
+        menuEl.contains(target as Node)
+      ) {
+        return;
+      }
+      const isRootScroll =
+        target === null ||
+        target === document ||
+        target === win ||
+        target === document.documentElement ||
+        target === document.body;
+      const targetContainsAnchor =
+        target !== null &&
+        typeof (target as Node).contains === "function" &&
+        (target as Node).contains(anchorBtn);
+
+      if (!isRootScroll && !targetContainsAnchor && !anchorPositionChanged()) {
+        return;
+      }
       this.closeContinueMenu({ restoreFocus: false });
     };
 
@@ -952,7 +1017,7 @@ export class InputToolbarController {
     };
   }
 
-  private positionContinueMenu(menuEl: HTMLDivElement, anchorBtn: HTMLButtonElement): void {
+  private positionContinueMenu(menuEl: HTMLDivElement, anchorBtn: HTMLButtonElement): DOMRect {
     const historyListEl = menuEl.querySelector<HTMLElement>(".gg-dropup-history-list");
     const headerEl = historyListEl
       ? menuEl.querySelector<HTMLElement>(".gg-dropup-header")
@@ -1066,6 +1131,7 @@ export class InputToolbarController {
     if (historyListEl && listMaxCss !== null) {
       historyListEl.style.maxHeight = `${listMaxCss}px`;
     }
+    return rect;
   }
 
   private closeContinueMenu(options: { restoreFocus: boolean }): void {
@@ -1089,8 +1155,10 @@ export class InputToolbarController {
   ): void {
     const { btn } = entry;
     const hasRecovery = state.recovery.length > 0;
-    const disabled = Boolean(state.activeRun);
+    const disabled = Boolean(state.activeRun || state.isBusy);
     const latestPreview = formatLatestRecoveryPreview(state.recovery);
+    const isRecoveryMenuOpen =
+      this.continueMenu?.kind === "recovery" && this.continueMenu.anchorBtn === btn;
 
     btn.classList.toggle("is-dimmed", disabled);
     btn.disabled = disabled;
@@ -1100,7 +1168,7 @@ export class InputToolbarController {
     );
     if (!disabled) {
       btn.setAttribute("aria-haspopup", "menu");
-      btn.setAttribute("aria-expanded", "false");
+      btn.setAttribute("aria-expanded", isRecoveryMenuOpen ? "true" : "false");
       btn.setAttribute(
         "aria-keyshortcuts",
         "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter",
@@ -1382,12 +1450,13 @@ export class InputToolbarController {
     renderRootOptions();
     document.body.append(menuEl);
     anchorBtn.setAttribute("aria-expanded", "true");
-    this.positionContinueMenu(menuEl, anchorBtn);
+    const initialAnchorRect = this.positionContinueMenu(menuEl, anchorBtn);
 
     const cleanup = this.attachDropupMenuLifecycle({
       menuEl,
       anchorBtn,
       items,
+      initialAnchorRect,
       onBackKey: () => {
         if (!inHistoryView) return false;
         renderRootOptions();

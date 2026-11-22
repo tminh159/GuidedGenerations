@@ -5523,15 +5523,16 @@ describe("frontend orchestration and safety", () => {
       expect(getBtn("guided_regenerate").disabled).toBe(true);
       expect(h.sentRpcs.filter((r) => r.action === "run_action")).toHaveLength(1);
 
-      // 2. Clicking Stop during optimistic phase aborts cleanly via { chatId } and immediately restores toolbar
+      // 2. Clicking Stop during optimistic phase aborts cleanly via { chatId } and keeps buttons disabled until RPC settles
       respBtnRunning.click();
       const abortRpcs1 = h.sentRpcs.filter((r) => r.action === "abort_action");
       expect(abortRpcs1).toHaveLength(1);
       expect(abortRpcs1[0]!.input).toEqual({ chatId: "chat-a" });
       expect(getBtn("guided_response").classList.contains("is-running")).toBe(false);
-      expect(getBtn("guided_continue").disabled).toBe(false);
+      expect(getBtn("guided_response").disabled).toBe(true);
+      expect(getBtn("guided_continue").disabled).toBe(true);
 
-      // Settle aborted run_action RPC
+      // Settle aborted run_action RPC -> toolbar buttons re-enable once launchingChats clears
       const runReq1 = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
       h.emitFromBackend({
         type: "gg:reply",
@@ -5539,6 +5540,8 @@ describe("frontend orchestration and safety", () => {
         result: { runId: "r-1", actionId: "guided_response", chatId: "chat-a", aborted: true },
       });
       await flushMicrotasks();
+      expect(getBtn("guided_response").disabled).toBe(false);
+      expect(getBtn("guided_continue").disabled).toBe(false);
 
       // 3. Reconciles cleanly when real gg:status arrives; subsequent Stop sends { runId }
       h.setComposerState({ text: "Second prompt" });
@@ -6320,6 +6323,830 @@ describe("frontend orchestration and safety", () => {
       expect(h.getComposerText()).toBe("Foreground draft");
     } finally {
       teardown();
+    }
+  });
+
+  test("reconciles stuck run on foreground return (visibilitychange/focus/online), coalesces burst, and cancels orphaned run_action without delayed timeout banner", async () => {
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const capturedTimers = new Map<number, { fn: () => void; ms: number }>();
+    let nextTimerId = 100_000;
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: () => void,
+      ms = 0,
+      ...args: unknown[]
+    ) => {
+      if (ms === 300_000 || ms === 7_000) {
+        const id = nextTimerId++;
+        capturedTimers.set(id, { fn: () => fn(), ms });
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn as (...a: unknown[]) => void, ms, ...args);
+    }) as typeof setTimeout;
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      if (typeof id === "number" && capturedTimers.has(id)) {
+        capturedTimers.delete(id);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    let visibilityState: "visible" | "hidden" = "visible";
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibilityState,
+    });
+
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Continue the scene",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const row = document.createElement("div");
+      const msgContent = document.createElement("div");
+      msgContent.setAttribute("data-component", "MessageContent");
+      row.append(msgContent);
+      document.body.append(row);
+      h.setMessageElement("m-bg-1", row);
+
+      const getRespBtn = () =>
+        h.actionsMount.querySelector<HTMLButtonElement>('[data-gg-action="guided_response"]')!;
+
+      getRespBtn().click();
+      await flushMicrotasks();
+      expect(getRespBtn().classList.contains("is-running")).toBe(true);
+
+      const runReq = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
+      expect(runReq).toBeDefined();
+      const timeoutTimersBefore = [...capturedTimers.values()].filter((t) => t.ms === 300_000);
+      expect(timeoutTimersBefore).toHaveLength(1);
+
+      // Backend starts run -> replaces pending:<n> with real runId
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-bg-1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now() - 10,
+          messageId: "m-bg-1",
+          swipeId: 0,
+        },
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+
+      // Tab goes background and terminal gg:status/gg:reply are missed
+      visibilityState = "hidden";
+      document.dispatchEvent(new document.defaultView!.Event("visibilitychange"));
+      expect(h.sentRpcs.filter((r) => r.action === "get_bootstrap")).toHaveLength(1);
+
+      // Return to foreground: visibilitychange + focus + pageshow burst -> single coalesced get_bootstrap
+      visibilityState = "visible";
+      const Win = document.defaultView!;
+      document.dispatchEvent(new Win.Event("visibilitychange"));
+      Win.dispatchEvent(new Win.Event("focus"));
+      Win.dispatchEvent(new Win.Event("pageshow"));
+
+      const bootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps).toHaveLength(2);
+
+      // Backend reports generation already finished cleanly
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps[1]!.requestId,
+        result: {
+          ...makeBootstrapView({ activeRun: null, activeRuns: [] }),
+          recentTerminalRuns: [
+            {
+              runId: "run-bg-1",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "done",
+              startedAt: Date.now() - 100,
+              finishedAt: Date.now(),
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+
+      // Indicator & red stop button cleared, orphaned 300s timer cancelled, no timeout banner
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(getRespBtn().classList.contains("is-running")).toBe(false);
+      expect(h.alertMount.textContent).toBe("");
+      expect([...capturedTimers.values()].filter((t) => t.ms === 300_000)).toHaveLength(0);
+
+      // Launching lock is released so a new action can be triggered immediately
+      h.setComposerState({ text: "Next prompt" });
+      getRespBtn().click();
+      await flushMicrotasks();
+      expect(h.sentRpcs.filter((r) => r.action === "run_action")).toHaveLength(2);
+    } finally {
+      teardown();
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+    }
+  });
+
+  test("surfaces missed backend error once from recentTerminalRuns on foreground return", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Trigger error in background",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const respBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+      respBtn.click();
+      await flushMicrotasks();
+
+      const startedAt = Date.now() - 50;
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-err-1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt,
+        },
+      });
+
+      // Return via window online event
+      const Win = document.defaultView!;
+      Win.dispatchEvent(new Win.Event("online"));
+
+      const bootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps).toHaveLength(2);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps[1]!.requestId,
+        result: {
+          ...makeBootstrapView({ activeRun: null, activeRuns: [] }),
+          recentTerminalRuns: [
+            {
+              runId: "run-err-1",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "error",
+              error: "Upstream 502 Bad Gateway",
+              startedAt,
+              finishedAt: Date.now(),
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+
+      expect(respBtn.classList.contains("is-running")).toBe(false);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.alertMount.textContent).toContain("Upstream 502 Bad Gateway");
+
+      // Subsequent refresh with the same recentTerminalRuns must NOT re-surface the same error
+      h.alertMount.replaceChildren();
+      h.emitFromBackend({ type: "gg:changed" });
+      const bootstraps2 = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps2).toHaveLength(3);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps2[2]!.requestId,
+        result: {
+          ...makeBootstrapView({ activeRun: null, activeRuns: [] }),
+          recentTerminalRuns: [
+            {
+              runId: "run-err-1",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "error",
+              error: "Upstream 502 Bad Gateway",
+              startedAt,
+              finishedAt: Date.now(),
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+      expect(h.alertMount.textContent).toBe("");
+    } finally {
+      teardown();
+    }
+  });
+
+  test("run_action timeout awaits fresh post-timeout get_bootstrap and clears UI cleanly without timeout banner when backend already finished", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Timed out after background",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const respBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+      respBtn.click();
+      await flushMicrotasks();
+
+      const runReq = h.sentRpcs.filter((r) => r.action === "run_action")[0]!;
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-t1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now() - 20,
+        },
+      });
+
+      // Simulate an already in-flight refresh from BEFORE the timeout
+      h.emitFromBackend({ type: "gg:changed" });
+      const preTimeoutBootstrap = h.sentRpcs.filter((r) => r.action === "get_bootstrap")[1]!;
+      expect(preTimeoutBootstrap).toBeDefined();
+
+      // run_action times out while pre-timeout get_bootstrap is still pending
+      h.rejectRpc(runReq.requestId, "Timed out waiting for run_action.");
+      await flushMicrotasks();
+
+      // Pre-timeout bootstrap resolves showing run-t1 was active before timeout
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: preTimeoutBootstrap.requestId,
+        result: makeBootstrapView({
+          activeRun: {
+            runId: "run-t1",
+            actionId: "guided_response",
+            chatId: "chat-a",
+            startedAt: Date.now() - 20,
+          },
+        }),
+      });
+      await flushMicrotasks();
+
+      // Fresh post-timeout get_bootstrap MUST have been dispatched
+      const bootstrapsAfter = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstrapsAfter).toHaveLength(3);
+
+      // Post-timeout get_bootstrap confirms backend finished run-t1
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstrapsAfter[2]!.requestId,
+        result: {
+          ...makeBootstrapView({ activeRun: null, activeRuns: [] }),
+          recentTerminalRuns: [
+            {
+              runId: "run-t1",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "done",
+              startedAt: Date.now() - 20,
+              finishedAt: Date.now(),
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+
+      expect(respBtn.classList.contains("is-running")).toBe(false);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.alertMount.textContent).toBe("");
+      expect(h.getComposerText()).toBe("");
+    } finally {
+      teardown();
+    }
+  });
+
+  test("run_action timeout keeps running UI without error banner when backend is still active, then clears via safety-net poll once finished", async () => {
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    const origSetInterval = globalThis.setInterval;
+    const origClearInterval = globalThis.clearInterval;
+    const actionTimers = new Map<number, () => void>();
+    const intervalCallbacks = new Map<number, () => void>();
+    let nextId = 200_000;
+
+    (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = ((
+      fn: () => void,
+      ms = 0,
+      ...args: unknown[]
+    ) => {
+      if (ms === 300_000) {
+        const id = nextId++;
+        actionTimers.set(id, () => fn());
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }
+      return origSetTimeout(fn as (...a: unknown[]) => void, ms, ...args);
+    }) as typeof setTimeout;
+    (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout = ((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      if (typeof id === "number" && actionTimers.has(id)) {
+        actionTimers.delete(id);
+        return;
+      }
+      origClearTimeout(id);
+    }) as typeof clearTimeout;
+    (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = ((
+      fn: () => void,
+      ms = 0,
+      ...args: unknown[]
+    ) => {
+      if (ms === 10_000) {
+        const id = nextId++;
+        intervalCallbacks.set(id, () => fn());
+        return id as unknown as ReturnType<typeof setInterval>;
+      }
+      return origSetInterval(fn as (...a: unknown[]) => void, ms, ...args);
+    }) as typeof setInterval;
+    (globalThis as unknown as { clearInterval: typeof clearInterval }).clearInterval = ((
+      id?: ReturnType<typeof setInterval>,
+    ) => {
+      if (typeof id === "number" && intervalCallbacks.has(id)) {
+        intervalCallbacks.delete(id);
+        return;
+      }
+      origClearInterval(id);
+    }) as typeof clearInterval;
+
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Very long generation",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const respBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+      respBtn.click();
+      await flushMicrotasks();
+
+      const liveRun = {
+        runId: "run-long-1",
+        actionId: "guided_response" as const,
+        chatId: "chat-a",
+        startedAt: Date.now() - 10,
+      };
+      h.emitFromBackend({ type: "gg:status", run: liveRun });
+      expect(intervalCallbacks.size).toBe(1);
+
+      // Fire the real 300_000ms RPC timeout
+      expect(actionTimers.size).toBe(1);
+      const [timerId, fireTimeout] = [...actionTimers.entries()][0]!;
+      actionTimers.delete(timerId);
+      fireTimeout();
+      await flushMicrotasks();
+
+      // Post-timeout get_bootstrap confirms backend is still running
+      const bootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps).toHaveLength(2);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps[1]!.requestId,
+        result: makeBootstrapView({ activeRun: liveRun, activeRuns: [liveRun] }),
+      });
+      await flushMicrotasks();
+
+      // UI stays active with NO error banner
+      expect(respBtn.classList.contains("is-running")).toBe(true);
+      expect(h.streamAfterMount.querySelectorAll('[data-gg-optimistic-indicator="true"]')).toHaveLength(1);
+      expect(h.alertMount.textContent).toBe("");
+      expect(intervalCallbacks.size).toBe(1);
+
+      // Safety-net interval fires later when backend finished
+      const pollFn = [...intervalCallbacks.values()][0]!;
+      pollFn();
+      const bootstrapsAfterPoll = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstrapsAfterPoll).toHaveLength(3);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstrapsAfterPoll[2]!.requestId,
+        result: makeBootstrapView({ activeRun: null, activeRuns: [] }),
+      });
+      await flushMicrotasks();
+
+      expect(respBtn.classList.contains("is-running")).toBe(false);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(intervalCallbacks.size).toBe(0);
+    } finally {
+      teardown();
+      (globalThis as unknown as { setTimeout: typeof setTimeout }).setTimeout = origSetTimeout;
+      (globalThis as unknown as { clearTimeout: typeof clearTimeout }).clearTimeout =
+        origClearTimeout;
+      (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = origSetInterval;
+      (globalThis as unknown as { clearInterval: typeof clearInterval }).clearInterval =
+        origClearInterval;
+    }
+  });
+
+  test("abort_action returning { aborted: false } triggers get_bootstrap reconciliation and clears stuck UI", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "Stale stop test",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const respBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+      respBtn.click();
+      await flushMicrotasks();
+
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "run-stale-1",
+          actionId: "guided_response",
+          chatId: "chat-a",
+          startedAt: Date.now() - 10,
+        },
+      });
+      expect(respBtn.classList.contains("is-running")).toBe(true);
+
+      // User clicks the red Stop button, but backend already finished so abort_action returns { aborted: false }
+      respBtn.click();
+      const abortReq = h.sentRpcs.filter((r) => r.action === "abort_action")[0]!;
+      expect(abortReq.input).toEqual({ runId: "run-stale-1" });
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: abortReq.requestId,
+        result: { aborted: false },
+      });
+      await flushMicrotasks();
+
+      // Reconciliation get_bootstrap is sent and clears stuck indicator, button, and orphaned run_action
+      const bootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps).toHaveLength(2);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps[1]!.requestId,
+        result: makeBootstrapView({ activeRun: null, activeRuns: [] }),
+      });
+      await flushMicrotasks();
+
+      expect(respBtn.classList.contains("is-running")).toBe(false);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("does not cancel new run when earlier run finished in same ms, deduplicates cross-chat error banners, and handles superseded refresh on timeout", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "First prompt",
+    });
+    const teardown = setup(h.ctx);
+
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const respBtn = h.actionsMount.querySelector<HTMLButtonElement>(
+        '[data-gg-action="guided_response"]',
+      )!;
+
+      // 1. Same-ms finished run-1 in recentTerminalRuns must NOT cancel active observed run-2
+      respBtn.click();
+      await flushMicrotasks();
+      const now = Date.now();
+      const run2 = {
+        runId: "run-2",
+        actionId: "guided_response" as const,
+        chatId: "chat-a",
+        startedAt: now,
+      };
+      h.emitFromBackend({ type: "gg:status", run: run2 });
+
+      const Win = document.defaultView!;
+      Win.dispatchEvent(new Win.Event("focus"));
+      const bootstraps = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      expect(bootstraps).toHaveLength(2);
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps[1]!.requestId,
+        result: {
+          ...makeBootstrapView({ activeRun: run2, activeRuns: [run2] }),
+          recentTerminalRuns: [
+            {
+              runId: "run-1",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "done",
+              startedAt: now - 10,
+              finishedAt: now,
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+      expect(respBtn.classList.contains("is-running")).toBe(true);
+
+      // Cleanly finish run-2 via cross-chat terminal gg:status (chat-a errored while chat-b active run carried)
+      h.emitFromBackend({
+        type: "gg:status",
+        chatId: "chat-a",
+        error: "Cross-chat error",
+        run: {
+          runId: "run-b-live",
+          actionId: "guided_continue",
+          chatId: "chat-b",
+          startedAt: now,
+        },
+      });
+      expect(h.alertMount.textContent).toContain("Cross-chat error");
+
+      // Subsequent refresh with run-2 in recentTerminalRuns must NOT re-show "Cross-chat error"
+      h.alertMount.replaceChildren();
+      h.emitFromBackend({ type: "gg:changed" });
+      const bootstraps2 = h.sentRpcs.filter((r) => r.action === "get_bootstrap");
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: bootstraps2[bootstraps2.length - 1]!.requestId,
+        result: {
+          ...makeBootstrapView({
+            activeRun: {
+              runId: "run-b-live",
+              actionId: "guided_continue",
+              chatId: "chat-b",
+              startedAt: now,
+            },
+            activeRuns: [
+              {
+                runId: "run-b-live",
+                actionId: "guided_continue",
+                chatId: "chat-b",
+                startedAt: now,
+              },
+            ],
+          }),
+          recentTerminalRuns: [
+            {
+              runId: "run-2",
+              actionId: "guided_response",
+              chatId: "chat-a",
+              status: "error",
+              error: "Cross-chat error",
+              startedAt: now,
+              finishedAt: now,
+            },
+          ],
+        },
+      });
+      await flushMicrotasks();
+      expect(h.alertMount.textContent).toBe("");
+
+      // 2. Timeout refresh superseded by activateDrawer() includeCatalogs refresh does not trigger false timeout banner
+      h.tabRoot.remove();
+      h.setComposerState({ text: "Superseded test" });
+      respBtn.click();
+      await flushMicrotasks();
+      const runReq2 = h.sentRpcs.filter((r) => r.action === "run_action")[1]!;
+      h.rejectRpc(runReq2.requestId, "Timed out waiting for run_action.");
+      await flushMicrotasks();
+
+      const timeoutBootstrap = h.sentRpcs[h.sentRpcs.length - 1]!;
+      expect(timeoutBootstrap.action).toBe("get_bootstrap");
+
+      // Trigger superseding includeCatalogs refresh via drawer activation while timeoutBootstrap is in flight
+      h.tabRoot.dispatchEvent(new Win.Event("click"));
+      h.activateDrawer();
+      const supersedingBootstrap = h.sentRpcs[h.sentRpcs.length - 1]!;
+      expect(supersedingBootstrap.action).toBe("get_bootstrap");
+      expect(supersedingBootstrap.requestId).not.toBe(timeoutBootstrap.requestId);
+
+      // Resolve timeoutBootstrap first (superseded) and supersedingBootstrap with activeRun: null
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: timeoutBootstrap.requestId,
+        result: makeBootstrapView({ activeRun: null, activeRuns: [] }),
+      });
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: supersedingBootstrap.requestId,
+        result: makeBootstrapView({ activeRun: null, activeRuns: [] }),
+      });
+      await flushMicrotasks();
+
+      expect(h.alertMount.textContent).toBe("");
+      expect(respBtn.classList.contains("is-running")).toBe(false);
+    } finally {
+      teardown();
+    }
+  });
+
+  test("frontend audit fixes: unscoped gg:status error guard, safeGetActiveChat, sticky pendingImpersonateDrafts + LRU cap, and shared characterId chat heads", async () => {
+    // 1. Unscoped gg:status error with unrelated event.run.chatId must NOT clear activeRunsByChat or delete chat head
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      const runB = {
+        runId: "run-b-live",
+        actionId: "guided_response" as const,
+        chatId: "chat-b",
+        startedAt: Date.now(),
+        hasContentOutput: true,
+      };
+      h.emitFromBackend({ type: "gg:status", chatId: "chat-b", run: runB });
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+      // Unscoped error status (no event.chatId) carrying chat-b's active run
+      h.emitFromBackend({
+        type: "gg:status",
+        run: runB,
+        error: "Unscoped global error",
+      });
+      expect(h.alertMount.textContent).toContain("Unscoped global error");
+      // Chat head for chat-b is preserved
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+      // Unscoped error status (no event.chatId) with run: null must ALSO preserve chat-b's active run & chat head
+      h.emitFromBackend({
+        type: "gg:status",
+        run: null,
+        error: "Unscoped null-run error",
+      });
+      expect(h.alertMount.textContent).toContain("Unscoped null-run error");
+      expect(document.body.querySelector('.gg-chat-head[data-chat-id="chat-b"]')).not.toBeNull();
+
+      // Switching to chat-b shows chat-b's active run is still tracked in activeRunsByChat
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      await flushMicrotasks();
+      expect(
+        h.actionsMount.querySelector('[data-gg-action="guided_response"]')?.classList.contains("is-running"),
+      ).toBe(true);
+
+      // 2. Sticky pendingImpersonateDrafts: non-empty composer deletes the draft instead of re-injecting later
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitFromBackend({
+        type: "gg:impersonate-chunk",
+        chatId: "chat-a",
+        text: "Stale draft for chat-a",
+        done: true,
+        aborted: false,
+      });
+      // Switch to chat-a while user already has text in composer -> draft is NOT applied and is deleted
+      h.setChat("chat-a", { mounted: true, text: "User typed text" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      await flushMicrotasks();
+      expect(h.getComposerText()).toBe("User typed text");
+
+      // Switch away and back with empty composer -> deleted draft must NOT reappear
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      await flushMicrotasks();
+      h.setChat("chat-a", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-a" });
+      await flushMicrotasks();
+      expect(h.getComposerText()).toBe("");
+
+      // 3. LRU cap on pendingImpersonateDrafts (50 max): oldest evicted, newest retained
+      h.setChat("chat-active", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-active" });
+      await flushMicrotasks();
+      for (let i = 0; i < 55; i += 1) {
+        h.emitFromBackend({
+          type: "gg:impersonate-chunk",
+          chatId: `chat-lru-${i}`,
+          text: `Draft #${i}`,
+          done: true,
+          aborted: false,
+        });
+      }
+      // Oldest (chat-lru-0) should have been evicted
+      h.setChat("chat-lru-0", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-lru-0" });
+      await flushMicrotasks();
+      expect(h.getComposerText()).toBe("");
+      // Newest (chat-lru-54) should still be applied
+      h.setChat("chat-lru-54", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-lru-54" });
+      await flushMicrotasks();
+      expect(h.getComposerText()).toBe("Draft #54");
+    } finally {
+      teardown();
+    }
+
+    // 4. safeGetActiveChat guards throws (SPINDLE_FRONTEND_INACTIVE) and nullish returns in setup & callbacks
+    const hInactive = createFrontendHarness({
+      initialChatId: "chat-x",
+      composerMounted: true,
+      composerText: "",
+    });
+    let activeChatMode: "throw" | "null" = "throw";
+    (hInactive.ctx as unknown as { getActiveChat: () => unknown }).getActiveChat = () => {
+      if (activeChatMode === "throw") {
+        throw new Error("SPINDLE_FRONTEND_INACTIVE");
+      }
+      return null;
+    };
+    const teardownInactive = setup(hInactive.ctx);
+    try {
+      hInactive.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+      hInactive.emitFromBackend({ type: "gg:status", chatId: "chat-x", run: null, done: true });
+      hInactive.emitEvent("CHAT_SWITCHED", { chatId: "chat-y" });
+      hInactive.emitEvent("CHAT_DELETED", { chatId: "chat-y" });
+      activeChatMode = "null";
+      hInactive.emitEvent("CHAT_CHANGED", { chatId: "chat-z" });
+      await flushMicrotasks();
+      expect(hInactive.actionsMount.querySelector('[data-gg-action="guided_response"]')).not.toBeNull();
+    } finally {
+      teardownInactive();
+    }
+
+    // 5. ChatHeadController: concurrent chats sharing characterId both update when characters.get resolves
+    let resolveChar!: (val: unknown) => void;
+    let charFetchCount = 0;
+    const sharedCtx = {
+      getActiveChat: () => ({ chatId: "chat-main" }),
+      events: { on: () => () => {} },
+      characters: {
+        get: () => {
+          charFetchCount += 1;
+          return new Promise((resolve) => {
+            resolveChar = resolve;
+          });
+        },
+      },
+    } as unknown as SpindleFrontendContext;
+
+    const headCtrl = new ChatHeadController(sharedCtx);
+    try {
+      headCtrl.syncRuns(
+        [
+          {
+            runId: "r-sh-1",
+            actionId: "guided_response",
+            chatId: "chat-sh-1",
+            startedAt: 100,
+            characterId: "char-shared",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+          {
+            runId: "r-sh-2",
+            actionId: "guided_continue",
+            chatId: "chat-sh-2",
+            startedAt: 101,
+            characterId: "char-shared",
+          } as unknown as Parameters<ChatHeadController["syncRuns"]>[0] extends Iterable<infer T> ? T : never,
+        ],
+        "chat-main",
+      );
+      expect(charFetchCount).toBe(1);
+
+      resolveChar({
+        id: "char-shared",
+        name: "Shared Hero",
+        avatarUrl: "https://cdn.example/shared-hero.png",
+      });
+      await flushMicrotasks();
+
+      const head1 = document.body.querySelector<HTMLButtonElement>('.gg-chat-head[data-chat-id="chat-sh-1"]')!;
+      const head2 = document.body.querySelector<HTMLButtonElement>('.gg-chat-head[data-chat-id="chat-sh-2"]')!;
+      expect(head1.getAttribute("aria-label")).toContain("Shared Hero");
+      expect(head2.getAttribute("aria-label")).toContain("Shared Hero");
+      expect(head1.querySelector<HTMLImageElement>("img.gg-chat-head-avatar")?.src).toBe(
+        "https://cdn.example/shared-hero.png",
+      );
+      expect(head2.querySelector<HTMLImageElement>("img.gg-chat-head-avatar")?.src).toBe(
+        "https://cdn.example/shared-hero.png",
+      );
+    } finally {
+      headCtrl.destroy();
     }
   });
 });

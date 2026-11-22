@@ -1,5 +1,6 @@
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import type {
+  ActionRunResult,
   ActiveRunState,
   BackendPushEvent,
   ExtensionBootstrapView,
@@ -10,6 +11,7 @@ import type {
   RemoveContinueResult,
   RpcActionName,
   RunActionInput,
+  TerminalRunSummary,
 } from "./shared/types";
 import { ChatHeadController } from "./frontend/chat-head";
 import { InputToolbarController } from "./frontend/input-toolbar";
@@ -49,6 +51,33 @@ type FrontendContextWithHostExtensions = SpindleFrontendContext & {
 
 const PENDING_RUN_ID_PREFIX = "pending:";
 const MAX_CHAT_STATUS_SEQ_ENTRIES = 200;
+const MAX_SEEN_TERMINAL_RUN_IDS = 100;
+const MAX_PENDING_IMPERSONATE_DRAFTS = 50;
+const FOREGROUND_RECONCILE_MIN_INTERVAL_MS = 500;
+const ACTIVE_RUN_RECONCILE_INTERVAL_MS = 10_000;
+const ACTION_RPC_TIMEOUT_MS = 300_000;
+
+class RpcTimeoutError extends Error {
+  constructor(action: RpcActionName) {
+    super(`Timed out waiting for ${action}.`);
+    this.name = "RpcTimeoutError";
+  }
+}
+
+function isRpcTimeoutError(error: unknown): boolean {
+  if (error instanceof RpcTimeoutError) return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  return /^Timed out waiting for /i.test(msg) || /^Timeout waiting for /i.test(msg);
+}
+
+interface InFlightActionRpc {
+  requestId: string;
+  actionId: GuidedActionId;
+  chatId: string;
+  startedAt: number;
+  observedRunId: string | null;
+  cancelAsReconciled: () => void;
+}
 
 function isPendingRunId(runId: string | null | undefined): boolean {
   return typeof runId === "string" && runId.startsWith(PENDING_RUN_ID_PREFIX);
@@ -157,6 +186,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let stopObservingTabConnection: (() => void) | null = null;
   let activeRun: ActiveRunState | null = null;
   const activeRunsByChat = new Map<string, ActiveRunState>();
+  const inFlightActionRpcsByChat = new Map<string, InFlightActionRpc>();
+  const seenTerminalRunIds = new Set<string>();
   const chatStatusSeq = new Map<string, number>();
   const pendingImpersonateDrafts = new Map<string, string>();
   const IMPERSONATE_DRAFT_RETRY_DELAYS_MS = [0, 20, 50, 100, 200] as const;
@@ -164,15 +195,84 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let impersonateDraftRetryChatId: string | null = null;
   let impersonateDraftRetryAttempt = 0;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  let activeRunReconcileTimer: ReturnType<typeof setInterval> | undefined;
+  let lastForegroundReconcileAt = 0;
   let composerAlertMount: Element | null = null;
-  let inFlightRefresh: Promise<void> | null = null;
+  let inFlightRefresh: Promise<boolean> | null = null;
   let inFlightRefreshIncludeCatalogs = false;
+  let lastRefreshSucceeded = false;
   let pendingFollowUpRefresh = false;
   let pendingFollowUpOnlyIfChanged = true;
   let pendingFollowUpIncludeCatalogs = false;
   let lastChatSwitchKey: string | null = null;
   let chatSwitchResetQueued = false;
-  let lastObservedActiveChatId: string | null = ctx.getActiveChat().chatId;
+  function safeGetActiveChat(): { chatId: string | null; characterId?: string | null } {
+    try {
+      const active = ctx.getActiveChat?.() as
+        | { chatId?: string | null; characterId?: string | null }
+        | null
+        | undefined;
+      return {
+        chatId: typeof active?.chatId === "string" && active.chatId ? active.chatId : null,
+        ...(active?.characterId !== undefined ? { characterId: active.characterId } : {}),
+      };
+    } catch {
+      return { chatId: null };
+    }
+  }
+
+  let lastObservedActiveChatId: string | null = safeGetActiveChat().chatId;
+
+  function markTerminalRunSeen(runId: string | null | undefined): void {
+    if (!runId || isPendingRunId(runId)) return;
+    if (seenTerminalRunIds.has(runId)) {
+      seenTerminalRunIds.delete(runId);
+    } else if (seenTerminalRunIds.size >= MAX_SEEN_TERMINAL_RUN_IDS) {
+      const oldest = seenTerminalRunIds.values().next().value;
+      if (oldest !== undefined) {
+        seenTerminalRunIds.delete(oldest);
+      }
+    }
+    seenTerminalRunIds.add(runId);
+  }
+
+  function stopActiveRunReconcileTimer(): void {
+    if (activeRunReconcileTimer !== undefined) {
+      clearInterval(activeRunReconcileTimer);
+      activeRunReconcileTimer = undefined;
+    }
+  }
+
+  function syncActiveRunReconcileTimer(): void {
+    if (destroyed || activeRunsByChat.size === 0) {
+      stopActiveRunReconcileTimer();
+      return;
+    }
+    if (activeRunReconcileTimer !== undefined) return;
+    activeRunReconcileTimer = setInterval(() => {
+      if (destroyed || activeRunsByChat.size === 0) {
+        stopActiveRunReconcileTimer();
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      void refresh({ onlyIfChanged: true });
+    }, ACTIVE_RUN_RECONCILE_INTERVAL_MS);
+  }
+
+  function reconcileOnForeground(): void {
+    if (destroyed) return;
+    if (activeRunsByChat.size === 0 && inFlightActionRpcsByChat.size === 0) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastForegroundReconcileAt < FOREGROUND_RECONCILE_MIN_INTERVAL_MS) {
+      return;
+    }
+    lastForegroundReconcileAt = now;
+    void refresh({ onlyIfChanged: true });
+  }
 
   function setChatStatusSeq(chatId: string, seqValue: number): void {
     if (chatStatusSeq.has(chatId)) {
@@ -208,7 +308,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   }
 
   function syncPrimaryActiveRun(): void {
-    const currentChatId = ctx.getActiveChat().chatId;
+    const currentChatId = safeGetActiveChat().chatId;
     if (currentChatId && activeRunsByChat.has(currentChatId)) {
       activeRun = activeRunsByChat.get(currentChatId)!;
       return;
@@ -235,13 +335,15 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       ...(options?.backgroundSwipe ? { backgroundSwipe: true } : {}),
     };
     statusSeq += 1;
+    lastForegroundReconcileAt = 0;
     setChatStatusSeq(chatId, statusSeq);
     activeRunsByChat.set(chatId, pendingRun);
+    syncActiveRunReconcileTimer();
     syncPrimaryActiveRun();
     if (view) {
       view = { ...view, activeRun };
     }
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     indicator.sync(getActiveRunForChat(activeChatId));
     renderToolbar();
     return pendingRun;
@@ -255,12 +357,13 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     statusSeq += 1;
     setChatStatusSeq(chatId, statusSeq);
     activeRunsByChat.delete(chatId);
+    syncActiveRunReconcileTimer();
     syncPrimaryActiveRun();
     if (view) {
       view = { ...view, activeRun };
     }
     if (!destroyed) {
-      const activeChatId = ctx.getActiveChat().chatId;
+      const activeChatId = safeGetActiveChat().chatId;
       indicator.sync(getActiveRunForChat(activeChatId));
       renderToolbar();
     }
@@ -294,6 +397,18 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }, delayMs);
   }
 
+  function setPendingImpersonateDraft(chatId: string, text: string): void {
+    if (pendingImpersonateDrafts.has(chatId)) {
+      pendingImpersonateDrafts.delete(chatId);
+    } else if (pendingImpersonateDrafts.size >= MAX_PENDING_IMPERSONATE_DRAFTS) {
+      const oldestKey = pendingImpersonateDrafts.keys().next().value;
+      if (oldestKey !== undefined) {
+        pendingImpersonateDrafts.delete(oldestKey);
+      }
+    }
+    pendingImpersonateDrafts.set(chatId, text);
+  }
+
   function applyPendingImpersonateDraft(
     chatId: string | null | undefined,
     options: { fromRetry?: boolean } = {},
@@ -307,7 +422,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       return;
     }
     const state = safeGetComposerState();
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     if (activeChatId !== chatId) {
       if (impersonateDraftRetryChatId === chatId) {
         clearImpersonateDraftRetry();
@@ -323,6 +438,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
     clearImpersonateDraftRetry();
     if (state.text.trim().length > 0) {
+      pendingImpersonateDrafts.delete(chatId);
       return;
     }
     if (safeSetComposerText(draft, state)) {
@@ -390,6 +506,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     action: RpcActionName,
     input?: unknown,
     timeoutMs = 30_000,
+    onDispatch?: (requestId: string) => void,
   ): Promise<T> {
     if (destroyed) return Promise.reject(new Error("Extension unloaded."));
     const requestId = `gg-${++seq}-${Date.now().toString(36)}`;
@@ -397,7 +514,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(requestId);
-        reject(new Error(`Timed out waiting for ${action}.`));
+        reject(new RpcTimeoutError(action));
       }, timeoutMs);
 
       pending.set(requestId, {
@@ -405,6 +522,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         reject,
         timer,
       });
+
+      onDispatch?.(requestId);
 
       ctx.sendToBackend({
         type: "gg:rpc",
@@ -469,7 +588,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   function syncRecoveryBusy(): void {
     if (destroyed) return;
-    const { chatId } = ctx.getActiveChat();
+    const { chatId } = safeGetActiveChat();
     drawer.setRecoveryBusy(isChatBusy(chatId));
   }
 
@@ -482,10 +601,11 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   function renderToolbar(): void {
     if (destroyed || !view) return;
-    const { chatId } = ctx.getActiveChat();
+    const { chatId } = safeGetActiveChat();
     toolbar.render({
       settings: view.settings,
       activeRun: getActiveRunForChat(chatId),
+      isBusy: isChatBusy(chatId),
       recovery: view.recovery,
       hasActiveChat: Boolean(chatId),
       chatId,
@@ -493,10 +613,19 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     syncRecoveryBusy();
   }
 
-  async function refresh(
-    options: { onlyIfChanged?: boolean; includeCatalogs?: boolean } = {},
-  ): Promise<void> {
+  function syncBusyUi(): void {
     if (destroyed) return;
+    if (view) {
+      renderToolbar();
+    } else {
+      syncRecoveryBusy();
+    }
+  }
+
+  async function refresh(
+    options: { onlyIfChanged?: boolean; includeCatalogs?: boolean; fresh?: boolean } = {},
+  ): Promise<boolean> {
+    if (destroyed) return false;
     if (!drawerMounted && drawer.isTabConnected()) {
       drawerMounted = true;
       clearTabConnectionObserver();
@@ -514,11 +643,23 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         pendingFollowUpOnlyIfChanged && Boolean(options.onlyIfChanged);
       pendingFollowUpIncludeCatalogs =
         pendingFollowUpIncludeCatalogs || includeCatalogs;
+      if (options.fresh) {
+        await inFlightRefresh;
+        if (destroyed) return false;
+        if (inFlightRefresh) {
+          return inFlightRefresh;
+        }
+        return refresh({
+          onlyIfChanged: options.onlyIfChanged,
+          includeCatalogs,
+          fresh: false,
+        });
+      }
       return inFlightRefresh;
     }
 
-    let runPromise!: Promise<void>;
-    runPromise = (async () => {
+    let runPromise!: Promise<boolean>;
+    runPromise = (async (): Promise<boolean> => {
       const myBootstrapSeq = ++bootstrapSeq;
       const startSettingsRevision = settingsRevision;
       const startStatusSeq = statusSeq;
@@ -526,11 +667,23 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         const rawNext = await rpc<ExtensionBootstrapView>("get_bootstrap", {
           includeCatalogs,
         });
-        if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
+        if (destroyed) return false;
+        if (myBootstrapSeq !== bootstrapSeq) {
+          if (inFlightRefresh && inFlightRefresh !== runPromise) {
+            return inFlightRefresh;
+          }
+          return lastRefreshSucceeded;
+        }
         const next = includeCatalogs
           ? await withFrontendConnectionFallback(rawNext, ctx)
           : rawNext;
-        if (destroyed || myBootstrapSeq !== bootstrapSeq) return;
+        if (destroyed) return false;
+        if (myBootstrapSeq !== bootstrapSeq) {
+          if (inFlightRefresh && inFlightRefresh !== runPromise) {
+            return inFlightRefresh;
+          }
+          return lastRefreshSucceeded;
+        }
 
         const resolvedSettings =
           view && settingsRevision !== startSettingsRevision
@@ -554,6 +707,27 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           next.activeRun.chatId.length > 0
         ) {
           bootstrapRunsByChat.set(next.activeRun.chatId, next.activeRun);
+        }
+
+        const prevRealRunIdByChat = new Map<string, string>();
+        for (const [chatId, run] of activeRunsByChat.entries()) {
+          if (!isPendingRunId(run.runId)) {
+            prevRealRunIdByChat.set(chatId, run.runId);
+          }
+        }
+
+        const terminalRuns = (
+          next as ExtensionBootstrapView & { recentTerminalRuns?: TerminalRunSummary[] }
+        ).recentTerminalRuns;
+        const recentTerminals = Array.isArray(terminalRuns) ? terminalRuns : [];
+
+        for (const [chatId, run] of bootstrapRunsByChat.entries()) {
+          if (!isPendingRunId(run.runId)) {
+            const inFlight = inFlightActionRpcsByChat.get(chatId);
+            if (inFlight) {
+              inFlight.observedRunId = run.runId;
+            }
+          }
         }
 
         const preservedPendingRuns = new Map<string, ActiveRunState>();
@@ -589,16 +763,71 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           }
         }
 
+        // Reconcile orphaned action RPCs whose backend run is confirmed finished.
+        for (const [chatId, inFlight] of [...inFlightActionRpcsByChat.entries()]) {
+          if ((chatStatusSeq.get(chatId) ?? 0) > startStatusSeq) {
+            continue;
+          }
+          const backendRun = bootstrapRunsByChat.get(chatId);
+          const prevRealRunId = prevRealRunIdByChat.get(chatId) ?? null;
+          const matchedTerminal = recentTerminals.find((t) =>
+            inFlight.observedRunId !== null
+              ? t.runId === inFlight.observedRunId
+              : t.chatId === chatId &&
+                t.actionId === inFlight.actionId &&
+                t.finishedAt >= inFlight.startedAt,
+          );
+          const knownRunFinished =
+            (matchedTerminal !== undefined &&
+              (!backendRun || backendRun.runId !== matchedTerminal.runId)) ||
+            (inFlight.observedRunId !== null &&
+              (!backendRun || backendRun.runId !== inFlight.observedRunId)) ||
+            (prevRealRunId !== null &&
+              (!backendRun || backendRun.runId !== prevRealRunId));
+          if (knownRunFinished) {
+            inFlight.cancelAsReconciled();
+          }
+        }
+
         for (const [chatId, pendingRun] of preservedPendingRuns.entries()) {
-          if (!activeRunsByChat.has(chatId) && launchingChats.has(chatId)) {
+          if (
+            !activeRunsByChat.has(chatId) &&
+            launchingChats.has(chatId) &&
+            inFlightActionRpcsByChat.has(chatId)
+          ) {
             activeRunsByChat.set(chatId, pendingRun);
           }
         }
 
+        syncActiveRunReconcileTimer();
         syncPrimaryActiveRun();
         const resolvedActiveRun = activeRun;
 
         const prevView = view;
+        let missedErrorToShow: string | null = null;
+        if (recentTerminals.length > 0) {
+          if (prevView === null) {
+            for (const entry of recentTerminals) {
+              markTerminalRunSeen(entry.runId);
+            }
+          } else {
+            const ordered = [...recentTerminals].sort(
+              (a, b) => a.finishedAt - b.finishedAt,
+            );
+            for (const entry of ordered) {
+              if (seenTerminalRunIds.has(entry.runId)) continue;
+              markTerminalRunSeen(entry.runId);
+              if (
+                entry.status === "error" &&
+                typeof entry.error === "string" &&
+                entry.error.length > 0
+              ) {
+                missedErrorToShow = entry.error;
+              }
+            }
+          }
+        }
+
         const preserveLoadedCatalogs =
           !includeCatalogs && catalogsLoaded && prevView !== null;
         const mergedNext: ExtensionBootstrapView = {
@@ -638,7 +867,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
         view = mergedNext;
         activeRun = resolvedActiveRun;
-        const currentChatId = ctx.getActiveChat().chatId;
+        const currentChatId = safeGetActiveChat().chatId;
         indicator.sync(getActiveRunForChat(currentChatId));
         chatHeads.syncRuns(
           Array.from(activeRunsByChat.values()).filter((r) => !isPendingRunId(r.runId)),
@@ -652,10 +881,17 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           }
         }
         renderToolbar();
+        if (missedErrorToShow) {
+          showBanner(missedErrorToShow, "error", 7_000);
+        }
+        lastRefreshSucceeded = true;
+        return true;
       } catch (error) {
-        if (destroyed) return;
+        if (destroyed) return false;
+        lastRefreshSucceeded = false;
         const msg = error instanceof Error ? error.message : String(error);
         showBanner(msg, "error");
+        return false;
       } finally {
         if (inFlightRefresh === runPromise) {
           inFlightRefresh = null;
@@ -680,12 +916,124 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     return runPromise;
   }
 
+  async function executeActionRpc(params: {
+    rpcAction: "run_action" | "regenerate_last_continue";
+    actionId: GuidedActionId;
+    chatId: string;
+    payload: RunActionInput | RegenerateContinueInput;
+    backgroundSwipe?: boolean;
+    onRollback?: () => void;
+  }): Promise<void> {
+    const {
+      rpcAction,
+      actionId,
+      chatId,
+      payload,
+      backgroundSwipe,
+      onRollback,
+    } = params;
+    const pendingRun = startPendingRun(actionId, chatId, { backgroundSwipe });
+    let reconciled = false;
+    let currentRequestId = "";
+
+    const actionEntry: InFlightActionRpc = {
+      requestId: "",
+      actionId,
+      chatId,
+      startedAt: Date.now(),
+      observedRunId: null,
+      cancelAsReconciled: () => {
+        if (reconciled) return;
+        reconciled = true;
+        const waiter = pending.get(currentRequestId);
+        if (waiter) {
+          pending.delete(currentRequestId);
+          clearTimeout(waiter.timer);
+          waiter.resolve(undefined);
+        }
+        if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+          inFlightActionRpcsByChat.delete(chatId);
+        }
+        launchingChats.delete(chatId);
+        clearPendingRun(chatId, pendingRun.runId);
+        syncBusyUi();
+      },
+    };
+
+    try {
+      // Streaming generations may take longer than default 30s.
+      const result = await rpc<ActionRunResult | undefined>(
+        rpcAction,
+        payload,
+        ACTION_RPC_TIMEOUT_MS,
+        (requestId) => {
+          currentRequestId = requestId;
+          actionEntry.requestId = requestId;
+          inFlightActionRpcsByChat.set(chatId, actionEntry);
+        },
+      );
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      if (destroyed || reconciled) return;
+
+      const resultRunId =
+        result && typeof result === "object" && typeof result.runId === "string"
+          ? result.runId
+          : actionEntry.observedRunId;
+      if (resultRunId) {
+        markTerminalRunSeen(resultRunId);
+      }
+      clearPendingRun(chatId, pendingRun.runId);
+
+      const lingeringRun = activeRunsByChat.get(chatId);
+      if (
+        lingeringRun &&
+        !isPendingRunId(lingeringRun.runId) &&
+        (!resultRunId || lingeringRun.runId === resultRunId)
+      ) {
+        void refresh({ onlyIfChanged: true });
+      }
+    } catch (error) {
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      clearPendingRun(chatId, pendingRun.runId);
+      if (destroyed || reconciled) return;
+
+      const msg = error instanceof Error ? error.message : String(error);
+      if (isRpcTimeoutError(error)) {
+        const refreshed = await refresh({ onlyIfChanged: true, fresh: true });
+        if (destroyed) return;
+        if (!refreshed) {
+          onRollback?.();
+          showBanner(msg, "error", 7_000);
+        }
+        return;
+      }
+
+      if (actionEntry.observedRunId) {
+        markTerminalRunSeen(actionEntry.observedRunId);
+      }
+      onRollback?.();
+      showBanner(msg, "error", 7_000);
+      if (getActiveRunForChat(chatId)) {
+        void refresh({ onlyIfChanged: true });
+      }
+    } finally {
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      clearPendingRun(chatId, pendingRun.runId);
+    }
+  }
+
   async function triggerAction(
     actionId: GuidedActionId,
     options?: { backgroundSwipe?: boolean },
   ): Promise<void> {
     if (destroyed || isPreChatLaunching) return;
-    const preChatId = ctx.getActiveChat().chatId;
+    const preChatId = safeGetActiveChat().chatId;
     if (
       preChatId &&
       (getActiveRunForChat(preChatId) || launchingChats.has(preChatId))
@@ -697,7 +1045,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     let lockedChatId: string | null = preChatId;
     if (lockedChatId) {
       launchingChats.add(lockedChatId);
-      syncRecoveryBusy();
+      syncBusyUi();
     }
 
     try {
@@ -705,7 +1053,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       isPreChatLaunching = false;
       if (destroyed || !view) return;
 
-      const { chatId } = ctx.getActiveChat();
+      const { chatId } = safeGetActiveChat();
       if (!chatId) {
         showBanner("Open a chat before triggering a guided action.", "warn");
         return;
@@ -718,7 +1066,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         if (launchingChats.has(chatId)) return;
         lockedChatId = chatId;
         launchingChats.add(lockedChatId);
-        syncRecoveryBusy();
+        syncBusyUi();
       }
 
       if (getActiveRunForChat(chatId)) return;
@@ -770,47 +1118,40 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         ...(isBackgroundSwipe ? { backgroundSwipe: true } : {}),
       };
 
-      const pendingRun = startPendingRun(actionId, chatId, {
+      await executeActionRpc({
+        rpcAction: "run_action",
+        actionId,
+        chatId,
+        payload,
         backgroundSwipe: isBackgroundSwipe,
-      });
-
-      try {
-        // Streaming generations may take longer than default 30s.
-        await rpc("run_action", payload, 300_000);
-        if (destroyed) return;
-      } catch (error) {
-        clearPendingRun(chatId, pendingRun.runId);
-        if (destroyed) return;
-        // Restore cleared input only when no backend run is still active for this chat,
-        // the same chat & composer are still mounted, and the user hasn't typed.
-        if (shouldClear && !getActiveRunForChat(chatId)) {
-          const currentComposer = safeGetComposerState();
-          const activeChatId = ctx.getActiveChat().chatId;
-          if (
-            isComposerAvailable(currentComposer) &&
-            currentComposer.chatId === chatId &&
-            activeChatId === chatId &&
-            !currentComposer.text
-          ) {
-            safeSetComposerText(inputText);
+        onRollback: () => {
+          // Restore cleared input only when no backend run is still active for this chat,
+          // the same chat & composer are still mounted, and the user hasn't typed.
+          if (shouldClear && !getActiveRunForChat(chatId)) {
+            const currentComposer = safeGetComposerState();
+            const activeChatId = safeGetActiveChat().chatId;
+            if (
+              isComposerAvailable(currentComposer) &&
+              currentComposer.chatId === chatId &&
+              activeChatId === chatId &&
+              !currentComposer.text
+            ) {
+              safeSetComposerText(inputText);
+            }
           }
-        }
-        const msg = error instanceof Error ? error.message : String(error);
-        showBanner(msg, "error", 7_000);
-      } finally {
-        clearPendingRun(chatId, pendingRun.runId);
-      }
+        },
+      });
     } finally {
       isPreChatLaunching = false;
       if (lockedChatId) {
         launchingChats.delete(lockedChatId);
       }
-      syncRecoveryBusy();
+      syncBusyUi();
     }
   }
 
   function restoreRecoveryEntry(entry: RecoveryEntry): void {
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     if (destroyed || !view) return;
     if (isChatBusy(activeChatId)) {
       showBanner(
@@ -843,7 +1184,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   }
 
   function clearCurrentInput(): void {
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     if (destroyed || !view || isChatBusy(activeChatId)) {
       return;
     }
@@ -882,14 +1223,14 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   async function removeLastContinue(): Promise<void> {
     if (destroyed || isPreChatLaunching) return;
-    const { chatId } = ctx.getActiveChat();
+    const { chatId } = safeGetActiveChat();
     if (!chatId) {
       showBanner("Open a chat before removing the last continue.", "warn");
       return;
     }
     if (isChatBusy(chatId)) return;
     launchingChats.add(chatId);
-    syncRecoveryBusy();
+    syncBusyUi();
     pendingImpersonateDrafts.delete(chatId);
     try {
       clearBanner();
@@ -900,48 +1241,42 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       showBanner(msg, "warn", 7_000);
     } finally {
       launchingChats.delete(chatId);
-      syncRecoveryBusy();
+      syncBusyUi();
     }
   }
 
   async function regenerateLastContinue(): Promise<void> {
     if (destroyed || isPreChatLaunching) return;
-    const { chatId } = ctx.getActiveChat();
+    const { chatId } = safeGetActiveChat();
     if (!chatId) {
       showBanner("Open a chat before regenerating the last continue.", "warn");
       return;
     }
     if (isChatBusy(chatId)) return;
     launchingChats.add(chatId);
+    syncBusyUi();
     pendingImpersonateDrafts.delete(chatId);
-    let pendingRun: ActiveRunState | null = null;
     try {
       clearBanner();
-      pendingRun = startPendingRun("guided_continue", chatId);
       const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
       const payload: RegenerateContinueInput = {
         chatId,
         activeConnectionId,
       };
-      await rpc("regenerate_last_continue", payload, 300_000);
-    } catch (error) {
-      if (pendingRun) {
-        clearPendingRun(chatId, pendingRun.runId);
-      }
-      if (destroyed) return;
-      const msg = error instanceof Error ? error.message : String(error);
-      showBanner(msg, "error", 7_000);
+      await executeActionRpc({
+        rpcAction: "regenerate_last_continue",
+        actionId: "guided_continue",
+        chatId,
+        payload,
+      });
     } finally {
-      if (pendingRun) {
-        clearPendingRun(chatId, pendingRun.runId);
-      }
       launchingChats.delete(chatId);
-      syncRecoveryBusy();
+      syncBusyUi();
     }
   }
 
   async function clearRecoveryHistory(): Promise<void> {
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     if (destroyed) return;
     if (isChatBusy(activeChatId)) {
       showBanner(
@@ -980,7 +1315,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     onAbortAction: (runId) => {
       if (destroyed) return;
       if (isPendingRunId(runId)) {
-        const activeChatId = ctx.getActiveChat().chatId;
+        const activeChatId = safeGetActiveChat().chatId;
         const pendingRun =
           (activeChatId ? activeRunsByChat.get(activeChatId) : undefined) ??
           Array.from(activeRunsByChat.values()).find((r) => r.runId === runId);
@@ -991,10 +1326,21 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         }
         return;
       }
-      void rpc("abort_action", { runId }).catch(() => undefined);
+      void rpc<{ aborted?: boolean }>("abort_action", { runId }).then(
+        (res) => {
+          if (destroyed) return;
+          if (!res?.aborted) {
+            void refresh({ onlyIfChanged: true });
+          }
+        },
+        () => {
+          if (destroyed) return;
+          void refresh({ onlyIfChanged: true });
+        },
+      );
     },
     onRestoreLatest: () => {
-      const activeChatId = ctx.getActiveChat().chatId;
+      const activeChatId = safeGetActiveChat().chatId;
       if (destroyed || !view || isChatBusy(activeChatId)) {
         return;
       }
@@ -1081,7 +1427,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
 
   function handleActiveChatChanged(metricsChatId?: string | null): void {
     if (destroyed) return;
-    const activeChatId = ctx.getActiveChat().chatId;
+    const activeChatId = safeGetActiveChat().chatId;
     const effectiveMetricsChatId =
       metricsChatId !== undefined ? metricsChatId : activeChatId;
     const dedupeKey = `${activeChatId ?? ""}\0${effectiveMetricsChatId ?? ""}`;
@@ -1134,7 +1480,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       switch (event.type) {
         case "gg:status": {
           statusSeq += 1;
-          const activeChatId = ctx.getActiveChat().chatId;
+          const activeChatId = safeGetActiveChat().chatId;
           const prevActiveChatRun = getActiveRunForChat(activeChatId);
           const eventChatId =
             typeof event.chatId === "string" && event.chatId.length > 0
@@ -1142,6 +1488,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               : undefined;
           const hasTerminalSignal =
             Boolean(event.done) || Boolean(event.aborted) || Boolean(event.error);
+          const isUnscopedErrorStatus =
+            eventChatId === undefined && hasTerminalSignal && Boolean(event.error);
           const prevEventChatRun = eventChatId
             ? activeRunsByChat.get(eventChatId)
             : undefined;
@@ -1155,6 +1503,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               event.run.chatId !== eventChatId &&
               hasTerminalSignal
             ) {
+              markTerminalRunSeen(prevEventChatRun?.runId);
+              markTerminalRunSeen(
+                inFlightActionRpcsByChat.get(eventChatId)?.observedRunId,
+              );
               activeRunsByChat.delete(eventChatId);
               setChatStatusSeq(eventChatId, statusSeq);
               if (
@@ -1168,14 +1520,24 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             }
             if (
               !hasTerminalSignal ||
+              isUnscopedErrorStatus ||
               (eventChatId !== undefined && event.run.chatId !== eventChatId)
             ) {
               if (prevRunChatRun?.runId !== event.run.runId) {
                 pendingImpersonateDrafts.delete(event.run.chatId);
+                lastForegroundReconcileAt = 0;
+              }
+              if (!isPendingRunId(event.run.runId)) {
+                const inFlight = inFlightActionRpcsByChat.get(event.run.chatId);
+                if (inFlight) {
+                  inFlight.observedRunId = event.run.runId;
+                }
               }
               activeRunsByChat.set(event.run.chatId, event.run);
               setChatStatusSeq(event.run.chatId, statusSeq);
             } else {
+              markTerminalRunSeen(event.run.runId);
+              markTerminalRunSeen(prevRunChatRun?.runId);
               activeRunsByChat.delete(event.run.chatId);
               setChatStatusSeq(event.run.chatId, statusSeq);
               if (
@@ -1187,6 +1549,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               }
             }
           } else if (eventChatId) {
+            markTerminalRunSeen(prevEventChatRun?.runId);
+            markTerminalRunSeen(
+              inFlightActionRpcsByChat.get(eventChatId)?.observedRunId,
+            );
             activeRunsByChat.delete(eventChatId);
             setChatStatusSeq(eventChatId, statusSeq);
             if (
@@ -1197,7 +1563,15 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             ) {
               pendingImpersonateDrafts.delete(eventChatId);
             }
-          } else {
+          } else if (!isUnscopedErrorStatus) {
+            if (hasTerminalSignal) {
+              for (const run of activeRunsByChat.values()) {
+                markTerminalRunSeen(run.runId);
+              }
+              for (const inFlight of inFlightActionRpcsByChat.values()) {
+                markTerminalRunSeen(inFlight.observedRunId);
+              }
+            }
             activeRunsByChat.clear();
             globalClearSeq = statusSeq;
             if (hasTerminalSignal) {
@@ -1205,6 +1579,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             }
           }
 
+          syncActiveRunReconcileTimer();
           syncPrimaryActiveRun();
           if (view) {
             view = {
@@ -1217,7 +1592,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             prevActiveChatRun !== nextActiveChatRun ||
             (activeChatId !== null &&
               (eventChatId === activeChatId || event.run?.chatId === activeChatId)) ||
-            (!eventChatId && !event.run);
+            (!eventChatId && !event.run && !isUnscopedErrorStatus);
           if (activeChatAffected) {
             indicator.sync(nextActiveChatRun);
           }
@@ -1239,10 +1614,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
               (activeRunsByChat.size === 1
                 ? Array.from(activeRunsByChat.values())[0]!.chatId
                 : activeRun?.chatId ?? null);
-            const activeChatId = ctx.getActiveChat().chatId;
+            const activeChatId = safeGetActiveChat().chatId;
             if (expectedChatId !== null && expectedChatId !== activeChatId) {
               if (event.done && !event.aborted && event.text.length > 0) {
-                pendingImpersonateDrafts.set(expectedChatId, event.text);
+                setPendingImpersonateDraft(expectedChatId, event.text);
               }
               return;
             }
@@ -1258,7 +1633,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
                 event.text.length > 0 &&
                 expectedChatId
               ) {
-                pendingImpersonateDrafts.set(expectedChatId, event.text);
+                setPendingImpersonateDraft(expectedChatId, event.text);
                 if (expectedChatId === activeChatId) {
                   applyPendingImpersonateDraft(activeChatId);
                 }
@@ -1271,7 +1646,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
                 safeFocusComposer(state);
               }
             } else if (event.done && !event.aborted && event.text.length > 0) {
-              pendingImpersonateDrafts.set(activeChatId, event.text);
+              setPendingImpersonateDraft(activeChatId, event.text);
             }
           }
           return;
@@ -1307,14 +1682,14 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   disposers.push(
     ctx.events.on("CHAT_SWITCHED", (payload) => {
       handleActiveChatChanged(
-        extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
+        extractChatIdFromPayload(payload) ?? safeGetActiveChat().chatId,
       );
     }),
   );
   disposers.push(
     ctx.events.on("CHAT_CHANGED", (payload) => {
       handleActiveChatChanged(
-        extractChatIdFromPayload(payload) ?? ctx.getActiveChat().chatId,
+        extractChatIdFromPayload(payload) ?? safeGetActiveChat().chatId,
       );
     }),
   );
@@ -1331,8 +1706,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         clearImpersonateDraftRetry();
       }
       launchingChats.delete(deletedChatId);
+      syncActiveRunReconcileTimer();
       syncPrimaryActiveRun();
-      const activeChatId = ctx.getActiveChat().chatId;
+      const activeChatId = safeGetActiveChat().chatId;
       indicator.sync(getActiveRunForChat(activeChatId));
       chatHeads.onChatDeleted(deletedChatId);
       pillMetrics.onChatDeleted(deletedChatId);
@@ -1374,7 +1750,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     if (ctx.state) {
       disposers.push(
         ctx.state.subscribe("chat.active", () => {
-          const nextChatId = ctx.getActiveChat().chatId;
+          const nextChatId = safeGetActiveChat().chatId;
           if (nextChatId === lastObservedActiveChatId) return;
           handleActiveChatChanged();
         }),
@@ -1385,16 +1761,48 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     // Older host fallback below
   }
   if (!stateSubscribed) {
-    let lastChatId = ctx.getActiveChat().chatId;
+    let lastChatId = safeGetActiveChat().chatId;
     const poll = setInterval(() => {
       if (destroyed) return;
-      const nextChatId = ctx.getActiveChat().chatId;
+      const nextChatId = safeGetActiveChat().chatId;
       if (nextChatId !== lastChatId) {
         lastChatId = nextChatId;
         handleActiveChatChanged(nextChatId);
       }
     }, 600);
     disposers.push(() => clearInterval(poll));
+  }
+
+  if (typeof document !== "undefined") {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        reconcileOnForeground();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    disposers.push(() => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    });
+  }
+
+  const win =
+    typeof window !== "undefined"
+      ? window
+      : typeof document !== "undefined"
+        ? document.defaultView
+        : null;
+  if (win && typeof win.addEventListener === "function") {
+    const onForegroundEvent = () => {
+      reconcileOnForeground();
+    };
+    win.addEventListener("focus", onForegroundEvent);
+    win.addEventListener("pageshow", onForegroundEvent);
+    win.addEventListener("online", onForegroundEvent);
+    disposers.push(() => {
+      win.removeEventListener("focus", onForegroundEvent);
+      win.removeEventListener("pageshow", onForegroundEvent);
+      win.removeEventListener("online", onForegroundEvent);
+    });
   }
 
   ctx.ready();
@@ -1407,6 +1815,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       // Ignore flush errors on teardown
     }
     destroyed = true;
+    stopActiveRunReconcileTimer();
     inFlightRefresh = null;
     inFlightRefreshIncludeCatalogs = false;
     pendingFollowUpRefresh = false;
@@ -1428,6 +1837,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       waiter.reject(new Error("Guided Generations unloaded."));
     }
     pending.clear();
+    inFlightActionRpcsByChat.clear();
+    seenTerminalRunIds.clear();
     launchingChats.clear();
     activeRunsByChat.clear();
     chatStatusSeq.clear();

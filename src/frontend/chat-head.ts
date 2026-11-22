@@ -255,8 +255,14 @@ export class ChatHeadController {
       );
     }
 
+    const isUnscopedErrorStatus =
+      eventChatId === undefined && hasTerminalSignal && Boolean(event.error);
     if (run && typeof run.chatId === "string" && run.chatId.length > 0) {
-      if (!hasTerminalSignal || (eventChatId !== undefined && run.chatId !== eventChatId)) {
+      if (
+        !hasTerminalSignal ||
+        isUnscopedErrorStatus ||
+        (eventChatId !== undefined && run.chatId !== eventChatId)
+      ) {
         this.upsertFromActiveRun(run, currentActiveChatId);
       } else if (!eventChatId && hasTerminalSignal) {
         this.finalizeChatRun(
@@ -268,7 +274,7 @@ export class ChatHeadController {
           currentActiveChatId,
         );
       }
-    } else if (!eventChatId) {
+    } else if (!eventChatId && !isUnscopedErrorStatus) {
       for (const [chatId, entry] of [...this.heads.entries()]) {
         if (entry.status === "running" || entry.status === "streaming") {
           this.finalizeChatRun(
@@ -407,7 +413,7 @@ export class ChatHeadController {
     this.heads.set(run.chatId, nextEntry);
 
     if (characterId && !characterName && !this.characterCache.has(characterId)) {
-      void this.resolveCharacterMeta(run.chatId, characterId);
+      void this.resolveCharacterMeta(characterId);
     }
   }
 
@@ -441,10 +447,7 @@ export class ChatHeadController {
     }
   }
 
-  private async resolveCharacterMeta(
-    chatId: string,
-    characterId: string,
-  ): Promise<void> {
+  private async resolveCharacterMeta(characterId: string): Promise<void> {
     if (this.destroyed || !characterId) return;
     if (
       this.pendingCharacterFetches.has(characterId) ||
@@ -485,9 +488,9 @@ export class ChatHeadController {
         avatarUrl: safeAvatar,
       });
 
-      const entry = this.heads.get(chatId);
-      if (entry && entry.characterId === characterId) {
-        let changed = false;
+      let changed = false;
+      for (const entry of this.heads.values()) {
+        if (entry.characterId !== characterId) continue;
         if (name && !entry.characterName) {
           entry.characterName = name;
           changed = true;
@@ -502,9 +505,9 @@ export class ChatHeadController {
           entry.avatarUrl = safeAvatar;
           changed = true;
         }
-        if (changed) {
-          this.render();
-        }
+      }
+      if (changed) {
+        this.render();
       }
     } catch {
       if (!this.destroyed) {

@@ -76,7 +76,7 @@ export const GUIDED_GENERATIONS_CSS = `
 
 .gg-btn.is-running {
   background: rgba(239, 68, 68, 0.2);
-  color: #fecaca;
+  color: var(--lumiverse-danger-text, var(--lumiverse-danger, #ef4444));
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35);
 }
 
@@ -141,13 +141,13 @@ export const GUIDED_GENERATIONS_CSS = `
 .gg-notice.is-error {
   border-color: rgba(239, 68, 68, 0.5);
   background: rgba(239, 68, 68, 0.14);
-  color: #fecaca;
+  color: var(--lumiverse-danger-text, var(--lumiverse-text, var(--text-primary, currentColor)));
 }
 
 .gg-notice.is-warn {
   border-color: rgba(245, 158, 11, 0.48);
   background: rgba(245, 158, 11, 0.14);
-  color: #fde68a;
+  color: var(--lumiverse-warning-text, var(--lumiverse-text, var(--text-primary, currentColor)));
 }
 
 .gg-section-body {

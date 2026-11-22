@@ -388,6 +388,13 @@ export class SettingsDrawerController {
 
   private isEditingDrawerInput(): boolean {
     if (this.debounceTimers.size > 0) return true;
+    if (
+      this.tab.root.querySelector(
+        '[aria-expanded="true"]:not(.gg-card-header), [role="listbox"]',
+      ) !== null
+    ) {
+      return true;
+    }
     const active = typeof document !== "undefined" ? document.activeElement : null;
     return Boolean(
       isElementNode(active) &&
@@ -1608,11 +1615,28 @@ function isElementNode(value: unknown): value is Element {
 
 function isEditableElement(el: Element): boolean {
   const tag = el.tagName;
-  return (
+  if (
     tag === "INPUT" ||
     tag === "TEXTAREA" ||
     tag === "SELECT" ||
     (el as HTMLElement).isContentEditable
+  ) {
+    return true;
+  }
+  if (el.classList.contains("gg-card-header")) {
+    return false;
+  }
+  const role = el.getAttribute("role");
+  if (role === "combobox" || role === "listbox" || role === "option") {
+    return true;
+  }
+  if (el.getAttribute("aria-expanded") === "true") {
+    return true;
+  }
+  return Boolean(
+    el.closest?.(
+      '[role="combobox"], [role="listbox"], [role="option"], [aria-expanded="true"]:not(.gg-card-header)',
+    ),
   );
 }
 

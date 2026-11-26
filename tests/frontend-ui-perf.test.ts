@@ -273,7 +273,7 @@ describe("Phase 4 frontend UI & icon performance optimizations", () => {
       });
 
       const initialButtons = Array.from(actionsMount.querySelectorAll<HTMLButtonElement>("button"));
-      expect(initialButtons).toHaveLength(6);
+      expect(initialButtons).toHaveLength(7);
       const initialSvgs = initialButtons.map((b) => b.querySelector("svg"));
 
       // Transition to activeRun on guided_response -> same button nodes, untouched SVGs on other buttons
@@ -290,8 +290,8 @@ describe("Phase 4 frontend UI & icon performance optimizations", () => {
       });
 
       const runningButtons = Array.from(actionsMount.querySelectorAll<HTMLButtonElement>("button"));
-      expect(runningButtons).toHaveLength(6);
-      for (let i = 0; i < 6; i += 1) {
+      expect(runningButtons).toHaveLength(7);
+      for (let i = 0; i < 7; i += 1) {
         expect(runningButtons[i]).toBe(initialButtons[i]);
       }
 
@@ -334,7 +334,7 @@ describe("Phase 4 frontend UI & icon performance optimizations", () => {
       });
 
       const idleButtons = Array.from(actionsMount.querySelectorAll<HTMLButtonElement>("button"));
-      for (let i = 0; i < 6; i += 1) {
+      for (let i = 0; i < 7; i += 1) {
         expect(idleButtons[i]).toBe(initialButtons[i]);
       }
       expect(idleButtons[recoveryIdx]!.querySelector("svg")).toBe(initialSvgs[recoveryIdx]);

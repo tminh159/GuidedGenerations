@@ -11,6 +11,7 @@ import { createDefaultSettings } from "../src/shared/defaults";
 import type {
   ExtensionBootstrapView,
   GuidedGenerationsSettings,
+  GuidedSceneChatContext,
   RecoveryEntry,
   RpcRequestEnvelope,
 } from "../src/shared/types";
@@ -683,14 +684,14 @@ describe("frontend orchestration and safety", () => {
     h.resolveLastRpc(initialView, "get_bootstrap");
     await flushMicrotasks();
 
-    // Toggle first switch (Guided Response enabled -> false) => save #1
-    const switches = h.tabRoot.querySelectorAll<HTMLButtonElement>('button[role="switch"]');
-    switches[0]!.click();
+    // Toggle first checkbox (Guided Response enabled -> false) => save #1
+    const checkboxes = h.tabRoot.querySelectorAll<HTMLInputElement>('input[type="checkbox"].gg-checkbox');
+    checkboxes[0]!.click();
     await flushMicrotasks();
     const save1 = h.sentRpcs.filter((r) => r.action === "save_settings")[0]!;
 
-    // Toggle second switch (Guided Response clearInputOnRun -> false) => save #2
-    switches[1]!.click();
+    // Toggle second checkbox (Guided Response clearInputOnRun -> false) => save #2
+    checkboxes[1]!.click();
     await flushMicrotasks();
     const save2 = h.sentRpcs.filter((r) => r.action === "save_settings")[1]!;
 
@@ -705,7 +706,7 @@ describe("frontend orchestration and safety", () => {
     await flushMicrotasks();
 
     // Newer clearInputOnRun=false must be preserved when triggering next save
-    switches[0]!.click();
+    checkboxes[0]!.click();
     await flushMicrotasks();
     const save3 = h.sentRpcs.filter((r) => r.action === "save_settings")[2]!;
     expect((save3.input as GuidedGenerationsSettings).actions.guided_response.clearInputOnRun).toBe(
@@ -936,7 +937,7 @@ describe("frontend orchestration and safety", () => {
 
     // A11y checks: chevrons aria-hidden, card headers aria-controls, <label> for fields
     const chevrons = tabRoot.querySelectorAll(".gg-card-chevron");
-    expect(chevrons.length).toBe(7);
+    expect(chevrons.length).toBe(8);
     for (const chevron of chevrons) {
       expect(chevron.getAttribute("aria-hidden")).toBe("true");
     }
@@ -948,15 +949,15 @@ describe("frontend orchestration and safety", () => {
     }
     expect(tabRoot.querySelectorAll("label.gg-field-label").length).toBeGreaterThan(5);
 
-    // Toggling Guided Response switch synchronously updates its Visible/Hidden tag in Toolbar Position & Order
+    // Toggling Guided Response checkbox synchronously updates its Visible/Hidden tag in Toolbar Position & Order
     const orderTag = tabRoot.querySelector<HTMLElement>(
       '[data-gg-order-id="guided_response"] .gg-order-item-state',
     )!;
     expect(orderTag.textContent).toBe("Visible");
-    const responseSwitch = tabRoot.querySelector<HTMLButtonElement>(
-      'button[aria-label="Show Guided Response button on input bar"]',
+    const responseCheckbox = tabRoot.querySelector<HTMLInputElement>(
+      'input[type="checkbox"][aria-label="Show Guided Response button on input bar"]',
     )!;
-    responseSwitch.click();
+    responseCheckbox.click();
     expect(orderTag.textContent).toBe("Hidden");
 
     // Reordering moves row and restores focus to the moved row's button
@@ -3267,11 +3268,11 @@ describe("frontend orchestration and safety", () => {
     initialView.settings.actions.guided_response.instructionTemplate = "Initial template";
     drawer.render(initialView);
 
-    // Edit switch synchronously (applyRegex -> false) + edit textarea debounced
-    const regexSwitch = tabRoot.querySelector<HTMLButtonElement>(
-      'button[role="switch"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
+    // Edit checkbox synchronously (applyRegex -> false) + edit textarea debounced
+    const regexCheckbox = tabRoot.querySelector<HTMLInputElement>(
+      'input[type="checkbox"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
     )!;
-    regexSwitch.click();
+    regexCheckbox.click();
 
     const textarea = tabRoot.querySelector<HTMLTextAreaElement>(
       'textarea[aria-label="Guided Response Guidance Template"]',
@@ -3306,11 +3307,11 @@ describe("frontend orchestration and safety", () => {
     const rebuiltTextarea = tabRoot.querySelector<HTMLTextAreaElement>(
       'textarea[aria-label="Guided Response Guidance Template"]',
     )!;
-    const rebuiltRegexSwitch = tabRoot.querySelector<HTMLButtonElement>(
-      'button[role="switch"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
+    const rebuiltRegexCheckbox = tabRoot.querySelector<HTMLInputElement>(
+      'input[type="checkbox"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
     )!;
     expect(rebuiltTextarea.value).toBe("Just-saved template");
-    expect(rebuiltRegexSwitch.getAttribute("aria-checked")).toBe("false");
+    expect(rebuiltRegexCheckbox.checked).toBe(false);
     drawer.destroy();
 
     // 2. setup(ctx) teardown flushes pending debounced saves before marking destroyed
@@ -4535,7 +4536,7 @@ describe("frontend orchestration and safety", () => {
       expect(h.getConnectionsListCalls()).toBe(0);
 
       // Toolbar IS still rendered and functional while drawer is unmounted
-      expect(h.actionsMount.querySelectorAll("button")).toHaveLength(6);
+      expect(h.actionsMount.querySelectorAll("button")).toHaveLength(7);
 
       // connections.subscribe is ignored while drawer is unmounted
       h.emitConnectionsChange();
@@ -4587,10 +4588,10 @@ describe("frontend orchestration and safety", () => {
       h.activateDrawer();
 
       expect(h.getMountCounts()).toEqual({
-        switch: 16,
-        select: 21,
-        combobox: 5,
-        textArea: 5,
+        switch: 0,
+        select: 26,
+        combobox: 6,
+        textArea: 9,
       });
       expect(h.tabRoot.querySelector(".gg-notice")?.textContent).toContain("Type guidance");
       const restoreBtn = h.tabRoot.querySelector<HTMLButtonElement>(".gg-recovery-item button");
@@ -4668,10 +4669,10 @@ describe("frontend orchestration and safety", () => {
       });
       await flushMicrotasks();
       expect(h1.getMountCounts()).toEqual({
-        switch: 16,
-        select: 21,
-        combobox: 5,
-        textArea: 5,
+        switch: 0,
+        select: 26,
+        combobox: 6,
+        textArea: 9,
       });
     } finally {
       teardown1();
@@ -4690,10 +4691,10 @@ describe("frontend orchestration and safety", () => {
       h2.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
       await flushMicrotasks();
       expect(h2.getMountCounts()).toEqual({
-        switch: 16,
-        select: 21,
-        combobox: 5,
-        textArea: 5,
+        switch: 0,
+        select: 26,
+        combobox: 6,
+        textArea: 9,
       });
     } finally {
       teardown2();
@@ -4747,10 +4748,10 @@ describe("frontend orchestration and safety", () => {
 
       expect(observerState.disconnectCalls).toBe(1);
       expect(h3.getMountCounts()).toEqual({
-        switch: 16,
-        select: 21,
-        combobox: 5,
-        textArea: 5,
+        switch: 0,
+        select: 26,
+        combobox: 6,
+        textArea: 9,
       });
       const postDockReq = h3.sentRpcs.filter((r) => r.action === "get_bootstrap")[1]!;
       expect(postDockReq.input).toEqual({ includeCatalogs: true });
@@ -4837,7 +4838,7 @@ describe("frontend orchestration and safety", () => {
       const getButtons = () =>
         Array.from(h.actionsMount.querySelectorAll<HTMLButtonElement>("button"));
       const initialButtons = getButtons();
-      expect(initialButtons).toHaveLength(6);
+      expect(initialButtons).toHaveLength(7);
 
       const expectSameButtonRefs = (expected: HTMLButtonElement[]) => {
         const current = getButtons();
@@ -5083,13 +5084,13 @@ describe("frontend orchestration and safety", () => {
       settings.actions.guided_swipe.enabled = false;
       toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
       expect(actionsMount.querySelector('[data-gg-action="guided_swipe"]')).toBeNull();
-      expect(actionsMount.querySelectorAll("button")).toHaveLength(5);
+      expect(actionsMount.querySelectorAll("button")).toHaveLength(6);
 
       // Toggling inputRecovery.enabled updates buttons
       settings.inputRecovery.enabled = false;
       toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
       expect(actionsMount.querySelector('[data-gg-action="input_recovery"]')).toBeNull();
-      expect(actionsMount.querySelectorAll("button")).toHaveLength(4);
+      expect(actionsMount.querySelectorAll("button")).toHaveLength(5);
 
       // Reordering buttonOrder updates DOM order
       settings.buttonOrder = [
@@ -5097,6 +5098,7 @@ describe("frontend orchestration and safety", () => {
         "guided_regenerate",
         "guided_continue",
         "guided_response",
+        "guided_scene",
         "guided_swipe",
         "input_recovery",
       ];
@@ -5110,6 +5112,7 @@ describe("frontend orchestration and safety", () => {
         "guided_regenerate",
         "guided_continue",
         "guided_response",
+        "guided_scene",
       ]);
 
       // Placement / alignment changes update classes and mount host
@@ -5125,7 +5128,7 @@ describe("frontend orchestration and safety", () => {
       settings.toolbarPlacement = "below_bar";
       toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
       expect(rowMount.classList.contains("gg-actions-host--row")).toBe(true);
-      expect(rowMount.querySelectorAll("button")).toHaveLength(4);
+      expect(rowMount.querySelectorAll("button")).toHaveLength(5);
 
       // Swapping activeRun.runId for same actionId rebinds Stop button click handler
       toolbar.render({
@@ -5152,7 +5155,7 @@ describe("frontend orchestration and safety", () => {
         recovery: [],
         hasActiveChat: true,
       });
-      expect(rowMount.querySelectorAll("button")).toHaveLength(4);
+      expect(rowMount.querySelectorAll("button")).toHaveLength(5);
     } finally {
       toolbar.destroy();
       actionsMount.remove();
@@ -7147,6 +7150,159 @@ describe("frontend orchestration and safety", () => {
       );
     } finally {
       headCtrl.destroy();
+    }
+  });
+
+  test("executeSceneDropNow preserves optimistic pending run across concurrent refresh() and onSaveSettings syncs backend-normalized settings to drawer", async () => {
+    const h = createFrontendHarness({
+      initialChatId: "chat-a",
+      composerMounted: true,
+      composerText: "",
+    });
+    const teardown = setup(h.ctx);
+    try {
+      h.resolveLastRpc(makeBootstrapView(), "get_bootstrap");
+      await flushMicrotasks();
+
+      // 1. executeSceneDropNow registers in inFlightActionRpcsByChat so concurrent refresh() preserves pending run
+      h.emitFromBackend({
+        type: "gg:scene-updated",
+        chatId: "chat-a",
+        armedScene: {
+          chatId: "chat-a",
+          status: "armed",
+          pacing: "multi_turn",
+          delivery: "bridge",
+          adjustmentMode: "verbatim",
+          greetingSource: "custom",
+          greetingLabel: "Custom Scene",
+          rawGreetingText: "Bridge into the rooftop confrontation.",
+          transitionNote: "",
+          customDirection: "",
+          keepMediaIntact: true,
+          lockedDraftText: null,
+          draftLocked: false,
+          armedAt: 1000,
+        },
+      });
+      await flushMicrotasks();
+
+      const sceneBtn = () =>
+        h.actionsMount.querySelector<HTMLButtonElement>(
+          '[data-gg-action="guided_scene"]',
+        )!;
+      sceneBtn().dispatchEvent(
+        new (document.defaultView!.MouseEvent)("click", {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+        }),
+      );
+      await flushMicrotasks();
+
+      const dropNowItem = document.querySelector<HTMLButtonElement>(
+        '.gg-dropup-menu [data-gg-menu-action="drop_now"]',
+      )!;
+      dropNowItem.click();
+      await flushMicrotasks();
+
+      const dropReq = h.sentRpcs.find((r) => r.action === "drop_scene_now")!;
+      expect(dropReq).toBeDefined();
+      expect(sceneBtn().classList.contains("is-running")).toBe(true);
+
+      // Concurrent refresh() returns activeRun: null before gg:status arrives
+      h.emitFromBackend({ type: "gg:changed" });
+      h.resolveLastRpc(
+        makeBootstrapView({ activeRun: null, activeRuns: [] }),
+        "get_bootstrap",
+      );
+      await flushMicrotasks();
+
+      // Pending run is still preserved!
+      expect(sceneBtn().classList.contains("is-running")).toBe(true);
+
+      // Resolving drop_scene_now clears the pending run
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: dropReq.requestId,
+        result: {
+          runId: "scene-run-1",
+          actionId: "guided_scene",
+          chatId: "chat-a",
+          aborted: false,
+          text: "Dropped.",
+          dropTarget: "new_message",
+        },
+      });
+      await flushMicrotasks();
+      expect(sceneBtn().classList.contains("is-running")).toBe(false);
+
+      // 2. onSaveSettings with rebuildDrawer: false calls drawer.syncSettings(saved) when backend normalizes settings
+      h.tabRoot
+        .querySelector<HTMLButtonElement>('[data-gg-nav="advanced"]')!
+        .click();
+      await flushMicrotasks();
+      const makeCtx = (chatId: string): GuidedSceneChatContext => ({
+        chatId,
+        isGroup: false,
+        primaryCharacterId: "char-1",
+        primaryCharacterName: "Lyra",
+        members: [{ id: "char-1", name: "Lyra" }],
+        greetings: [
+          {
+            key: "char-1:0",
+            id: "g-0",
+            characterId: "char-1",
+            characterName: "Lyra",
+            greetingIndex: 0,
+            label: "Greeting #1",
+            text: "Hello there.",
+            preview: "Hello there.",
+            isOpening: false,
+            hasMedia: false,
+          },
+        ],
+        armedScene: null,
+        canSwipeLastAssistant: true,
+      });
+      h.resolveLastRpc(makeCtx("chat-a"), "get_scene_context");
+      await flushMicrotasks();
+
+      const keepMediaBox = h.tabRoot.querySelector<HTMLInputElement>(
+        'input[type="checkbox"][aria-label="Keep media intact in Guided Scene"]',
+      )!;
+      expect(keepMediaBox.checked).toBe(true);
+
+      // Trigger Basic setting save (rebuildDrawer: false) and return backend-normalized settings
+      const respCheckbox = h.tabRoot.querySelector<HTMLInputElement>(
+        'input[type="checkbox"][aria-label="Show Guided Response button on input bar"]',
+      )!;
+      respCheckbox.click();
+      await flushMicrotasks();
+      const saveReq = h.sentRpcs
+        .filter((r) => r.action === "save_settings")
+        .pop()!;
+      const normalizedFromBackend: GuidedGenerationsSettings = structuredClone(
+        saveReq.input as GuidedGenerationsSettings,
+      );
+      normalizedFromBackend.guidedScene.keepMediaIntact = false;
+      h.emitFromBackend({
+        type: "gg:reply",
+        requestId: saveReq.requestId,
+        result: normalizedFromBackend,
+      });
+      await flushMicrotasks();
+
+      // Switch to chat-b -> scene panel hydrates keepMediaIntact from synced settings
+      h.setChat("chat-b", { mounted: true, text: "" });
+      h.emitEvent("CHAT_SWITCHED", { chatId: "chat-b" });
+      await flushMicrotasks();
+      h.resolveLastRpc(makeCtx("chat-b"), "get_scene_context");
+      await flushMicrotasks();
+
+      expect(keepMediaBox.checked).toBe(false);
+    } finally {
+      teardown();
     }
   });
 });

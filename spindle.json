@@ -1,11 +1,11 @@
 {
   "name": "Guided Generations",
   "identifier": "guided_generations",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "Gehihi",
   "github": "https://github.com/tminh159/GuidedGenerations",
   "homepage": "https://github.com/tminh159/GuidedGenerations",
-  "description": "Guided Response, Guided Continue, Guided Regenerate, Guided Swipe, Impersonation, and Input Recovery buttons on the chat input bar, each with its own API connection profile, model, and preset settings.",
+  "description": "Guided Response, Guided Continue, Guided Regenerate, Guided Swipe, Impersonation, Guided Scene, and Input Recovery tools on the chat input bar and drawer, each with its own API connection profile, model, and preset settings.",
   "permissions": [
     "generation",
     "chats",

@@ -1,17 +1,28 @@
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
+import { normalizeGuidedSceneConfig } from "./shared/defaults";
 import type {
   ActionRunResult,
   ActiveRunState,
+  ArmedSceneState,
+  ArmSceneInput,
   BackendPushEvent,
+  DropSceneNowInput,
+  DropSceneNowResult,
   ExtensionBootstrapView,
   GuidedActionId,
   GuidedGenerationsSettings,
+  GuidedSceneChatContext,
+  GuidedSceneConfig,
+  PreviewSceneDraftInput,
+  PreviewSceneDraftResult,
   RecoveryEntry,
   RegenerateContinueInput,
   RemoveContinueResult,
   RpcActionName,
+  RunActionId,
   RunActionInput,
   TerminalRunSummary,
+  UpdateArmedSceneInput,
 } from "./shared/types";
 import { ChatHeadController } from "./frontend/chat-head";
 import { InputToolbarController } from "./frontend/input-toolbar";
@@ -72,7 +83,7 @@ function isRpcTimeoutError(error: unknown): boolean {
 
 interface InFlightActionRpc {
   requestId: string;
-  actionId: GuidedActionId;
+  actionId: RunActionId;
   chatId: string;
   startedAt: number;
   observedRunId: string | null;
@@ -85,6 +96,24 @@ function isPendingRunId(runId: string | null | undefined): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isArmedSceneState(value: unknown): value is ArmedSceneState {
+  return (
+    isRecord(value) &&
+    typeof value.chatId === "string" &&
+    value.chatId.length > 0 &&
+    typeof value.status === "string" &&
+    typeof value.pacing === "string"
+  );
+}
+
+function extractArmedSceneResult(raw: unknown): ArmedSceneState | null {
+  if (isArmedSceneState(raw)) return raw;
+  if (isRecord(raw) && "armedScene" in raw) {
+    return isArmedSceneState(raw.armedScene) ? raw.armedScene : null;
+  }
+  return null;
 }
 
 function areJsonValuesEqual(a: unknown, b: unknown): boolean {
@@ -175,6 +204,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let seq = 0;
   let pendingRunSeq = 0;
   let bootstrapSeq = 0;
+  let sceneContextSeq = 0;
   let settingsRevision = 0;
   let statusSeq = 0;
   let globalClearSeq = 0;
@@ -183,9 +213,11 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let view: ExtensionBootstrapView | null = null;
   let drawerMounted = false;
   let catalogsLoaded = false;
+  let suppressingActivateSceneLoad = false;
   let stopObservingTabConnection: (() => void) | null = null;
   let activeRun: ActiveRunState | null = null;
   const activeRunsByChat = new Map<string, ActiveRunState>();
+  const armedScenesByChat = new Map<string, ArmedSceneState>();
   const inFlightActionRpcsByChat = new Map<string, InFlightActionRpc>();
   const seenTerminalRunIds = new Set<string>();
   const chatStatusSeq = new Map<string, number>();
@@ -206,6 +238,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   let pendingFollowUpIncludeCatalogs = false;
   let lastChatSwitchKey: string | null = null;
   let chatSwitchResetQueued = false;
+
   function safeGetActiveChat(): { chatId: string | null; characterId?: string | null } {
     try {
       const active = ctx.getActiveChat?.() as
@@ -221,7 +254,61 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
   }
 
+  function safeGetActiveConnectionId(): string | null {
+    try {
+      return ctx.connections?.getActive?.()?.activeProfileId ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   let lastObservedActiveChatId: string | null = safeGetActiveChat().chatId;
+
+  function getArmedSceneForChat(
+    chatId: string | null | undefined,
+  ): ArmedSceneState | null {
+    if (!chatId) return null;
+    return armedScenesByChat.get(chatId) ?? null;
+  }
+
+  function applyArmedSceneForChat(
+    chatId: string | null | undefined,
+    armed: ArmedSceneState | null,
+  ): void {
+    if (chatId) {
+      if (armed && armed.chatId === chatId) {
+        armedScenesByChat.set(chatId, armed);
+      } else {
+        armedScenesByChat.delete(chatId);
+      }
+    }
+    const activeChatId = safeGetActiveChat().chatId;
+    drawer.setArmedScene(getArmedSceneForChat(activeChatId), activeChatId);
+    renderToolbar();
+  }
+
+  function hydrateArmedScenesFromBootstrap(next: ExtensionBootstrapView): void {
+    const hasArmedList = Array.isArray(next.armedScenes);
+    const hasSingleArmed = next.armedScene !== undefined;
+    if (!hasArmedList && !hasSingleArmed) return;
+
+    if (hasArmedList) {
+      armedScenesByChat.clear();
+      for (const item of next.armedScenes!) {
+        if (isArmedSceneState(item)) {
+          armedScenesByChat.set(item.chatId, item);
+        }
+      }
+    }
+    if (isArmedSceneState(next.armedScene)) {
+      armedScenesByChat.set(next.armedScene.chatId, next.armedScene);
+    } else if (!hasArmedList && next.armedScene === null) {
+      const activeChatId = safeGetActiveChat().chatId;
+      if (activeChatId) {
+        armedScenesByChat.delete(activeChatId);
+      }
+    }
+  }
 
   function markTerminalRunSeen(runId: string | null | undefined): void {
     if (!runId || isPendingRunId(runId)) return;
@@ -323,7 +410,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   }
 
   function startPendingRun(
-    actionId: GuidedActionId,
+    actionId: RunActionId,
     chatId: string,
     options?: { backgroundSwipe?: boolean },
   ): ActiveRunState {
@@ -344,7 +431,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       view = { ...view, activeRun };
     }
     const activeChatId = safeGetActiveChat().chatId;
-    indicator.sync(getActiveRunForChat(activeChatId));
+    const activeChatRun = getActiveRunForChat(activeChatId);
+    indicator.sync(activeChatRun);
+    drawer.setSceneActiveRun(activeChatRun);
     renderToolbar();
     return pendingRun;
   }
@@ -364,7 +453,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
     if (!destroyed) {
       const activeChatId = safeGetActiveChat().chatId;
-      indicator.sync(getActiveRunForChat(activeChatId));
+      const activeChatRun = getActiveRunForChat(activeChatId);
+      indicator.sync(activeChatRun);
+      drawer.setSceneActiveRun(activeChatRun);
       renderToolbar();
     }
     return true;
@@ -609,6 +700,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       recovery: view.recovery,
       hasActiveChat: Boolean(chatId),
       chatId,
+      armedScene: getArmedSceneForChat(chatId),
     });
     syncRecoveryBusy();
   }
@@ -619,6 +711,364 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       renderToolbar();
     } else {
       syncRecoveryBusy();
+    }
+  }
+
+  async function loadSceneContext(options: { force?: boolean } = {}): Promise<void> {
+    if (destroyed) return;
+    if (!options.force && !drawer.isShowingGuidedScene()) return;
+    const { chatId } = safeGetActiveChat();
+    const mySeq = ++sceneContextSeq;
+    if (!chatId) {
+      drawer.setSceneLoading(false);
+      drawer.setSceneContext(null, null);
+      return;
+    }
+    drawer.setSceneLoading(true);
+    try {
+      const context = await rpc<GuidedSceneChatContext>("get_scene_context", {
+        chatId,
+      });
+      if (
+        destroyed ||
+        mySeq !== sceneContextSeq ||
+        safeGetActiveChat().chatId !== chatId
+      ) {
+        return;
+      }
+      if (context && typeof context.chatId === "string") {
+        if (context.armedScene) {
+          armedScenesByChat.set(context.chatId, context.armedScene);
+        } else {
+          armedScenesByChat.delete(context.chatId);
+        }
+      }
+      drawer.setSceneLoading(false);
+      drawer.setSceneContext(context, null);
+      renderToolbar();
+    } catch (error) {
+      if (
+        destroyed ||
+        mySeq !== sceneContextSeq ||
+        safeGetActiveChat().chatId !== chatId
+      ) {
+        return;
+      }
+      drawer.setSceneLoading(false);
+      const msg = error instanceof Error ? error.message : String(error);
+      drawer.setSceneContext(null, msg);
+    }
+  }
+
+  async function saveSceneConfigPatch(
+    patch: Partial<GuidedSceneConfig>,
+  ): Promise<void> {
+    if (destroyed || !view) return;
+    const currentScene = normalizeGuidedSceneConfig(view.settings.guidedScene);
+    const nextSettings: GuidedGenerationsSettings = {
+      ...view.settings,
+      guidedScene: {
+        ...currentScene,
+        ...patch,
+      },
+    };
+    const rev = ++settingsRevision;
+    view = { ...view, settings: nextSettings };
+    drawer.syncSettings(nextSettings);
+    renderToolbar();
+    try {
+      const saved = await rpc<GuidedGenerationsSettings>(
+        "save_settings",
+        nextSettings,
+      );
+      if (destroyed || !view || rev !== settingsRevision) return;
+      const unchanged = areJsonValuesEqual(saved, view.settings);
+      view = { ...view, settings: saved };
+      if (!unchanged) {
+        drawer.syncSettings(saved);
+        renderToolbar();
+      }
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        `Failed saving settings: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      if (rev === settingsRevision) {
+        void refresh();
+      }
+    }
+  }
+
+  function abortRunById(runId: string): void {
+    if (destroyed) return;
+    if (isPendingRunId(runId)) {
+      const activeChatId = safeGetActiveChat().chatId;
+      const pendingRun =
+        (activeChatId ? activeRunsByChat.get(activeChatId) : undefined) ??
+        Array.from(activeRunsByChat.values()).find((r) => r.runId === runId);
+      const targetChatId = pendingRun?.chatId ?? activeChatId;
+      if (targetChatId) {
+        clearPendingRun(targetChatId, runId);
+        void rpc("abort_action", { chatId: targetChatId }).catch(() => undefined);
+      }
+      return;
+    }
+    void rpc<{ aborted?: boolean }>("abort_action", { runId }).then(
+      (res) => {
+        if (destroyed) return;
+        if (!res?.aborted) {
+          void refresh({ onlyIfChanged: true });
+        }
+      },
+      () => {
+        if (destroyed) return;
+        void refresh({ onlyIfChanged: true });
+      },
+    );
+  }
+
+  async function executeSceneDropNow(
+    input: DropSceneNowInput,
+  ): Promise<DropSceneNowResult> {
+    if (destroyed) {
+      throw new Error("Extension unloaded.");
+    }
+    const chatId = input.chatId;
+    if (!chatId) {
+      throw new Error("Open a chat before dropping a scene.");
+    }
+    if (isChatBusy(chatId)) {
+      throw new Error("Wait for the active guided run to finish first.");
+    }
+
+    const hasLockedDraft =
+      Boolean(input.draftLocked) &&
+      Boolean((input.lockedDraftText ?? input.previewText)?.trim());
+    const willStreamBridge =
+      input.delivery !== "cut" &&
+      input.adjustmentMode === "verbatim" &&
+      !hasLockedDraft;
+    const willStreamRewrite =
+      input.adjustmentMode !== "verbatim" && !hasLockedDraft;
+    const mightStream = willStreamBridge || willStreamRewrite;
+
+    launchingChats.add(chatId);
+    const pendingRun = mightStream
+      ? startPendingRun("guided_scene", chatId)
+      : null;
+    if (!mightStream) {
+      syncBusyUi();
+    }
+
+    let reconciled = false;
+    let currentRequestId = "";
+    const actionEntry: InFlightActionRpc = {
+      requestId: "",
+      actionId: "guided_scene",
+      chatId,
+      startedAt: Date.now(),
+      observedRunId: null,
+      cancelAsReconciled: () => {
+        if (reconciled) return;
+        reconciled = true;
+        const waiter = pending.get(currentRequestId);
+        if (waiter) {
+          pending.delete(currentRequestId);
+          clearTimeout(waiter.timer);
+          waiter.resolve(undefined);
+        }
+        if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+          inFlightActionRpcsByChat.delete(chatId);
+        }
+        launchingChats.delete(chatId);
+        if (pendingRun) {
+          clearPendingRun(chatId, pendingRun.runId);
+        }
+        syncBusyUi();
+      },
+    };
+
+    try {
+      clearBanner();
+      const result = await rpc<DropSceneNowResult>(
+        "drop_scene_now",
+        input,
+        ACTION_RPC_TIMEOUT_MS,
+        (requestId) => {
+          currentRequestId = requestId;
+          actionEntry.requestId = requestId;
+          inFlightActionRpcsByChat.set(chatId, actionEntry);
+        },
+      );
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      if (pendingRun) {
+        clearPendingRun(chatId, pendingRun.runId);
+      }
+      if (!destroyed && !reconciled && drawerMounted && drawer.isShowingGuidedScene()) {
+        void loadSceneContext();
+      }
+      return result;
+    } catch (error) {
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      if (pendingRun) {
+        clearPendingRun(chatId, pendingRun.runId);
+      }
+      if (!destroyed && !reconciled && getActiveRunForChat(chatId)) {
+        void refresh({ onlyIfChanged: true });
+      }
+      throw error;
+    } finally {
+      if (inFlightActionRpcsByChat.get(chatId) === actionEntry) {
+        inFlightActionRpcsByChat.delete(chatId);
+      }
+      launchingChats.delete(chatId);
+      if (pendingRun) {
+        clearPendingRun(chatId, pendingRun.runId);
+      }
+      syncBusyUi();
+    }
+  }
+
+  function toggleSceneDrawer(): void {
+    if (destroyed) return;
+    let drawerState: { open?: boolean; tabId?: string | null } | null = null;
+    try {
+      drawerState = ctx.ui?.events?.getDrawerState?.() ?? null;
+    } catch {
+      drawerState = null;
+    }
+    const isMainDrawerOpenOnScene =
+      Boolean(drawerState?.open) &&
+      drawerState?.tabId === drawer.getTabId() &&
+      drawer.isShowingGuidedScene();
+
+    if (isMainDrawerOpenOnScene) {
+      void rpc("close_drawer").catch(() => undefined);
+      return;
+    }
+
+    const wasShowing = drawer.isShowingGuidedScene();
+    drawer.openGuidedScene();
+    if (!drawerMounted) {
+      drawerMounted = true;
+      clearTabConnectionObserver();
+      drawer.render(view);
+    }
+    suppressingActivateSceneLoad = true;
+    try {
+      drawer.activate();
+    } finally {
+      suppressingActivateSceneLoad = false;
+    }
+    if (!catalogsLoaded) {
+      void refresh({ onlyIfChanged: false, includeCatalogs: true });
+    }
+    // openGuidedScene() already triggers onActiveViewChange -> loadSceneContext when !wasShowing
+    if (wasShowing) {
+      void loadSceneContext({ force: true });
+    }
+  }
+
+  async function handleToolbarSceneDropNextTurn(): Promise<void> {
+    if (destroyed) return;
+    const { chatId } = safeGetActiveChat();
+    if (!chatId) return;
+    try {
+      const raw = await rpc<unknown>("drop_next_turn", { chatId });
+      if (destroyed) return;
+      applyArmedSceneForChat(chatId, extractArmedSceneResult(raw));
+      showBanner("Guided Scene set to drop on the next turn.", "info");
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        error instanceof Error ? error.message : String(error),
+        "error",
+        7_000,
+      );
+    }
+  }
+
+  async function handleToolbarSceneDropNow(): Promise<void> {
+    if (destroyed) return;
+    const { chatId } = safeGetActiveChat();
+    if (!chatId) return;
+    const armed = getArmedSceneForChat(chatId);
+    if (!armed) return;
+    try {
+      await executeSceneDropNow({
+        chatId,
+        greetingSource: armed.greetingSource,
+        selectedGreetingKey: armed.selectedGreetingKey ?? null,
+        greetingLabel: armed.greetingLabel,
+        rawGreetingText: armed.rawGreetingText,
+        speakerCharacterId: armed.speakerCharacterId ?? null,
+        speakerCharacterName: armed.speakerCharacterName ?? null,
+        delivery: armed.delivery,
+        transitionNote: armed.transitionNote,
+        adjustmentMode: armed.adjustmentMode,
+        customDirection: armed.customDirection,
+        keepMediaIntact:
+          armed.keepMediaIntact ??
+          view?.settings.guidedScene?.keepMediaIntact ??
+          true,
+        draftLocked: armed.draftLocked,
+        lockedDraftText: armed.lockedDraftText,
+        previewText: armed.lockedDraftText ?? undefined,
+        dropTarget: "new_message",
+        activeConnectionId: safeGetActiveConnectionId(),
+      });
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        error instanceof Error ? error.message : String(error),
+        "error",
+        7_000,
+      );
+    }
+  }
+
+  async function handleToolbarSceneTogglePause(): Promise<void> {
+    if (destroyed) return;
+    const { chatId } = safeGetActiveChat();
+    if (!chatId) return;
+    const armed = getArmedSceneForChat(chatId);
+    if (!armed) return;
+    const action: RpcActionName =
+      armed.status === "paused" ? "resume_scene" : "pause_scene";
+    try {
+      const raw = await rpc<unknown>(action, { chatId });
+      if (destroyed) return;
+      applyArmedSceneForChat(chatId, extractArmedSceneResult(raw));
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        error instanceof Error ? error.message : String(error),
+        "error",
+        7_000,
+      );
+    }
+  }
+
+  async function handleToolbarSceneCancel(): Promise<void> {
+    if (destroyed) return;
+    const { chatId } = safeGetActiveChat();
+    if (!chatId) return;
+    try {
+      await rpc("cancel_scene", { chatId });
+      if (destroyed) return;
+      applyArmedSceneForChat(chatId, null);
+    } catch (error) {
+      if (destroyed) return;
+      showBanner(
+        error instanceof Error ? error.message : String(error),
+        "error",
+        7_000,
+      );
     }
   }
 
@@ -689,6 +1139,8 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           view && settingsRevision !== startSettingsRevision
             ? view.settings
             : next.settings;
+
+        hydrateArmedScenesFromBootstrap(next);
 
         const bootstrapRunsByChat = new Map<string, ActiveRunState>();
         const bootstrapRuns = (
@@ -868,7 +1320,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         view = mergedNext;
         activeRun = resolvedActiveRun;
         const currentChatId = safeGetActiveChat().chatId;
-        indicator.sync(getActiveRunForChat(currentChatId));
+        const currentChatRun = getActiveRunForChat(currentChatId);
+        indicator.sync(currentChatRun);
+        drawer.setSceneActiveRun(currentChatRun);
+        drawer.setArmedScene(getArmedSceneForChat(currentChatId), currentChatId);
         chatHeads.syncRuns(
           Array.from(activeRunsByChat.values()).filter((r) => !isPendingRunId(r.runId)),
           currentChatId,
@@ -1107,7 +1562,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         return;
       }
 
-      const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
+      const activeConnectionId = safeGetActiveConnectionId();
       const isBackgroundSwipe =
         actionId === "guided_swipe" && Boolean(options?.backgroundSwipe);
       const payload: RunActionInput = {
@@ -1258,7 +1713,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     pendingImpersonateDrafts.delete(chatId);
     try {
       clearBanner();
-      const activeConnectionId = ctx.connections?.getActive?.()?.activeProfileId ?? null;
+      const activeConnectionId = safeGetActiveConnectionId();
       const payload: RegenerateContinueInput = {
         chatId,
         activeConnectionId,
@@ -1313,31 +1768,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       void triggerAction(actionId, options);
     },
     onAbortAction: (runId) => {
-      if (destroyed) return;
-      if (isPendingRunId(runId)) {
-        const activeChatId = safeGetActiveChat().chatId;
-        const pendingRun =
-          (activeChatId ? activeRunsByChat.get(activeChatId) : undefined) ??
-          Array.from(activeRunsByChat.values()).find((r) => r.runId === runId);
-        const targetChatId = pendingRun?.chatId ?? activeChatId;
-        if (targetChatId) {
-          clearPendingRun(targetChatId, runId);
-          void rpc("abort_action", { chatId: targetChatId }).catch(() => undefined);
-        }
-        return;
-      }
-      void rpc<{ aborted?: boolean }>("abort_action", { runId }).then(
-        (res) => {
-          if (destroyed) return;
-          if (!res?.aborted) {
-            void refresh({ onlyIfChanged: true });
-          }
-        },
-        () => {
-          if (destroyed) return;
-          void refresh({ onlyIfChanged: true });
-        },
-      );
+      abortRunById(runId);
     },
     onRestoreLatest: () => {
       const activeChatId = safeGetActiveChat().chatId;
@@ -1363,6 +1794,21 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     onRegenerateLastContinue: () => {
       void regenerateLastContinue();
     },
+    onToggleSceneDrawer: () => {
+      toggleSceneDrawer();
+    },
+    onSceneDropNextTurn: () => {
+      void handleToolbarSceneDropNextTurn();
+    },
+    onSceneDropNow: () => {
+      void handleToolbarSceneDropNow();
+    },
+    onSceneTogglePause: () => {
+      void handleToolbarSceneTogglePause();
+    },
+    onSceneCancelSteering: () => {
+      void handleToolbarSceneCancel();
+    },
   });
 
   const drawer = new SettingsDrawerController(ctx, {
@@ -1370,6 +1816,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       if (destroyed) return;
       clearBanner();
       void refresh({ includeCatalogs: true });
+      if (drawer.isShowingGuidedScene()) {
+        void loadSceneContext();
+      }
     },
     onSaveSettings: async (nextSettings: GuidedGenerationsSettings, options) => {
       if (destroyed || !view) return;
@@ -1387,7 +1836,11 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
         view = { ...view, settings: saved };
         if (!settingsUnchanged) {
           renderToolbar();
-          if (options?.rebuildDrawer) drawer.render(view);
+          if (options?.rebuildDrawer) {
+            drawer.render(view);
+          } else {
+            drawer.syncSettings(saved);
+          }
         }
       } catch (error) {
         if (destroyed) return;
@@ -1402,6 +1855,83 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     },
     onRestoreEntry: (entry) => restoreRecoveryEntry(entry),
     onClearRecovery: () => clearRecoveryHistory(),
+    onActiveViewChange: (_tab, _subTab) => {
+      if (destroyed) return;
+      if (drawer.isShowingGuidedScene()) {
+        void loadSceneContext({ force: true });
+      }
+    },
+    scene: {
+      onRefreshContext: async () => {
+        await loadSceneContext({ force: true });
+      },
+      onSaveSceneConfigPatch: async (patch) => {
+        await saveSceneConfigPatch(patch);
+      },
+      onPreviewDraft: async (input: PreviewSceneDraftInput) => {
+        return rpc<PreviewSceneDraftResult>(
+          "preview_scene_draft",
+          input,
+          ACTION_RPC_TIMEOUT_MS,
+        );
+      },
+      onCancelPreview: (chatId: string) => {
+        void rpc("abort_action", { chatId }).catch(() => undefined);
+      },
+      onAbortRun: (runId: string) => {
+        abortRunById(runId);
+      },
+      onDropSceneNow: async (input: DropSceneNowInput) => {
+        return executeSceneDropNow(input);
+      },
+      onArmScene: async (input: ArmSceneInput) => {
+        const raw = await rpc<unknown>("arm_scene", input);
+        const armed = extractArmedSceneResult(raw);
+        if (!destroyed) {
+          applyArmedSceneForChat(input.chatId, armed);
+        }
+        return armed;
+      },
+      onUpdateArmedScene: async (input: UpdateArmedSceneInput) => {
+        const raw = await rpc<unknown>("update_armed_scene", input);
+        const armed = extractArmedSceneResult(raw);
+        if (!destroyed) {
+          applyArmedSceneForChat(input.chatId, armed);
+        }
+        return armed;
+      },
+      onPauseScene: async (chatId: string) => {
+        const raw = await rpc<unknown>("pause_scene", { chatId });
+        const armed = extractArmedSceneResult(raw);
+        if (!destroyed) {
+          applyArmedSceneForChat(chatId, armed);
+        }
+        return armed;
+      },
+      onResumeScene: async (chatId: string) => {
+        const raw = await rpc<unknown>("resume_scene", { chatId });
+        const armed = extractArmedSceneResult(raw);
+        if (!destroyed) {
+          applyArmedSceneForChat(chatId, armed);
+        }
+        return armed;
+      },
+      onDropNextTurn: async (chatId: string) => {
+        const raw = await rpc<unknown>("drop_next_turn", { chatId });
+        const armed = extractArmedSceneResult(raw);
+        if (!destroyed) {
+          applyArmedSceneForChat(chatId, armed);
+        }
+        return armed;
+      },
+      onCancelScene: async (chatId: string) => {
+        await rpc("cancel_scene", { chatId });
+        if (!destroyed) {
+          applyArmedSceneForChat(chatId, null);
+        }
+      },
+      getActiveConnectionId: () => safeGetActiveConnectionId(),
+    },
   });
 
   drawerMounted = drawer.isTabConnected();
@@ -1414,6 +1944,9 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       drawer.render(view);
     }
     void refresh({ onlyIfChanged: catalogsLoaded, includeCatalogs: true });
+    if (!suppressingActivateSceneLoad && drawer.isShowingGuidedScene()) {
+      void loadSceneContext();
+    }
   }
 
   if (!drawerMounted) {
@@ -1445,11 +1978,21 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     }
     clearImpersonateDraftRetry();
     syncPrimaryActiveRun();
-    indicator.sync(getActiveRunForChat(activeChatId));
+    const activeChatRun = getActiveRunForChat(activeChatId);
+    indicator.sync(activeChatRun);
+    drawer.setSceneActiveRun(activeChatRun);
+    drawer.setArmedScene(getArmedSceneForChat(activeChatId), activeChatId);
     chatHeads.onChatChanged(activeChatId);
     renderToolbar();
     applyPendingImpersonateDraft(activeChatId);
     pillMetrics.onChatChanged(effectiveMetricsChatId);
+    sceneContextSeq += 1;
+    if (drawerMounted && drawer.isTabConnected() && drawer.isShowingGuidedScene()) {
+      void loadSceneContext();
+    } else {
+      drawer.setSceneLoading(false);
+      drawer.setSceneContext(null, null);
+    }
   }
 
   disposers.push(
@@ -1595,6 +2138,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
             (!eventChatId && !event.run && !isUnscopedErrorStatus);
           if (activeChatAffected) {
             indicator.sync(nextActiveChatRun);
+            drawer.setSceneActiveRun(nextActiveChatRun);
           }
           chatHeads.handleStatusEvent(event, activeChatId);
           if (activeChatAffected) {
@@ -1602,6 +2146,43 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
           }
           if (event.error) {
             showBanner(event.error, "error", 7_000);
+          }
+          return;
+        }
+        case "gg:scene-updated": {
+          if (Array.isArray(event.armedScenes)) {
+            armedScenesByChat.clear();
+            for (const item of event.armedScenes) {
+              if (isArmedSceneState(item)) {
+                armedScenesByChat.set(item.chatId, item);
+              }
+            }
+          }
+          const targetChatId =
+            typeof event.chatId === "string" && event.chatId.length > 0
+              ? event.chatId
+              : isArmedSceneState(event.armedScene)
+                ? event.armedScene.chatId
+                : null;
+          if (targetChatId) {
+            if (isArmedSceneState(event.armedScene)) {
+              armedScenesByChat.set(targetChatId, event.armedScene);
+            } else if (event.armedScene === null || !Array.isArray(event.armedScenes)) {
+              armedScenesByChat.delete(targetChatId);
+            }
+          }
+          const activeChatId = safeGetActiveChat().chatId;
+          drawer.setArmedScene(getArmedSceneForChat(activeChatId), activeChatId);
+          renderToolbar();
+          if (
+            event.reason === "dropped" &&
+            targetChatId &&
+            targetChatId === activeChatId &&
+            drawerMounted &&
+            drawer.isTabConnected() &&
+            drawer.isShowingGuidedScene()
+          ) {
+            void loadSceneContext();
           }
           return;
         }
@@ -1701,6 +2282,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       statusSeq += 1;
       setChatStatusSeq(deletedChatId, statusSeq);
       activeRunsByChat.delete(deletedChatId);
+      armedScenesByChat.delete(deletedChatId);
       pendingImpersonateDrafts.delete(deletedChatId);
       if (impersonateDraftRetryChatId === deletedChatId) {
         clearImpersonateDraftRetry();
@@ -1709,10 +2291,28 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
       syncActiveRunReconcileTimer();
       syncPrimaryActiveRun();
       const activeChatId = safeGetActiveChat().chatId;
-      indicator.sync(getActiveRunForChat(activeChatId));
+      const activeChatRun = getActiveRunForChat(activeChatId);
+      indicator.sync(activeChatRun);
+      drawer.setSceneActiveRun(activeChatRun);
+      drawer.setArmedScene(getArmedSceneForChat(activeChatId), activeChatId);
       chatHeads.onChatDeleted(deletedChatId);
       pillMetrics.onChatDeleted(deletedChatId);
       renderToolbar();
+    }),
+  );
+  const refreshSceneContextOnMessageChange = () => {
+    if (
+      !destroyed &&
+      drawerMounted &&
+      drawer.isTabConnected() &&
+      drawer.isShowingGuidedScene()
+    ) {
+      void loadSceneContext();
+    }
+  };
+  disposers.push(
+    ctx.events.on("MESSAGE_SENT", () => {
+      refreshSceneContextOnMessageChange();
     }),
   );
   disposers.push(
@@ -1727,7 +2327,10 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
   );
   disposers.push(
     ctx.events.on("MESSAGE_DELETED", (payload) => {
-      if (!destroyed) pillMetrics.onMessageDeleted(payload);
+      if (!destroyed) {
+        pillMetrics.onMessageDeleted(payload);
+        refreshSceneContextOnMessageChange();
+      }
     }),
   );
 
@@ -1841,6 +2444,7 @@ export function setup(rawCtx: SpindleFrontendContext): () => void {
     seenTerminalRunIds.clear();
     launchingChats.clear();
     activeRunsByChat.clear();
+    armedScenesByChat.clear();
     chatStatusSeq.clear();
     pendingImpersonateDrafts.clear();
     try {

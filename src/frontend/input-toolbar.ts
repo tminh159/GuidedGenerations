@@ -1,20 +1,26 @@
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import {
   ACTION_METADATA,
+  GUIDED_SCENE_METADATA,
   normalizeButtonOrder,
   normalizeToolbarPlacement,
 } from "../shared/defaults";
 import type {
   ActiveRunState,
+  ArmedSceneState,
+  ArmedSceneStatus,
   GuidedActionId,
   GuidedGenerationsSettings,
+  GuidedSceneArmedPacing,
   RecoveryEntry,
+  RunActionId,
   ToolbarOptionId,
   ToolbarPlacement,
 } from "../shared/types";
 import {
   CONTINUE_MENU_ICONS,
   RECOVERY_MENU_ICONS,
+  SCENE_MENU_ICONS,
   STOP_ICON_SVG,
   TOOLBAR_ICONS,
 } from "./icons";
@@ -31,6 +37,11 @@ export interface InputToolbarHandlers {
   onClearRecovery?(): void;
   onRemoveLastContinue(): void;
   onRegenerateLastContinue(): void;
+  onToggleSceneDrawer?(): void;
+  onSceneDropNextTurn?(): void;
+  onSceneDropNow?(): void;
+  onSceneTogglePause?(): void;
+  onSceneCancelSteering?(): void;
 }
 
 export interface ToolbarRenderState {
@@ -40,6 +51,7 @@ export interface ToolbarRenderState {
   recovery: readonly RecoveryEntry[];
   hasActiveChat: boolean;
   chatId?: string | null;
+  armedScene?: ArmedSceneState | null;
 }
 
 interface ToolbarRenderSignature {
@@ -50,7 +62,9 @@ interface ToolbarRenderSignature {
   hasActiveRun: boolean;
   isBusy: boolean;
   activeRunId: string | null;
-  activeRunActionId: GuidedActionId | null;
+  activeRunActionId: RunActionId | null;
+  armedSceneStatus: ArmedSceneStatus | null;
+  armedScenePacing: GuidedSceneArmedPacing | null;
   hasRecovery: boolean;
   latestRecoveryPreview: string;
 }
@@ -73,6 +87,7 @@ function buildToolbarRenderSignature(
   if (state.settings.actions.guided_swipe?.enabled) enabledMask |= 1 << 3;
   if (state.settings.actions.guided_impersonate?.enabled) enabledMask |= 1 << 4;
   if (state.settings.inputRecovery.enabled) enabledMask |= 1 << 5;
+  if (state.settings.guidedScene?.enabled) enabledMask |= 1 << 6;
 
   const recoveryEnabled = Boolean(state.settings.inputRecovery.enabled);
   const hasRecovery = recoveryEnabled && state.recovery.length > 0;
@@ -86,6 +101,8 @@ function buildToolbarRenderSignature(
     isBusy: Boolean(state.isBusy || state.activeRun),
     activeRunId: state.activeRun?.runId ?? null,
     activeRunActionId: state.activeRun?.actionId ?? null,
+    armedSceneStatus: state.armedScene?.status ?? null,
+    armedScenePacing: state.armedScene?.pacing ?? null,
     hasRecovery,
     latestRecoveryPreview: hasRecovery
       ? formatLatestRecoveryPreview(state.recovery)
@@ -105,6 +122,8 @@ function areCoreToolbarSignaturesEqual(
     a.isBusy !== b.isBusy ||
     a.activeRunId !== b.activeRunId ||
     a.activeRunActionId !== b.activeRunActionId ||
+    a.armedSceneStatus !== b.armedSceneStatus ||
+    a.armedScenePacing !== b.armedScenePacing ||
     a.order.length !== b.order.length
   ) {
     return false;
@@ -141,7 +160,7 @@ const POST_RELEASE_SUPPRESS_MS = 0;
 const POST_RELEASE_MAX_WINDOW_MS = 250;
 
 interface ContinueMenuSession {
-  kind: "continue" | "recovery";
+  kind: "continue" | "recovery" | "scene";
   menuEl: HTMLDivElement;
   anchorBtn: HTMLButtonElement;
   items: HTMLButtonElement[];
@@ -264,7 +283,9 @@ export class InputToolbarController {
       const enabled =
         optionId === "input_recovery"
           ? Boolean(state.settings.inputRecovery.enabled)
-          : Boolean(state.settings.actions[optionId]?.enabled);
+          : optionId === "guided_scene"
+            ? Boolean(state.settings.guidedScene?.enabled)
+            : Boolean(state.settings.actions[optionId]?.enabled);
       if (enabled) visibleIds.push(optionId);
     }
 
@@ -408,6 +429,8 @@ export class InputToolbarController {
       entry.iconKey = "input_recovery";
       btn.innerHTML = TOOLBAR_ICONS.input_recovery;
       this.attachRecoveryHoldHandlers(btn);
+    } else if (optionId === "guided_scene") {
+      this.attachSceneHoldHandlers(btn);
     } else if (optionId === "guided_swipe") {
       this.attachSwipeHoldHandlers(btn);
     } else if (optionId === "guided_continue") {
@@ -438,7 +461,68 @@ export class InputToolbarController {
       this.syncRecoveryButton(entry, state);
       return;
     }
+    if (optionId === "guided_scene") {
+      this.syncSceneButton(entry, state);
+      return;
+    }
     this.syncActionButton(entry, optionId, state);
+  }
+
+  private syncSceneButton(
+    entry: ToolbarButtonEntry,
+    state: ToolbarRenderState,
+  ): void {
+    const { btn } = entry;
+    const isThisRunning = state.activeRun?.actionId === "guided_scene";
+    const isOtherRunning = Boolean(state.activeRun) && !isThisRunning;
+    const isBusyWithoutRun = Boolean(state.isBusy) && !state.activeRun;
+    const disabled = isOtherRunning || isBusyWithoutRun;
+    const armed = state.armedScene ?? null;
+    const isArmed = !isThisRunning && Boolean(armed);
+    const isPaused = isArmed && armed?.status === "paused";
+    const isSceneMenuOpen =
+      this.continueMenu?.kind === "scene" && this.continueMenu.anchorBtn === btn;
+
+    btn.classList.toggle("is-running", isThisRunning);
+    btn.classList.toggle("is-armed", isArmed);
+    btn.classList.toggle("is-paused", isPaused);
+    btn.classList.toggle("is-dimmed", disabled);
+    btn.disabled = disabled;
+
+    if (isThisRunning) {
+      btn.setAttribute("aria-label", `Stop ${GUIDED_SCENE_METADATA.label}`);
+      btn.title = `Stop ${GUIDED_SCENE_METADATA.label}`;
+      btn.removeAttribute("aria-haspopup");
+      btn.removeAttribute("aria-expanded");
+      btn.removeAttribute("aria-keyshortcuts");
+    } else if (isArmed) {
+      const targetDesc =
+        armed?.greetingLabel ||
+        (armed?.greetingSource === "custom" ? "Custom Scene" : "Greeting");
+      const statusLabel = isPaused
+        ? `Guided Scene paused (${targetDesc})`
+        : `Guided Scene steering (${targetDesc})`;
+      btn.setAttribute("aria-label", statusLabel);
+      btn.title = `${statusLabel} — click to open Guided Scene, hold for steering controls`;
+      btn.setAttribute("aria-haspopup", "menu");
+      btn.setAttribute("aria-expanded", isSceneMenuOpen ? "true" : "false");
+      btn.setAttribute(
+        "aria-keyshortcuts",
+        "Shift+F10 Alt+ArrowUp Control+Enter Meta+Enter",
+      );
+    } else {
+      btn.setAttribute("aria-label", GUIDED_SCENE_METADATA.label);
+      btn.title = GUIDED_SCENE_METADATA.tooltip;
+      btn.removeAttribute("aria-haspopup");
+      btn.removeAttribute("aria-expanded");
+      btn.removeAttribute("aria-keyshortcuts");
+    }
+
+    const nextIconKey = isThisRunning ? "stop" : "guided_scene";
+    if (entry.iconKey !== nextIconKey) {
+      entry.iconKey = nextIconKey;
+      btn.innerHTML = isThisRunning ? STOP_ICON_SVG : TOOLBAR_ICONS.guided_scene;
+    }
   }
 
   private syncActionButton(
@@ -590,6 +674,7 @@ export class InputToolbarController {
     btn: HTMLButtonElement,
     actionId: ToolbarOptionId,
     options: {
+      canHold?: () => boolean;
       onClick: (event: MouseEvent) => void;
       onHold: () => void;
       onShortcutKeyDown: (event: KeyboardEvent) => boolean;
@@ -640,6 +725,7 @@ export class InputToolbarController {
 
     btn.addEventListener("pointerdown", (event) => {
       if (btn.disabled || this.latestState?.activeRun || this.latestState?.isBusy) return;
+      if (options.canHold && !options.canHold()) return;
       if (!event.isPrimary) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
 
@@ -659,6 +745,9 @@ export class InputToolbarController {
         btn.classList.remove("is-holding");
         if (this.activeHoldCancel === cancelHold) {
           this.activeHoldCancel = null;
+        }
+        if (options.canHold && !options.canHold()) {
+          return;
         }
         hold.fired = true;
         this.armPostHoldClickSuppression(btn, () => {
@@ -716,6 +805,129 @@ export class InputToolbarController {
         event.stopPropagation();
       }
     });
+  }
+
+  private attachSceneHoldHandlers(btn: HTMLButtonElement): void {
+    const isArmed = () => Boolean(this.latestState?.armedScene);
+    this.attachLongPressHandlers(btn, "guided_scene", {
+      canHold: isArmed,
+      onClick: (event) => {
+        if (this.continueMenu !== null && this.continueMenu.anchorBtn === btn) {
+          this.closeContinueMenu({ restoreFocus: true });
+          return;
+        }
+        this.closeContinueMenu({ restoreFocus: false });
+        if ((event.ctrlKey || event.metaKey) && isArmed()) {
+          this.openSceneMenu(btn);
+          return;
+        }
+        this.handlers.onToggleSceneDrawer?.();
+      },
+      onHold: () => {
+        if (isArmed()) {
+          this.openSceneMenu(btn);
+        }
+      },
+      onShortcutKeyDown: (event) => {
+        if (!isArmed()) return false;
+        if (
+          (event.shiftKey && event.key === "F10") ||
+          (event.altKey && event.key === "ArrowUp") ||
+          ((event.ctrlKey || event.metaKey) && event.key === "Enter")
+        ) {
+          this.openSceneMenu(btn);
+          return true;
+        }
+        return false;
+      },
+    });
+  }
+
+  private openSceneMenu(anchorBtn: HTMLButtonElement): void {
+    if (this.destroyed || typeof document === "undefined" || !document.body) return;
+    const armed = this.latestState?.armedScene;
+    if (!armed) return;
+    this.closeContinueMenu({ restoreFocus: false });
+
+    const isPaused = armed.status === "paused";
+    const menuEl = document.createElement("div");
+    menuEl.className = "gg-dropup-menu";
+    menuEl.setAttribute("role", "menu");
+    menuEl.setAttribute("aria-label", "Guided Scene steering controls");
+
+    const dropNextDisabled = !isPaused && armed.pacing === "next_turn";
+    const menuDefs = [
+      {
+        id: "drop_next_turn",
+        label: "Drop Next Turn",
+        icon: SCENE_MENU_ICONS.drop_next_turn,
+        danger: false,
+        disabled: dropNextDisabled,
+        onSelect: () => this.handlers.onSceneDropNextTurn?.(),
+      },
+      {
+        id: "drop_now",
+        label: "Drop Now",
+        icon: SCENE_MENU_ICONS.drop_now,
+        danger: false,
+        disabled: false,
+        onSelect: () => this.handlers.onSceneDropNow?.(),
+      },
+      {
+        id: "toggle_pause",
+        label: isPaused ? "Resume Steering" : "Pause Steering",
+        icon: isPaused ? SCENE_MENU_ICONS.resume : SCENE_MENU_ICONS.pause,
+        danger: false,
+        disabled: false,
+        onSelect: () => this.handlers.onSceneTogglePause?.(),
+      },
+      {
+        id: "cancel_steering",
+        label: "Cancel Steering",
+        icon: SCENE_MENU_ICONS.cancel,
+        danger: true,
+        disabled: false,
+        onSelect: () => this.handlers.onSceneCancelSteering?.(),
+      },
+    ] as const;
+
+    const items: HTMLButtonElement[] = [];
+    for (const def of menuDefs) {
+      const itemBtn = document.createElement("button");
+      itemBtn.type = "button";
+      itemBtn.className = `gg-dropup-item${def.danger ? " is-danger" : ""}`;
+      itemBtn.setAttribute("role", "menuitem");
+      itemBtn.setAttribute("data-gg-menu-action", def.id);
+      itemBtn.disabled = def.disabled;
+      if (def.disabled) {
+        itemBtn.setAttribute("aria-disabled", "true");
+      }
+      itemBtn.tabIndex = -1;
+      itemBtn.innerHTML = `${def.icon}<span>${def.label}</span>`;
+      itemBtn.addEventListener("click", (event) => {
+        if (itemBtn.disabled) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeContinueMenu({ restoreFocus: false });
+        def.onSelect();
+      });
+      items.push(itemBtn);
+      menuEl.append(itemBtn);
+    }
+
+    document.body.append(menuEl);
+    anchorBtn.setAttribute("aria-expanded", "true");
+    const initialAnchorRect = this.positionContinueMenu(menuEl, anchorBtn);
+
+    const cleanup = this.attachDropupMenuLifecycle({
+      menuEl,
+      anchorBtn,
+      items,
+      initialAnchorRect,
+    });
+
+    this.continueMenu = { kind: "scene", menuEl, anchorBtn, items, cleanup };
+    (items.find((b) => !b.disabled) ?? items[0])?.focus();
   }
 
   private attachSwipeHoldHandlers(btn: HTMLButtonElement): void {
@@ -1023,14 +1235,12 @@ export class InputToolbarController {
       ? menuEl.querySelector<HTMLElement>(".gg-dropup-header")
       : null;
 
-    // Reset any prior height constraints before measuring natural dimensions.
     if (menuEl.style.maxHeight) menuEl.style.maxHeight = "";
     if (menuEl.style.overflowY) menuEl.style.overflowY = "";
     if (historyListEl && historyListEl.style.maxHeight) {
       historyListEl.style.maxHeight = "";
     }
 
-    // Batch all DOM/layout reads before writing styles to avoid forced synchronous reflows.
     const rect = anchorBtn.getBoundingClientRect();
     const win = typeof window !== "undefined" ? window : document.defaultView;
     const getStyle =
@@ -1086,7 +1296,6 @@ export class InputToolbarController {
     const rawHistoryListHeight = historyListEl ? historyListEl.offsetHeight : 0;
     const rawHeaderHeight = headerEl ? headerEl.offsetHeight : 0;
 
-    // Compute layout coordinates purely in JS.
     const menuWidth = rawMenuWidth * uiScale;
     const menuHeight = rawMenuHeight * uiScale;
     const gapPx = 6;
@@ -1122,7 +1331,6 @@ export class InputToolbarController {
       listMaxCss = Math.min(220, Math.max(0, maxMenuHeightCss - chromeHeightCss));
     }
 
-    // Batch all style writes together.
     menuEl.style.left = `${clampedLeft / uiScale}px`;
     menuEl.style.top = topCss;
     menuEl.style.bottom = bottomCss;
@@ -1536,4 +1744,3 @@ export class InputToolbarController {
     }
   }
 }
-

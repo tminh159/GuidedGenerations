@@ -5,9 +5,14 @@ import {
   normalizeButtonOrder,
   normalizeGuidanceDepth,
   normalizeGuidancePosition,
+  normalizeGuidedSceneConfig,
+  normalizeSceneAdjustmentMode,
+  normalizeSceneArmedPacing,
+  normalizeSceneDelivery,
   normalizeToolbarPlacement,
 } from "../shared/defaults";
 import type {
+  ArmedSceneState,
   ConnectionOptionSummary,
   ContinueHistoryEntry,
   GuidanceInjectionRole,
@@ -21,10 +26,11 @@ import type {
 const SETTINGS_FILE = "settings.json";
 const RECOVERY_FILE = "recovery.json";
 const CONTINUE_HISTORY_FILE = "continue-history.json";
+const ACTIVE_SCENES_DIR = "active-scenes";
 export const MAX_CONTINUE_ENTRIES = 50;
 export const DEFAULT_MAX_CACHED_USERS = 256;
 
-type StorageFileKey = "settings" | "recovery" | "continue_history";
+type StorageFileKey = "settings" | "recovery" | "continue_history" | "active_scenes";
 
 export interface SettingsStoreOptions {
   maxCachedUsers?: number;
@@ -99,6 +105,66 @@ export function normalizeSettings(raw: unknown): GuidedGenerationsSettings {
           : defaults.inputRecovery.enabled,
       maxEntries,
     },
+    guidedScene: normalizeGuidedSceneConfig(root.guidedScene, defaults.guidedScene),
+  };
+}
+
+export function encodeArmedScenePath(chatId: string): string {
+  const encoded = encodeURIComponent(chatId).replaceAll(".", "%2E");
+  return `${ACTIVE_SCENES_DIR}/${encoded}.json`;
+}
+
+export function normalizeArmedSceneState(raw: unknown): ArmedSceneState | null {
+  if (!isRecord(raw)) return null;
+  const chatId = typeof raw.chatId === "string" ? raw.chatId.trim() : "";
+  if (!chatId) return null;
+  const rawGreetingText = typeof raw.rawGreetingText === "string" ? raw.rawGreetingText : "";
+  const status = raw.status === "paused" ? "paused" : "armed";
+  const greetingSource = raw.greetingSource === "custom" ? "custom" : "card";
+  const lockedDraftText =
+    typeof raw.lockedDraftText === "string" ? raw.lockedDraftText : null;
+  const draftLocked = Boolean(raw.draftLocked && lockedDraftText && lockedDraftText.trim().length > 0);
+  const armedAt =
+    typeof raw.armedAt === "number" && Number.isFinite(raw.armedAt)
+      ? raw.armedAt
+      : Date.now();
+  const turnsSteered =
+    typeof raw.turnsSteered === "number" && Number.isFinite(raw.turnsSteered) && raw.turnsSteered >= 0
+      ? Math.floor(raw.turnsSteered)
+      : undefined;
+
+  return {
+    chatId,
+    ...(typeof raw.userId === "string" && raw.userId.trim().length > 0
+      ? { userId: raw.userId.trim() }
+      : {}),
+    status,
+    pacing: normalizeSceneArmedPacing(raw.pacing, "next_turn"),
+    delivery: normalizeSceneDelivery(raw.delivery, "time_skip"),
+    adjustmentMode: normalizeSceneAdjustmentMode(raw.adjustmentMode, "verbatim"),
+    greetingSource,
+    selectedGreetingKey: normalizeOptionalId(raw.selectedGreetingKey),
+    greetingLabel:
+      typeof raw.greetingLabel === "string" && raw.greetingLabel.trim().length > 0
+        ? raw.greetingLabel.trim()
+        : greetingSource === "custom"
+          ? "Custom Scene"
+          : "Scene Greeting",
+    rawGreetingText,
+    speakerCharacterId: normalizeOptionalId(raw.speakerCharacterId),
+    speakerCharacterName: normalizeOptionalId(raw.speakerCharacterName),
+    transitionNote: typeof raw.transitionNote === "string" ? raw.transitionNote : "",
+    customDirection: typeof raw.customDirection === "string" ? raw.customDirection : "",
+    ...(typeof raw.keepMediaIntact === "boolean"
+      ? { keepMediaIntact: raw.keepMediaIntact }
+      : {}),
+    lockedDraftText,
+    draftLocked,
+    armedAt,
+    ...(turnsSteered !== undefined ? { turnsSteered } : {}),
+    ...(typeof raw.lastDropMessageId === "string" && raw.lastDropMessageId.trim().length > 0
+      ? { lastDropMessageId: raw.lastDropMessageId.trim() }
+      : {}),
   };
 }
 
@@ -248,9 +314,14 @@ export class SettingsStore {
   private readonly settingsCache = new Map<string, GuidedGenerationsSettings>();
   private readonly recoveryCache = new Map<string, RecoveryEntry[]>();
   private readonly continueHistoryCache = new Map<string, ContinueHistoryEntry[]>();
+  private readonly armedScenesCache = new Map<string, Map<string, ArmedSceneState>>();
+  private readonly armedScenesLoaded = new Map<string, boolean>();
+  private readonly armedScenesInFlight = new Map<string, Promise<Map<string, ArmedSceneState>>>();
+  private readonly armedScenesDirtyWhileLoading = new Map<string, Set<string>>();
   private readonly settingsVersions = new Map<string, number>();
   private readonly recoveryVersions = new Map<string, number>();
   private readonly continueVersions = new Map<string, number>();
+  private readonly armedScenesVersions = new Map<string, number>();
   private readonly settingsInFlight = new Map<string, Promise<GuidedGenerationsSettings | null>>();
   private readonly recoveryInFlight = new Map<string, Promise<RecoveryEntry[] | null>>();
   private readonly continueInFlight = new Map<string, Promise<ContinueHistoryEntry[] | null>>();
@@ -318,7 +389,12 @@ export class SettingsStore {
       buttonOrder: [...settings.buttonOrder],
       actions,
       inputRecovery: { ...settings.inputRecovery },
+      guidedScene: { ...settings.guidedScene },
     };
+  }
+
+  private cloneArmedScene(scene: ArmedSceneState): ArmedSceneState {
+    return { ...scene };
   }
 
   private enqueueUserWrite<T>(
@@ -804,6 +880,233 @@ export class SettingsStore {
       entries.map((entry) => ({ ...entry })),
     );
     this.bumpVersion(this.continueVersions, key);
+  }
+
+  async listArmedScenes(userId?: string): Promise<ArmedSceneState[]> {
+    const map = await this.loadArmedScenesMapUnlocked(userId, false);
+    return Array.from(map.values(), (scene) => this.cloneArmedScene(scene)).sort(
+      (a, b) => a.armedAt - b.armedAt,
+    );
+  }
+
+  async getArmedScene(chatId: string, userId?: string): Promise<ArmedSceneState | null> {
+    const cleanChatId = typeof chatId === "string" ? chatId.trim() : "";
+    if (!cleanChatId) return null;
+
+    const key = this.userKey(userId);
+    const wKey = this.writeQueueKey(userId, "active_scenes");
+    await this.waitForPendingWrites(wKey);
+
+    const cachedMap = this.lruGet(this.armedScenesCache, key);
+    if (cachedMap?.has(cleanChatId)) {
+      return this.cloneArmedScene(cachedMap.get(cleanChatId)!);
+    }
+    if (cachedMap && this.armedScenesLoaded.get(key)) {
+      return null;
+    }
+
+    const versionBeforeRead = this.armedScenesVersions.get(key) ?? 0;
+    const filePath = encodeArmedScenePath(cleanChatId);
+    try {
+      if (await this.spindle.userStorage.exists(filePath, userId)) {
+        const raw = await this.spindle.userStorage.read(filePath, userId);
+        const normalized = normalizeArmedSceneState(JSON.parse(raw));
+        if (normalized) {
+          const hadActiveWriteQueue = this.writeQueues.has(wKey);
+          if (hadActiveWriteQueue) {
+            await this.waitForPendingWrites(wKey);
+          }
+          const versionChanged = (this.armedScenesVersions.get(key) ?? 0) !== versionBeforeRead;
+          if (versionChanged || hadActiveWriteQueue) {
+            const latestCached = this.lruGet(this.armedScenesCache, key);
+            if (latestCached?.has(cleanChatId)) {
+              return this.cloneArmedScene(latestCached.get(cleanChatId)!);
+            }
+            if (latestCached && this.armedScenesLoaded.get(key)) {
+              return null;
+            }
+            if (!(await this.spindle.userStorage.exists(filePath, userId))) {
+              return null;
+            }
+            return this.cloneArmedScene(normalized);
+          }
+
+          let map = this.lruGet(this.armedScenesCache, key);
+          if (!map) {
+            map = new Map<string, ArmedSceneState>();
+            this.lruSet(this.armedScenesCache, key, map);
+          }
+          map.set(normalized.chatId, this.cloneArmedScene(normalized));
+          return this.cloneArmedScene(normalized);
+        }
+      }
+    } catch (error) {
+      this.spindle.log?.warn?.(
+        `[GuidedGenerations] Failed reading armed scene for ${cleanChatId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return null;
+  }
+
+  async saveArmedScene(scene: ArmedSceneState, userId?: string): Promise<ArmedSceneState> {
+    const normalized = normalizeArmedSceneState({
+      ...scene,
+      ...(userId ? { userId } : {}),
+    });
+    if (!normalized) {
+      throw new Error("Invalid armed scene payload: chatId is required.");
+    }
+
+    return this.enqueueUserWrite(userId, "active_scenes", async () => {
+      const key = this.userKey(userId);
+      const filePath = encodeArmedScenePath(normalized.chatId);
+      await this.spindle.userStorage.write(
+        filePath,
+        JSON.stringify(normalized, null, 2),
+        userId,
+      );
+      let map = this.lruGet(this.armedScenesCache, key);
+      if (!map) {
+        map = new Map<string, ArmedSceneState>();
+        this.lruSet(this.armedScenesCache, key, map);
+      }
+      map.set(normalized.chatId, this.cloneArmedScene(normalized));
+      this.armedScenesDirtyWhileLoading.get(key)?.add(normalized.chatId);
+      this.bumpVersion(this.armedScenesVersions, key);
+      return this.cloneArmedScene(normalized);
+    });
+  }
+
+  async deleteArmedScene(chatId: string, userId?: string): Promise<void> {
+    const cleanChatId = typeof chatId === "string" ? chatId.trim() : "";
+    if (!cleanChatId) return;
+
+    return this.enqueueUserWrite(userId, "active_scenes", async () => {
+      const key = this.userKey(userId);
+      const map = this.lruGet(this.armedScenesCache, key);
+      if (map) {
+        map.delete(cleanChatId);
+      }
+      this.armedScenesDirtyWhileLoading.get(key)?.add(cleanChatId);
+      this.bumpVersion(this.armedScenesVersions, key);
+
+      const filePath = encodeArmedScenePath(cleanChatId);
+      try {
+        if (typeof this.spindle.userStorage.delete === "function") {
+          const exists =
+            typeof this.spindle.userStorage.exists === "function"
+              ? await this.spindle.userStorage.exists(filePath, userId)
+              : true;
+          if (exists) {
+            await this.spindle.userStorage.delete(filePath, userId);
+          }
+        }
+      } catch (error) {
+        this.spindle.log?.warn?.(
+          `[GuidedGenerations] Failed deleting armed scene ${filePath}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    });
+  }
+
+  private async loadArmedScenesMapUnlocked(
+    userId: string | undefined,
+    skipWriteWait = false,
+  ): Promise<Map<string, ArmedSceneState>> {
+    const key = this.userKey(userId);
+    const wKey = this.writeQueueKey(userId, "active_scenes");
+
+    if (!skipWriteWait) {
+      await this.waitForPendingWrites(wKey);
+    }
+
+    const cached = this.lruGet(this.armedScenesCache, key);
+    if (cached && this.armedScenesLoaded.get(key)) {
+      return cached;
+    }
+
+    let inFlight = this.armedScenesInFlight.get(key);
+    if (!inFlight) {
+      const dirtyChats = new Set<string>();
+      this.armedScenesDirtyWhileLoading.set(key, dirtyChats);
+      const readPromise = (async (): Promise<Map<string, ArmedSceneState>> => {
+        const loaded = new Map<string, ArmedSceneState>();
+        if (typeof this.spindle.userStorage?.list !== "function") {
+          return loaded;
+        }
+        try {
+          const entries = await this.spindle.userStorage.list(`${ACTIVE_SCENES_DIR}/`, userId);
+          if (!Array.isArray(entries) || entries.length === 0) {
+            return loaded;
+          }
+          for (const rawPath of entries) {
+            if (typeof rawPath !== "string" || !rawPath.endsWith(".json")) continue;
+            const fullPath = rawPath.startsWith(`${ACTIVE_SCENES_DIR}/`)
+              ? rawPath
+              : `${ACTIVE_SCENES_DIR}/${rawPath.replace(/^\/+/, "")}`;
+            try {
+              const rawText = await this.spindle.userStorage.read(fullPath, userId);
+              const parsed = normalizeArmedSceneState(JSON.parse(rawText));
+              if (parsed) {
+                loaded.set(parsed.chatId, parsed);
+              }
+            } catch (err) {
+              this.spindle.log?.warn?.(
+                `[GuidedGenerations] Skipping unreadable armed scene ${fullPath}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
+          }
+        } catch (error) {
+          this.spindle.log?.warn?.(
+            `[GuidedGenerations] Failed listing armed scenes: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        return loaded;
+      })();
+
+      const tracked = readPromise.then((loaded) => {
+        const latestCache = this.lruGet(this.armedScenesCache, key);
+        const merged = new Map<string, ArmedSceneState>();
+        if (latestCache) {
+          for (const [chatId, scene] of latestCache.entries()) {
+            merged.set(chatId, this.cloneArmedScene(scene));
+          }
+        }
+        for (const [chatId, scene] of loaded.entries()) {
+          if (!dirtyChats.has(chatId) && !merged.has(chatId)) {
+            merged.set(chatId, scene);
+          }
+        }
+        this.lruSet(this.armedScenesCache, key, merged);
+        this.lruSet(this.armedScenesLoaded, key, true);
+        return merged;
+      });
+
+      inFlight = tracked;
+      this.armedScenesInFlight.set(key, tracked);
+      void tracked.finally(() => {
+        if (this.armedScenesInFlight.get(key) === tracked) {
+          this.armedScenesInFlight.delete(key);
+        }
+        if (this.armedScenesDirtyWhileLoading.get(key) === dirtyChats) {
+          this.armedScenesDirtyWhileLoading.delete(key);
+        }
+      });
+    }
+
+    const result = await inFlight;
+    if (!skipWriteWait && this.writeQueues.has(wKey)) {
+      await this.waitForPendingWrites(wKey);
+    }
+    return this.lruGet(this.armedScenesCache, key) ?? result;
   }
 
   async listConnections(userId?: string): Promise<ConnectionOptionSummary[]> {

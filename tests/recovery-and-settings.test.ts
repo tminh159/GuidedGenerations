@@ -60,6 +60,7 @@ describe("settings and recovery normalization", () => {
       "guided_continue",
       "guided_regenerate",
       "guided_impersonate",
+      "guided_scene",
     ]);
     expect(parsed.actions.guided_swipe.enabled).toBe(false);
     expect(parsed.actions.guided_swipe.connectionId).toBe("conn-2");
@@ -84,6 +85,43 @@ describe("settings and recovery normalization", () => {
 
     const invalidPlacement = normalizeSettings({ toolbarPlacement: "floating_moon" });
     expect(invalidPlacement.toolbarPlacement).toBe("after_native");
+
+    const withGuidedScene = normalizeSettings({
+      guidedScene: {
+        enabled: false,
+        connectionId: " conn-scene ",
+        model: " claude-sonnet ",
+        presetId: " preset-9 ",
+        contextMode: "full_preset",
+        contextTurns: 500,
+        injectionRole: "assistant",
+        guidancePosition: "append_last_user",
+        guidanceDepth: 4,
+        keepMediaIntact: false,
+        applyRegex: false,
+        pacing: "multi_turn",
+        delivery: "bridge",
+        adjustmentMode: "summary_rewrite",
+        dropTarget: "new_swipe",
+        readinessTag: "<custom-ready />",
+      },
+    });
+    expect(withGuidedScene.guidedScene.enabled).toBe(false);
+    expect(withGuidedScene.guidedScene.connectionId).toBe("conn-scene");
+    expect(withGuidedScene.guidedScene.model).toBe("claude-sonnet");
+    expect(withGuidedScene.guidedScene.presetId).toBe("preset-9");
+    expect(withGuidedScene.guidedScene.contextMode).toBe("full_preset");
+    expect(withGuidedScene.guidedScene.contextTurns).toBe(200);
+    expect(withGuidedScene.guidedScene.injectionRole).toBe("assistant");
+    expect(withGuidedScene.guidedScene.guidancePosition).toBe("append_last_user");
+    expect(withGuidedScene.guidedScene.guidanceDepth).toBe(4);
+    expect(withGuidedScene.guidedScene.keepMediaIntact).toBe(false);
+    expect(withGuidedScene.guidedScene.applyRegex).toBe(false);
+    expect(withGuidedScene.guidedScene.pacing).toBe("multi_turn");
+    expect(withGuidedScene.guidedScene.delivery).toBe("bridge");
+    expect(withGuidedScene.guidedScene.adjustmentMode).toBe("summary_rewrite");
+    expect(withGuidedScene.guidedScene.dropTarget).toBe("new_swipe");
+    expect(withGuidedScene.guidedScene.readinessTag).toBe("custom-ready");
   });
 
   test("appendRecoveryEntry deduplicates consecutive identical entries and enforces maxEntries", () => {
@@ -192,11 +230,12 @@ describe("InputToolbarController DOM behavior", () => {
       "guided_regenerate",
       "guided_swipe",
       "guided_impersonate",
+      "guided_scene",
       "input_recovery",
     ]);
 
     buttons[2]!.click();
-    buttons[4]!.click();
+    buttons[5]!.click();
     expect(triggered).toEqual(["guided_swipe"]);
     expect(restored).toBe(1);
 
@@ -335,9 +374,9 @@ describe("InputToolbarController DOM behavior", () => {
 
     drawer.render(view);
 
-    // Model combobox is mounted for each action with initial placeholder from active connection,
+    // Model combobox is mounted for each action + Guided Scene with initial placeholder from active connection,
     // deferring connection binding while the card is collapsed.
-    expect(modelComboboxes).toHaveLength(5);
+    expect(modelComboboxes).toHaveLength(6);
     expect(modelComboboxes[0]!.options.connection).toBeUndefined();
     expect(modelComboboxes[0]!.options.placeholder).toBe("Use connection model (gpt-4o)");
 
@@ -349,7 +388,7 @@ describe("InputToolbarController DOM behavior", () => {
 
     // Every card starts collapsed by default and can be expanded on click while keeping children attached.
     const headers = Array.from(tabRoot.querySelectorAll<HTMLButtonElement>(".gg-card-header"));
-    expect(headers).toHaveLength(7);
+    expect(headers).toHaveLength(8);
     for (const header of headers) {
       expect(header.getAttribute("aria-expanded")).toBe("false");
     }
@@ -392,9 +431,10 @@ describe("InputToolbarController DOM behavior", () => {
       "guided_response",
     ]);
 
-    // Clicking a mounted switch fires onSaveSettings with updated enabled state.
-    const firstSwitch = tabRoot.querySelector<HTMLButtonElement>('button[role="switch"]')!;
-    firstSwitch.click();
+    // Clicking a mounted checkbox fires onSaveSettings with updated enabled state (zero mountSwitch calls).
+    expect(switchCallbacks).toHaveLength(0);
+    const firstCheckbox = tabRoot.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    firstCheckbox.click();
     expect(savedSettings).toHaveLength(4);
     expect(savedSettings[0]!.actions.guided_response.connectionId).toBe("c2");
     expect(savedSettings[3]!.actions.guided_response.enabled).toBe(false);
@@ -586,6 +626,7 @@ describe("InputToolbarController DOM behavior", () => {
       "guided_continue",
       "guided_swipe",
       "guided_impersonate",
+      "guided_scene",
     ]);
 
     settings.toolbarPlacement = "right";
@@ -597,7 +638,7 @@ describe("InputToolbarController DOM behavior", () => {
     toolbar.render({ settings, activeRun: null, recovery: [], hasActiveChat: true });
     expect(actionsMount.children.length).toBe(0);
     expect(rowMount.classList.contains("gg-actions-host--row")).toBe(true);
-    expect(rowMount.querySelectorAll("button").length).toBe(6);
+    expect(rowMount.querySelectorAll("button").length).toBe(7);
 
     toolbar.destroy();
     expect(rowMount.children.length).toBe(0);
@@ -867,11 +908,11 @@ describe("InputToolbarController DOM behavior", () => {
     // No permission warnings when all 6 permissions are granted
     expect(tabRoot.querySelectorAll(".gg-notice")).toHaveLength(0);
 
-    // All 5 actions expose Guidance Position select, In-history depth input, applyRegex switch, and macro hint
+    // All 5 actions + Guided Scene expose Guidance Position select, In-history depth input, applyRegex checkbox, and macro hint
     const positionSelects = selectHandlers.filter((s) =>
       s.ariaLabel?.endsWith("Guidance Position"),
     );
-    expect(positionSelects).toHaveLength(5);
+    expect(positionSelects).toHaveLength(6);
     expect(positionSelects[0]!.options.map((o) => o.value)).toEqual([
       "before_post_history",
       "in_history",
@@ -879,7 +920,7 @@ describe("InputToolbarController DOM behavior", () => {
       "post_history",
     ]);
 
-    expect(numericHandlers).toHaveLength(6);
+    expect(numericHandlers).toHaveLength(8);
     const responseDepth = numericHandlers[0]!;
     const responseDepthWrap = responseDepth.input.closest(".gg-field") as HTMLElement;
     expect(responseDepth.disabled).toBe(true);
@@ -938,20 +979,20 @@ describe("InputToolbarController DOM behavior", () => {
     expect(savedSettings[savedSettings.length - 1]!.inputRecovery.maxEntries).toBe(25);
     expect(maxDrafts.input.value).toBe("25");
 
-    // Per-action applyRegex switch defaults to true and saves false when clicked
-    const regexSwitch = tabRoot.querySelector<HTMLButtonElement>(
-      'button[role="switch"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
+    // Per-action applyRegex checkbox defaults to true and saves false when clicked
+    const regexCheckbox = tabRoot.querySelector<HTMLInputElement>(
+      'input[type="checkbox"][aria-label="Apply Lumiverse regex scripts for Guided Response"]',
     )!;
-    expect(regexSwitch.getAttribute("aria-checked")).toBe("true");
-    regexSwitch.click();
-    expect(regexSwitch.getAttribute("aria-checked")).toBe("false");
+    expect(regexCheckbox.checked).toBe(true);
+    regexCheckbox.click();
+    expect(regexCheckbox.checked).toBe(false);
     expect(savedSettings[savedSettings.length - 1]!.actions.guided_response.applyRegex).toBe(false);
 
-    // Background swipe switch is no longer rendered anywhere in Settings
-    const bgSwitches = tabRoot.querySelectorAll<HTMLButtonElement>(
-      'button[role="switch"][aria-label*="background"]',
+    // Background swipe toggle is no longer rendered anywhere in Settings
+    const bgToggles = tabRoot.querySelectorAll<HTMLInputElement>(
+      'input[type="checkbox"][aria-label*="background"], button[role="switch"][aria-label*="background"]',
     );
-    expect(bgSwitches).toHaveLength(0);
+    expect(bgToggles).toHaveLength(0);
     expect(tabRoot.textContent).not.toContain("Run in background (keep current swipe)");
 
     // Template field label notes both {{input}} and Lumiverse macros
@@ -2035,11 +2076,12 @@ describe("InputToolbarController DOM behavior", () => {
       const maxEntriesSlot = tabRoot.querySelector("#gg-recovery-max-entries")?.parentElement as HTMLElement;
       expect(maxEntriesSlot).not.toBeNull();
       const inputEl = maxEntriesSlot.querySelector("input")!;
+      const maxEntriesSlotBtn = maxEntriesSlot.querySelector("button")!;
       // Focus moves to sibling inside slot (relatedTarget inside options.slot) -> must NOT flush/reset
       currentNumericVal = null;
       inputEl.value = "";
       maxEntriesSlot.dispatchEvent(
-        new Win.FocusEvent("focusout", { bubbles: true, relatedTarget: slotBtn }),
+        new Win.FocusEvent("focusout", { bubbles: true, relatedTarget: maxEntriesSlotBtn }),
       );
       expect(inputEl.value).toBe("");
       expect(savedPatches).toHaveLength(0);
@@ -2254,8 +2296,8 @@ describe("InputToolbarController DOM behavior", () => {
 
       drawer.render(view);
 
-      // All 5 action cards start collapsed -> all 5 mountModelCombobox calls receive connection: undefined
-      expect(modelComboboxes).toHaveLength(5);
+      // All 5 action cards + Guided Scene Settings card start collapsed -> all 6 mountModelCombobox calls receive connection: undefined
+      expect(modelComboboxes).toHaveLength(6);
       for (const mc of modelComboboxes) {
         expect(mc.options.connection).toBeUndefined();
         expect(mc.updates).toEqual([]);
@@ -2265,8 +2307,8 @@ describe("InputToolbarController DOM behavior", () => {
       // Expand Guided Response (headers[1]) -> binds default active connection { kind: "llm" }
       headers[1]!.click();
       expect(modelComboboxes[0]!.updates).toEqual([{ connection: { kind: "llm" } }]);
-      // Other 4 comboboxes remain unbound
-      for (let i = 1; i < 5; i += 1) {
+      // Other 5 comboboxes remain unbound
+      for (let i = 1; i < 6; i += 1) {
         expect(modelComboboxes[i]!.updates).toEqual([]);
       }
 
@@ -2293,12 +2335,13 @@ describe("InputToolbarController DOM behavior", () => {
       // Re-rendering drawer while Guided Response and Guided Swipe are expanded passes connection at mount time for those two only
       modelComboboxes.length = 0;
       drawer.render({ ...view, settings: latestSettings }, { force: true });
-      expect(modelComboboxes).toHaveLength(5);
+      expect(modelComboboxes).toHaveLength(6);
       expect(modelComboboxes[0]!.options.connection).toEqual({ kind: "llm" });
       expect(modelComboboxes[1]!.options.connection).toBeUndefined();
       expect(modelComboboxes[2]!.options.connection).toBeUndefined();
       expect(modelComboboxes[3]!.options.connection).toEqual({ kind: "llm", id: "c2" });
       expect(modelComboboxes[4]!.options.connection).toBeUndefined();
+      expect(modelComboboxes[5]!.options.connection).toBeUndefined();
     } finally {
       drawer.destroy();
       tabRoot.remove();
@@ -2902,6 +2945,131 @@ describe("backend perf optimizations (Phase 3 & 4)", () => {
     expect(payload.generationMetrics.ttft).toBe(200);
     expect(payload.generationMetrics.tps).toBe(20);
     expect(payload.generationMetrics.durationMs).toBe(1300);
+  });
+
+  test("SettingsStore preserves disk-only armed scenes during concurrent saveArmedScene and never resurrects deleted scenes in getArmedScene", async () => {
+    const files = new Map<string, string>();
+    let releaseList!: () => void;
+    let listGate: Promise<void> | null = null;
+    let releaseRead!: () => void;
+    let readGate: Promise<void> | null = null;
+    let gateReadPath: string | null = null;
+
+    const scenePath = (chatId: string) =>
+      `active-scenes/${encodeURIComponent(chatId).replaceAll(".", "%2E")}.json`;
+
+    const fakeSpindle = {
+      permissions: { has: () => true },
+      log: { warn: () => {} },
+      userStorage: {
+        exists: async (path: string, userId?: string) => files.has(`${userId ?? "__default__"}:${path}`),
+        read: async (path: string, userId?: string) => {
+          if (gateReadPath === path && readGate) {
+            await readGate;
+          }
+          const val = files.get(`${userId ?? "__default__"}:${path}`);
+          if (val === undefined) throw new Error(`missing: ${path}`);
+          return val;
+        },
+        write: async (path: string, content: string, userId?: string) => {
+          files.set(`${userId ?? "__default__"}:${path}`, content);
+        },
+        delete: async (path: string, userId?: string) => {
+          files.delete(`${userId ?? "__default__"}:${path}`);
+        },
+        list: async (prefix = "", userId?: string) => {
+          if (listGate) {
+            await listGate;
+          }
+          const userPrefix = `${userId ?? "__default__"}:`;
+          const results: string[] = [];
+          for (const key of files.keys()) {
+            if (key.startsWith(userPrefix)) {
+              const rel = key.slice(userPrefix.length);
+              if (rel.startsWith(prefix)) results.push(rel);
+            }
+          }
+          return results;
+        },
+      },
+    } as unknown as SpindleAPI;
+
+    // 1. Concurrent saveArmedScene(chatB) while listArmedScenes() is reading chatA from disk
+    const seedStore = new SettingsStore(fakeSpindle);
+    await seedStore.saveArmedScene(
+      {
+        chatId: "chatA",
+        userId: "u1",
+        status: "armed",
+        pacing: "next_turn",
+        delivery: "cut",
+        adjustmentMode: "verbatim",
+        greetingSource: "custom",
+        greetingLabel: "Scene A",
+        rawGreetingText: "Disk scene A",
+        transitionNote: "",
+        customDirection: "",
+        lockedDraftText: null,
+        draftLocked: false,
+        armedAt: 100,
+      },
+      "u1",
+    );
+
+    const store1 = new SettingsStore(fakeSpindle);
+    listGate = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    const listPromise = store1.listArmedScenes("u1");
+    await Promise.resolve();
+
+    await store1.saveArmedScene(
+      {
+        chatId: "chatB",
+        userId: "u1",
+        status: "armed",
+        pacing: "multi_turn",
+        delivery: "bridge",
+        adjustmentMode: "verbatim",
+        greetingSource: "custom",
+        greetingLabel: "Scene B",
+        rawGreetingText: "New scene B",
+        transitionNote: "",
+        customDirection: "",
+        lockedDraftText: null,
+        draftLocked: false,
+        armedAt: 200,
+      },
+      "u1",
+    );
+    releaseList();
+    listGate = null;
+
+    const listed = await listPromise;
+    expect(listed.map((s) => s.chatId)).toEqual(["chatA", "chatB"]);
+    expect((await store1.getArmedScene("chatA", "u1"))?.rawGreetingText).toBe("Disk scene A");
+    expect((await store1.getArmedScene("chatB", "u1"))?.rawGreetingText).toBe("New scene B");
+
+    // 2. Concurrent deleteArmedScene(chatA) while getArmedScene(chatA) is reading from disk
+    const store2 = new SettingsStore(fakeSpindle);
+    gateReadPath = scenePath("chatA");
+    readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+
+    const getPromise = store2.getArmedScene("chatA", "u1");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const delPromise = store2.deleteArmedScene("chatA", "u1");
+    releaseRead();
+    readGate = null;
+    gateReadPath = null;
+
+    const [gotAfterDelete] = await Promise.all([getPromise, delPromise]);
+    expect(gotAfterDelete).toBeNull();
+    expect(await store2.getArmedScene("chatA", "u1")).toBeNull();
+    expect((await store2.listArmedScenes("u1")).map((s) => s.chatId)).toEqual(["chatB"]);
   });
 });
 

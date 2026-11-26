@@ -1370,11 +1370,16 @@ describe("prompt-builder", () => {
     expect(strippedBlank.isChatHistory).toEqual([false, true, true, false]);
   });
 
-  test("collapseMessagesToSingleRole returns 1-message prompts unchanged and collapses multimodal multi-message prompts", () => {
-    const singleUser: AssembledLlmMessageDTO[] = [{ role: "user", content: "Only message" }];
+  test("collapseMessagesToSingleRole coerces 1-message prompts to targetRole and collapses multimodal multi-message prompts", () => {
+    const singleUser: AssembledLlmMessageDTO[] = [
+      { role: "user", content: "Only message", name: "Alice" },
+    ];
     const singleResult = collapseMessagesToSingleRole(singleUser, "system");
-    expect(singleResult).toEqual([{ role: "user", content: "Only message" }]);
+    expect(singleResult).toEqual([{ role: "system", content: "Only message", name: "Alice" }]);
     expect(singleResult[0]).not.toBe(singleUser[0]);
+    expect(collapseMessagesToSingleRole([{ role: "assistant", content: "Solo" }], "user")).toEqual([
+      { role: "user", content: "Solo" },
+    ]);
 
     const multimodal: AssembledLlmMessageDTO[] = [
       { role: "system", content: "System intro" },
@@ -1394,6 +1399,66 @@ describe("prompt-builder", () => {
           { type: "text", text: "System intro\n\nDescribe this:\n\nLooks cool" },
           { type: "image", data: "YWJj", mime_type: "image/png" },
         ],
+      },
+    ]);
+  });
+
+  test("mergeConsecutiveSameRoleMessages preserves and merges cache_control, thinking_blocks, reasoning_content, reasoning_details, and thought_signature", () => {
+    const merged = mergeConsecutiveSameRoleMessages([
+      {
+        role: "assistant",
+        content: "Part 1",
+        cache_control: { type: "ephemeral" },
+        thought_signature: "sig-1",
+        reasoning_content: "First thought",
+        thinking_blocks: [{ type: "thinking", thinking: "t1", signature: "s1" }],
+        reasoning_details: [{ step: 1 }],
+      },
+      {
+        role: "assistant",
+        content: "Part 2",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+        thought_signature: "sig-2",
+        reasoning_content: "Second thought",
+        thinking_blocks: [{ type: "redacted_thinking", data: "r2" }],
+        reasoning_details: [{ step: 2 }],
+      },
+      {
+        role: "user",
+        content: "Question 1",
+      },
+      {
+        role: "user",
+        content: "Question 2",
+        cache_control: { type: "ephemeral" },
+        thought_signature: "user-sig",
+        reasoning_content: "Only second reasoning",
+        thinking_blocks: [{ type: "thinking", thinking: "u2" }],
+        reasoning_details: [{ uStep: 2 }],
+      },
+    ]);
+
+    expect(merged).toEqual([
+      {
+        role: "assistant",
+        content: "Part 1\n\nPart 2",
+        cache_control: { type: "ephemeral" },
+        thought_signature: "sig-1",
+        reasoning_content: "First thought\n\nSecond thought",
+        thinking_blocks: [
+          { type: "thinking", thinking: "t1", signature: "s1" },
+          { type: "redacted_thinking", data: "r2" },
+        ],
+        reasoning_details: [{ step: 1 }, { step: 2 }],
+      },
+      {
+        role: "user",
+        content: "Question 1\n\nQuestion 2",
+        cache_control: { type: "ephemeral" },
+        thought_signature: "user-sig",
+        reasoning_content: "Only second reasoning",
+        thinking_blocks: [{ type: "thinking", thinking: "u2" }],
+        reasoning_details: [{ uStep: 2 }],
       },
     ]);
   });

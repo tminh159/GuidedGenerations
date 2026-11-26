@@ -573,10 +573,36 @@ export function mergeConsecutiveSameRoleMessages(
     const msg = { ...rawMsg };
     const prev = merged[merged.length - 1];
     if (prev && prev.role === msg.role) {
+      const mergedCacheControl = prev.cache_control ?? msg.cache_control;
+      const mergedThoughtSignature = prev.thought_signature ?? msg.thought_signature;
+      const mergedReasoningContent =
+        prev.reasoning_content && msg.reasoning_content
+          ? `${prev.reasoning_content}\n\n${msg.reasoning_content}`
+          : (prev.reasoning_content ?? msg.reasoning_content);
+      const mergedThinkingBlocks =
+        prev.thinking_blocks && msg.thinking_blocks
+          ? [...prev.thinking_blocks, ...msg.thinking_blocks]
+          : (prev.thinking_blocks ?? msg.thinking_blocks);
+      const mergedReasoningDetails =
+        prev.reasoning_details && msg.reasoning_details
+          ? [...prev.reasoning_details, ...msg.reasoning_details]
+          : (prev.reasoning_details ?? msg.reasoning_details);
+
       merged[merged.length - 1] = {
         ...prev,
         content: mergeMessageContents(prev.content, msg.content),
         ...(msg.partial === true ? { partial: true } : {}),
+        ...(mergedCacheControl !== undefined ? { cache_control: mergedCacheControl } : {}),
+        ...(mergedThoughtSignature !== undefined
+          ? { thought_signature: mergedThoughtSignature }
+          : {}),
+        ...(mergedReasoningContent !== undefined
+          ? { reasoning_content: mergedReasoningContent }
+          : {}),
+        ...(mergedThinkingBlocks !== undefined ? { thinking_blocks: mergedThinkingBlocks } : {}),
+        ...(mergedReasoningDetails !== undefined
+          ? { reasoning_details: mergedReasoningDetails }
+          : {}),
       };
     } else {
       merged.push(msg);
@@ -594,8 +620,11 @@ export function collapseMessagesToSingleRole(
   messages: readonly AssembledLlmMessageDTO[],
   role: "system" | "user",
 ): AssembledLlmMessageDTO[] {
-  if (messages.length <= 1) {
-    return messages.map((msg) => ({ ...msg }));
+  if (messages.length === 0) {
+    return [];
+  }
+  if (messages.length === 1) {
+    return [{ ...messages[0]!, role }];
   }
 
   const textChunks: string[] = [];

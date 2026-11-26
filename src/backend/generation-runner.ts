@@ -48,6 +48,7 @@ import {
   type GenerationUsageInput,
   safeCountTokens,
 } from "./generation-metrics";
+import type { InterceptorMux } from "./interceptor-mux";
 import type { SettingsStore } from "./settings-store";
 import type {
   ActionRunResult,
@@ -153,6 +154,8 @@ interface GuidedSwipeSession {
 
 interface ContinueSwipeTracker {
   getTargetSwipeIndex(): number;
+  getCurrentViewedSwipeId(): number;
+  isViewingTargetSwipe(): boolean;
   isTargetDeleted(): boolean;
   getSwipes(): string[];
   getSwipeDates(): number[];
@@ -245,21 +248,31 @@ export class GuidedGenerationRunner {
   private interceptorDisposer: InterceptorDisposer | null = null;
   private disposed = false;
   private readonly pendingDryRunCaptures = new Map<string, PendingDryRunCapture>();
-  private readonly chatDryRunQueues = new Map<string, Promise<unknown>>();
+  private readonly chatDryRunQueues: Map<string, Promise<unknown>>;
   private readonly activeNativeGenerations = new Map<string, Map<string, ActiveNativeGeneration>>();
   private readonly nativeGenWaiters = new Set<NativeGenerationWaiter>();
   private readonly nativeGenListeners = new Set<(chatId: string, messageId?: string) => void>();
-  private readonly lifecycleDisposers: Array<() => void> = [];
+  private nativeGenLifecycleDisposers: Array<() => void> = [];
 
   constructor(
     private readonly spindle: SpindleAPI,
     private readonly store: SettingsStore,
     private readonly emitFrontend: (event: BackendPushEvent, userId?: string) => void,
+    private readonly interceptorMux?: InterceptorMux,
+    private readonly coordination?: {
+      chatDryRunQueues?: Map<string, Promise<unknown>>;
+      isExternalChatBusy?: (userId: string | undefined, chatId: string) => boolean;
+    },
   ) {
+    this.chatDryRunQueues =
+      coordination?.chatDryRunQueues ?? new Map<string, Promise<unknown>>();
     this.registerNativeGenerationListeners();
   }
 
   private registerNativeGenerationListeners(): void {
+    if (this.disposed) return;
+    if (this.spindle.permissions?.has?.("generation") === false) return;
+    if (this.nativeGenLifecycleDisposers.length > 0) return;
     if (typeof this.spindle.on !== "function") return;
 
     const recordStart = (rawPayload: unknown) => {
@@ -348,14 +361,46 @@ export class GuidedGenerationRunner {
 
     try {
       const d1 = this.spindle.on("GENERATION_STARTED", recordStart);
-      if (typeof d1 === "function") this.lifecycleDisposers.push(d1);
+      if (typeof d1 === "function") this.nativeGenLifecycleDisposers.push(d1);
       const d2 = this.spindle.on("GENERATION_ENDED", recordEnd);
-      if (typeof d2 === "function") this.lifecycleDisposers.push(d2);
+      if (typeof d2 === "function") this.nativeGenLifecycleDisposers.push(d2);
       const d3 = this.spindle.on("GENERATION_STOPPED", recordEnd);
-      if (typeof d3 === "function") this.lifecycleDisposers.push(d3);
+      if (typeof d3 === "function") this.nativeGenLifecycleDisposers.push(d3);
     } catch {
       // Ignore if host event bus is unavailable in tests or older hosts.
     }
+  }
+
+  private disposeNativeGenerationListeners(): void {
+    for (const d of this.nativeGenLifecycleDisposers.splice(0)) {
+      try {
+        d();
+      } catch {
+        // Ignore disposer errors.
+      }
+    }
+  }
+
+  syncPermissions(): void {
+    this.syncInterceptorRegistration();
+    if (this.disposed) {
+      this.disposeNativeGenerationListeners();
+      return;
+    }
+    if (this.spindle.permissions?.has?.("generation") === false) {
+      this.disposeNativeGenerationListeners();
+      this.activeNativeGenerations.clear();
+      for (const waiter of [...this.nativeGenWaiters]) {
+        waiter.resolve();
+      }
+      this.nativeGenWaiters.clear();
+    } else {
+      this.registerNativeGenerationListeners();
+    }
+  }
+
+  hasBusyChat(userId?: string, chatId?: string | null): boolean {
+    return this.isChatBusy(this.userKey(userId), chatId);
   }
 
   private pruneStaleNativeGenerations(
@@ -464,13 +509,7 @@ export class GuidedGenerationRunner {
 
   dispose(): void {
     this.disposed = true;
-    for (const d of this.lifecycleDisposers.splice(0)) {
-      try {
-        d();
-      } catch {
-        // Ignore disposer errors.
-      }
-    }
+    this.disposeNativeGenerationListeners();
     this.activeNativeGenerations.clear();
     for (const waiter of [...this.nativeGenWaiters]) {
       waiter.resolve();
@@ -494,7 +533,9 @@ export class GuidedGenerationRunner {
     this.pendingUsers.clear();
     this.recentTerminalRuns.clear();
     this.pendingDryRunCaptures.clear();
-    this.chatDryRunQueues.clear();
+    if (!this.coordination?.chatDryRunQueues) {
+      this.chatDryRunQueues.clear();
+    }
 
     this.disposeInterceptor();
   }
@@ -531,10 +572,17 @@ export class GuidedGenerationRunner {
       return;
     }
     if (this.interceptorDisposer) return;
-    if (typeof this.spindle.registerInterceptor !== "function") return;
+    const registerFn = this.interceptorMux
+      ? (handler: Parameters<SpindleAPI["registerInterceptor"]>[0]) =>
+          this.interceptorMux!.register(handler)
+      : typeof this.spindle.registerInterceptor === "function"
+        ? (handler: Parameters<SpindleAPI["registerInterceptor"]>[0]) =>
+            this.spindle.registerInterceptor(handler)
+        : null;
+    if (!registerFn) return;
 
     try {
-      this.interceptorDisposer = this.spindle.registerInterceptor(async (messages, context) => {
+      this.interceptorDisposer = registerFn(async (messages, context) => {
         if (this.disposed) {
           return messages;
         }
@@ -923,7 +971,7 @@ export class GuidedGenerationRunner {
       this.emitFrontend(
         {
           type: "gg:status",
-          run: this.getActiveRun(userId),
+          run: resolvedChatId ? this.getActiveRun(userId, resolvedChatId) : null,
           ...(resolvedChatId ? { chatId: resolvedChatId } : {}),
           done: !wasAborted,
           aborted: wasAborted,
@@ -997,6 +1045,9 @@ export class GuidedGenerationRunner {
       throw new Error(
         "A Guided Generations action is already running. Stop it before starting another.",
       );
+    }
+    if (requestedChatId && this.coordination?.isExternalChatBusy?.(userId, requestedChatId)) {
+      throw new Error("A guided generation is already running in this chat.");
     }
 
     this.assertRequiredPermissions(input.actionId);
@@ -1158,6 +1209,10 @@ export class GuidedGenerationRunner {
             "A Guided Generations action is already running. Stop it before starting another.",
           );
         }
+        if (this.coordination?.isExternalChatBusy?.(userId, chatId)) {
+          emitErrorStatus = false;
+          throw new Error("A guided generation is already running in this chat.");
+        }
 
         runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
         runStartedAt = Date.now();
@@ -1246,6 +1301,10 @@ export class GuidedGenerationRunner {
           throw new Error(
             "A Guided Generations action is already running. Stop it before starting another.",
           );
+        }
+        if (this.coordination?.isExternalChatBusy?.(userId, chatId)) {
+          emitErrorStatus = false;
+          throw new Error("A guided generation is already running in this chat.");
         }
 
         runId = `gg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1850,6 +1909,9 @@ export class GuidedGenerationRunner {
         "A Guided Generations action is already running. Stop it before starting another.",
       );
     }
+    if (requestedChatId && this.coordination?.isExternalChatBusy?.(userId, requestedChatId)) {
+      throw new Error("A guided generation is already running in this chat.");
+    }
 
     this.assertRequiredPermissions("guided_continue");
     const controller = new AbortController();
@@ -1884,6 +1946,10 @@ export class GuidedGenerationRunner {
         throw new Error(
           "A Guided Generations action is already running. Stop it before starting another.",
         );
+      }
+      if (this.coordination?.isExternalChatBusy?.(userId, chatId)) {
+        emitErrorStatus = false;
+        throw new Error("A guided generation is already running in this chat.");
       }
       if (controller.signal.aborted) {
         wasAborted = true;
@@ -2112,7 +2178,9 @@ export class GuidedGenerationRunner {
           rawInput,
           controller.signal,
           async () => {
-            const latest = await this.readTargetMessageOrThrow(chatId, target.id);
+            const latest = await this.readTargetMessageOrThrow(chatId, target.id, {
+              includeExtra: true,
+            });
             const latestNorm = normalizeMessageSwipes(latest);
             return {
               messageId: latest.id,
@@ -2120,9 +2188,11 @@ export class GuidedGenerationRunner {
               swipeIndex: continueTracker.getTargetSwipeIndex(),
               swipeDates: latestNorm.swipeDates,
               baseText: entry.baseText,
+              latestSwipeId: continueTracker.getCurrentViewedSwipeId(),
+              latestExtra: latest.extra ? this.cloneRecord(latest.extra) : {},
             };
           },
-          async (current) => {
+          async (current, refreshOptions) => {
             if (continueTracker.isTargetDeleted()) {
               return current;
             }
@@ -2136,6 +2206,7 @@ export class GuidedGenerationRunner {
               chatId,
               shiftedCurrent,
               () => continueTracker.isTargetDeleted(),
+              { includeExtra: Boolean(refreshOptions?.isFinal) },
             );
             return {
               ...refreshed,
@@ -3399,6 +3470,7 @@ export class GuidedGenerationRunner {
     },
   ): ContinueSwipeTracker {
     let targetSwipeIndex = initialSwipeIndex;
+    let currentViewedSwipeId = initialSwipeIndex;
     let targetDeleted = false;
     const trackedSwipes = [...initialSwipes];
     const trackedSwipeDates = [...initialSwipeDates];
@@ -3411,31 +3483,41 @@ export class GuidedGenerationRunner {
       if (!event || event.chatId !== chatId || event.message?.id !== targetMessageId) {
         return;
       }
-      if (
-        event.action === "deleted" &&
-        typeof event.swipeId === "number" &&
-        Number.isFinite(event.swipeId)
-      ) {
-        const deletedIdx = Math.floor(event.swipeId);
-        if (deletedIdx < targetSwipeIndex) {
-          if (deletedIdx >= 0 && deletedIdx < trackedSwipes.length) {
+      if (event.action === "deleted") {
+        if (typeof event.swipeId === "number" && Number.isFinite(event.swipeId)) {
+          const deletedIdx = Math.floor(event.swipeId);
+          if (deletedIdx < targetSwipeIndex) {
+            if (deletedIdx >= 0 && deletedIdx < trackedSwipes.length) {
+              trackedSwipes.splice(deletedIdx, 1);
+              trackedSwipeDates.splice(deletedIdx, 1);
+            }
+            targetSwipeIndex = Math.max(0, targetSwipeIndex - 1);
+            callbacks?.onTargetSwipeIndexChanged?.(targetSwipeIndex);
+          } else if (deletedIdx === targetSwipeIndex) {
+            targetDeleted = true;
+            callbacks?.onTargetDeleted?.();
+          } else if (deletedIdx > targetSwipeIndex && deletedIdx < trackedSwipes.length) {
             trackedSwipes.splice(deletedIdx, 1);
             trackedSwipeDates.splice(deletedIdx, 1);
           }
-          targetSwipeIndex = Math.max(0, targetSwipeIndex - 1);
-          callbacks?.onTargetSwipeIndexChanged?.(targetSwipeIndex);
-        } else if (deletedIdx === targetSwipeIndex) {
-          targetDeleted = true;
-          callbacks?.onTargetDeleted?.();
-        } else if (deletedIdx > targetSwipeIndex && deletedIdx < trackedSwipes.length) {
-          trackedSwipes.splice(deletedIdx, 1);
-          trackedSwipeDates.splice(deletedIdx, 1);
+          if (deletedIdx < currentViewedSwipeId) {
+            currentViewedSwipeId = Math.max(0, currentViewedSwipeId - 1);
+          } else if (deletedIdx === currentViewedSwipeId) {
+            currentViewedSwipeId = Math.max(
+              0,
+              Math.min(currentViewedSwipeId, trackedSwipes.length - 1),
+            );
+          }
         }
+      } else if (typeof event.swipeId === "number" && Number.isFinite(event.swipeId)) {
+        currentViewedSwipeId = Math.max(0, Math.floor(event.swipeId));
       }
     });
 
     return {
       getTargetSwipeIndex: () => targetSwipeIndex,
+      getCurrentViewedSwipeId: () => currentViewedSwipeId,
+      isViewingTargetSwipe: () => currentViewedSwipeId === targetSwipeIndex,
       isTargetDeleted: () => targetDeleted,
       getSwipes: () => [...trackedSwipes],
       getSwipeDates: () => [...trackedSwipeDates],
@@ -3536,6 +3618,7 @@ export class GuidedGenerationRunner {
         {
           role: "assistant",
           content: snapshot.content ?? "",
+          ...(snapshot.name ? { name: snapshot.name } : {}),
           ...(snapshot.metadata ? { metadata: snapshot.metadata } : {}),
         },
         { triggerGeneration: false },
@@ -3693,6 +3776,9 @@ export class GuidedGenerationRunner {
         },
       );
 
+      // Intentionally keep the pre-created blank assistant slot on 0-token abort,
+      // error, or empty output for `guided_response`; only `guided_regenerate`
+      // restores `regeneratedSnapshot`.
       let restoredOriginal = false;
       if (!streamRes.hasOutput && regeneratedSnapshot) {
         await this.restoreTrailingAssistant(
@@ -3726,6 +3812,8 @@ export class GuidedGenerationRunner {
         text: streamRes.finalText,
       };
     } catch (error) {
+      // Only `guided_regenerate` restores `regeneratedSnapshot`; `guided_response`
+      // intentionally keeps its pre-created blank assistant slot on 0-token error.
       if (!hadStreamOutput && regeneratedSnapshot) {
         await this.restoreTrailingAssistant(
           chatId,
@@ -3804,8 +3892,10 @@ export class GuidedGenerationRunner {
           swipeIndex: continueTracker.getTargetSwipeIndex(),
           swipeDates: continueTracker.getSwipeDates(),
           baseText: initialBaseText,
+          latestSwipeId: continueTracker.getCurrentViewedSwipeId(),
+          latestExtra: initial.extra ? this.cloneRecord(initial.extra) : {},
         }),
-        async (current) => {
+        async (current, refreshOptions) => {
           if (continueTracker.isTargetDeleted()) {
             return current;
           }
@@ -3819,6 +3909,7 @@ export class GuidedGenerationRunner {
             chatId,
             shiftedCurrent,
             () => continueTracker.isTargetDeleted(),
+            { includeExtra: Boolean(refreshOptions?.isFinal) },
           );
           return {
             ...refreshed,
@@ -3877,6 +3968,9 @@ export class GuidedGenerationRunner {
     userId?: string,
     metricsPreset?: { presetId: string | null; presetName?: string },
   ): Promise<ActionRunResult> {
+    // Intentionally keep the pre-created blank swipe slot on 0-token abort,
+    // error, or empty output for `guided_swipe`; only `guided_regenerate`
+    // restores `regeneratedSnapshot`.
     const streamRes = await this.streamIntoMessage(
       chatId,
       rawInput,
@@ -4177,6 +4271,9 @@ export class GuidedGenerationRunner {
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
         return;
       }
+      if (targetSwipeTracker && !targetSwipeTracker.isViewingTargetSwipe()) {
+        return;
+      }
 
       const preRefreshLive = swipeOptions?.getTargetSwipeState?.();
       let effectiveTarget: StreamTargetState = preRefreshLive
@@ -4202,6 +4299,9 @@ export class GuidedGenerationRunner {
         return;
       }
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) {
+        return;
+      }
+      if (targetSwipeTracker && !targetSwipeTracker.isViewingTargetSwipe()) {
         return;
       }
 
@@ -4275,9 +4375,10 @@ export class GuidedGenerationRunner {
             break;
           }
           if (
-            swipeOptions &&
-            (!swipeOptions.isViewingTargetSwipe() ||
-              swipeOptions.isNativeGenerationActiveOnTarget?.())
+            (swipeOptions &&
+              (!swipeOptions.isViewingTargetSwipe() ||
+                swipeOptions.isNativeGenerationActiveOnTarget?.())) ||
+            (targetSwipeTracker && !targetSwipeTracker.isViewingTargetSwipe())
           ) {
             midstreamDirty = false;
             pendingMidstreamForce = false;
@@ -4317,6 +4418,50 @@ export class GuidedGenerationRunner {
           : targetSnapshot.swipeIndex;
         const finalContent = buildMergedContent(targetSnapshot.baseText);
         const finalReasoning = reasoningText;
+        const isViewingTarget = targetSwipeTracker
+          ? targetSwipeTracker.isViewingTargetSwipe()
+          : true;
+
+        if (!isViewingTarget) {
+          const existingBySwipe = targetSnapshot.latestExtra?.reasoningBySwipe;
+          const hadStoredSlotReasoning =
+            Array.isArray(existingBySwipe) &&
+            existingBySwipe[effectiveSwipeIndex] != null;
+          const includeReasoning =
+            finalReasoning.length > 0 ||
+            (forceReasoningPatch && hadStoredSlotReasoning);
+          const durationPatch = getReasoningDurationPatch(
+            targetSnapshot.baseText,
+            includeReasoning,
+          );
+          const bgReasoningDuration =
+            typeof durationPatch.reasoningDuration === "number" &&
+            durationPatch.reasoningDuration > 0
+              ? durationPatch.reasoningDuration
+              : undefined;
+          const patch = buildBackgroundSwipePatch({
+            swipes: targetSnapshot.swipes,
+            swipeIndex: effectiveSwipeIndex,
+            content: finalContent,
+            swipeDates: targetSnapshot.swipeDates,
+            ...(includeReasoning
+              ? {
+                  reasoningText: finalReasoning,
+                  ...(bgReasoningDuration !== undefined
+                    ? { reasoningDuration: bgReasoningDuration }
+                    : {}),
+                  clearReasoningSlot: forceReasoningPatch && finalReasoning.length === 0,
+                  existingExtra: targetSnapshot.latestExtra,
+                  existingActiveSwipeId:
+                    targetSnapshot.latestSwipeId ??
+                    targetSwipeTracker?.getCurrentViewedSwipeId(),
+                }
+              : {}),
+          }) as unknown as Parameters<SpindleAPI["chat"]["updateMessage"]>[2];
+          await runUpdatePatch(targetSnapshot.messageId, patch, swallowError);
+          return;
+        }
+
         const includeReasoning = Boolean(finalReasoning || forceReasoningPatch);
         const durationPatch = getReasoningDurationPatch(
           targetSnapshot.baseText,
@@ -4414,6 +4559,7 @@ export class GuidedGenerationRunner {
       if (isTargetDeleted()) return;
       if (swipeOptions?.isNativeGenerationActiveOnTarget?.()) return;
       if (swipeOptions && !swipeOptions.isViewingTargetSwipe()) return;
+      if (targetSwipeTracker && !targetSwipeTracker.isViewingTargetSwipe()) return;
       const liveSwipeState = swipeOptions?.getTargetSwipeState?.();
       if (liveSwipeState) {
         target = {
@@ -4633,7 +4779,7 @@ export class GuidedGenerationRunner {
     await waitForInFlightFlush();
 
     if (swipeOptions?.waitForNativeGenerationOnTarget && !isTargetDeleted()) {
-      await swipeOptions.waitForNativeGenerationOnTarget(signal);
+      await swipeOptions.waitForNativeGenerationOnTarget(signal.aborted ? undefined : signal);
     }
 
     if (refreshTarget) {

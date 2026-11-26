@@ -9,6 +9,7 @@ A Lumiverse Spindle extension recreating the core workflows of [GuidedGeneration
 - **Guided Regenerate** — Replace the trailing AI message with a fresh regenerated reply (restores the original message automatically if generation fails before producing output).
 - **Guided Swipe** — Click to create a new swipe on the last AI message steered by optional guidance text, or click-and-hold (also `Ctrl/Cmd+Click`, `Ctrl/Cmd+Enter`, or `Ctrl/Cmd+Space`) to generate in background swipe mode without leaving your current swipe.
 - **Impersonation** — Draft the user's next message directly into the composer input box.
+- **Guided Scene** — Stage or steer a scene transition from a character/group greeting or custom opening (with **Drop Now**, **Next Turn**, or **Multi-Turn** pacing, **Hard Cut** / **Time Skip** / **In-Scene Bridge** delivery, **Verbatim** / **Context Adapt** / **Summary Rewrite** adjustment, preview drafting with **Cancel Preview**, media preservation, and quick toolbar/banner controls to pause, resume, drop, or cancel armed steering).
 - **Input Recovery** — When enabled, automatically saves any non-empty composer text (`inputText`) used on guided runs (even when **Clear input bar when triggered** is disabled), up to a configurable **Max saved drafts** setting (`1–50`). Click to restore the latest saved draft (or clear the current composer input when no saved drafts exist), or click-and-hold (also `Ctrl/Cmd+Click`, `Shift+F10`, `Alt+Up`, or `Ctrl/Cmd+Enter`) to open the drop-up menu with **History** (browse and restore any saved draft) and **Clear History**.
 - **Stop / Abort Active Run** — While a guided action is running in the current chat, its toolbar button switches to a **Stop** button (`Stop <Action>`) and other guided action buttons are dimmed/disabled; click the active button at any time to abort the in-progress or pending run.
 - **Background Chat Heads** — Shows floating draggable Chat Head bubbles for active or recently completed guided runs in background chats, letting you jump back to the chat with a click.
@@ -24,7 +25,7 @@ A Lumiverse Spindle extension recreating the core workflows of [GuidedGeneration
    ```text
    https://github.com/tminh159/GuidedGenerations
    ```
-3. Enable **Guided Generations** and grant the requested permissions (`generation`, `chats`, `chat_mutation`, `characters`, `presets`, `regex_scripts`, `interceptor`).
+3. Enable **Guided Generations** and grant the requested permissions (`generation`, `chats`, `chat_mutation`, `characters`, `presets`, `regex_scripts`, `interceptor`, `push_notification`).
 
 ## Development
 

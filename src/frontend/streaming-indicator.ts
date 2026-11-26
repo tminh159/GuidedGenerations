@@ -1,19 +1,21 @@
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
-import type { ActiveRunState, GuidedActionId } from "../shared/types";
+import type { ActiveRunState, RunActionId } from "../shared/types";
 
-const INDICATOR_ACTIONS = new Set<GuidedActionId>([
+const INDICATOR_ACTIONS = new Set<RunActionId>([
   "guided_response",
   "guided_regenerate",
   "guided_swipe",
   "guided_continue",
+  "guided_scene",
 ]);
 
-const STREAM_AFTER_OPTIMISTIC_ACTIONS = new Set<GuidedActionId>([
+const STREAM_AFTER_OPTIMISTIC_ACTIONS = new Set<RunActionId>([
   "guided_response",
   "guided_regenerate",
+  "guided_scene",
 ]);
 
-const LATEST_ROW_OPTIMISTIC_ACTIONS = new Set<GuidedActionId>([
+const LATEST_ROW_OPTIMISTIC_ACTIONS = new Set<RunActionId>([
   "guided_continue",
   "guided_swipe",
 ]);
@@ -46,7 +48,7 @@ type DisplayPlan =
   | {
       kind: "row";
       messageId: string;
-      actionId: GuidedActionId;
+      actionId: RunActionId;
       allowStreamAfterFallback: boolean;
       retryRowIfMissing: boolean;
     };
@@ -486,7 +488,7 @@ export class StreamingIndicatorController {
 
   private resolveTarget(
     messageId: string,
-    actionId: GuidedActionId,
+    actionId: RunActionId,
   ): ResolvedIndicatorTarget | null {
     if (typeof this.ctx.dom?.findMessageElement !== "function") return null;
     const row = this.ctx.dom.findMessageElement(messageId);

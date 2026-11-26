@@ -689,4 +689,72 @@ describe("regex-processor", () => {
       await applyRegexScripts("foo_bar 123", [safeAlphaOrUnderscore], "ai_output", 0),
     ).toBe("ID 123");
   });
+
+  test("applyRegexScripts blocks bounded inner-quantifier groups and overlapping adjacent unbounded classes/shorthands while allowing disjoint ones", async () => {
+    const boundedInnerGroup = makeScript({
+      id: "redos-bounded-inner-group",
+      find_regex: "(aa+){2,100}$",
+      replace_string: "REPLACED",
+      flags: "",
+    });
+    const adjacentWordShorthand = makeScript({
+      id: "redos-adjacent-word",
+      find_regex: "\\w+\\w+",
+      replace_string: "REPLACED",
+      flags: "",
+    });
+    const adjacentCharClass = makeScript({
+      id: "redos-adjacent-class",
+      find_regex: "[a-z]+[a-z]+",
+      replace_string: "REPLACED",
+      flags: "",
+    });
+    const adjacentLiterals = makeScript({
+      id: "redos-adjacent-literals",
+      find_regex: "a+a+a+$",
+      replace_string: "REPLACED",
+      flags: "",
+    });
+
+    const input = `${"a".repeat(25)}!`;
+    expect(
+      await applyRegexScripts(
+        input,
+        [boundedInnerGroup, adjacentWordShorthand, adjacentCharClass, adjacentLiterals],
+        "ai_output",
+        0,
+      ),
+    ).toBe(input);
+
+    // Disjoint adjacent unbounded classes/shorthands remain allowed
+    const disjointDigitAlpha = makeScript({
+      id: "safe-digit-alpha",
+      find_regex: "\\d+[a-z]+",
+      replace_string: "TOKEN",
+      flags: "g",
+    });
+    expect(await applyRegexScripts("123abc 456def", [disjointDigitAlpha], "ai_output", 0)).toBe(
+      "TOKEN TOKEN",
+    );
+
+    const disjointWhitespaceWord = makeScript({
+      id: "safe-ws-word",
+      find_regex: "\\s+\\w+",
+      replace_string: " WORD",
+      flags: "g",
+    });
+    expect(await applyRegexScripts("hi   there", [disjointWhitespaceWord], "ai_output", 0)).toBe(
+      "hi WORD",
+    );
+
+    const disjointCamelCase = makeScript({
+      id: "safe-camel-case",
+      find_regex: "[A-Z]+[a-z]+",
+      replace_string: "CAMEL",
+      flags: "g",
+    });
+    expect(await applyRegexScripts("Hello World", [disjointCamelCase], "ai_output", 0)).toBe(
+      "CAMEL CAMEL",
+    );
+  });
 });

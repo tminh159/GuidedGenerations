@@ -62,7 +62,10 @@ describe("StreamingIndicatorController hot-loop optimizations", () => {
     dom.window.close();
   });
 
-  function createHarness(activeChatId = "chat-1") {
+  function createHarness(
+    activeChatId = "chat-1",
+    options: { latestMessageId?: string | null; streamAfterMount?: Element | null } = {},
+  ) {
     const listeners = new Map<string, Set<(payload: unknown) => void>>();
     const rows = new Map<string, Element>();
     let findCalls = 0;
@@ -71,6 +74,21 @@ describe("StreamingIndicatorController hot-loop optimizations", () => {
 
     const ctx = {
       getActiveChat: () => ({ chatId: activeChatId }),
+      ...(options.latestMessageId !== undefined
+        ? {
+            messages: {
+              getLatestMessageId: () => options.latestMessageId ?? null,
+            },
+          }
+        : {}),
+      ...(options.streamAfterMount !== undefined
+        ? {
+            ui: {
+              mount: (slot: string) =>
+                slot === "chat_stream_after" ? options.streamAfterMount! : null,
+            },
+          }
+        : {}),
       events: {
         on: (event: string, cb: (payload: unknown) => void) => {
           let set = listeners.get(event);
@@ -380,6 +398,76 @@ describe("StreamingIndicatorController hot-loop optimizations", () => {
       controller.destroy();
       globalThis.setTimeout = origSetTimeout;
       globalThis.clearTimeout = origClearTimeout;
+    }
+  });
+
+  test("does not mount optimistic indicator for foreground guided_swipe before messageId/swipeId confirmation, mounts once confirmed, and keeps optimistic row indicator for guided_continue", () => {
+    const streamAfterMount = document.createElement("div");
+    document.body.append(streamAfterMount);
+
+    const h = createHarness("chat-1", {
+      latestMessageId: "msg-1",
+      streamAfterMount,
+    });
+    const row = document.createElement("div");
+    const messageContent = document.createElement("div");
+    messageContent.setAttribute("data-component", "MessageContent");
+    messageContent.textContent = "Existing swipe content";
+    row.append(messageContent);
+    document.body.append(row);
+    h.rows.set("msg-1", row);
+
+    const controller = new StreamingIndicatorController(h.ctx);
+    try {
+      // 1. Pending foreground guided_swipe (no messageId/swipeId) mounts nothing on old swipe or streamAfter
+      controller.sync({
+        runId: "pending:1",
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        startedAt: Date.now(),
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 2. Pre-dryRun backend status (still no messageId/swipeId) also mounts nothing
+      controller.sync({
+        runId: "run-swipe-1",
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        startedAt: Date.now(),
+        backgroundSwipe: false,
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 3. Confirmed messageId + swipeId mounts cleanly on the row
+      controller.sync({
+        runId: "run-swipe-1",
+        actionId: "guided_swipe",
+        chatId: "chat-1",
+        startedAt: Date.now(),
+        messageId: "msg-1",
+        swipeId: 1,
+        backgroundSwipe: false,
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator--after")).toHaveLength(1);
+      expect(streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // Clear run
+      controller.sync(null);
+      expect(row.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // 4. guided_continue without messageId still mounts optimistically on the latest row immediately
+      controller.sync({
+        runId: "pending:2",
+        actionId: "guided_continue",
+        chatId: "chat-1",
+        startedAt: Date.now(),
+      });
+      expect(row.querySelectorAll(".gg-streaming-indicator--after")).toHaveLength(1);
+      expect(streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+    } finally {
+      controller.destroy();
     }
   });
 });

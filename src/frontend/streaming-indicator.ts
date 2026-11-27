@@ -17,7 +17,6 @@ const STREAM_AFTER_OPTIMISTIC_ACTIONS = new Set<RunActionId>([
 
 const LATEST_ROW_OPTIMISTIC_ACTIONS = new Set<RunActionId>([
   "guided_continue",
-  "guided_swipe",
 ]);
 
 const INDICATOR_HTML_BEFORE =
@@ -382,8 +381,10 @@ export class StreamingIndicatorController {
     }
 
     // Optimistic phase (before backend confirms run.messageId):
-    // Never show optimistic indicator for background swipes.
-    if (run.actionId === "guided_swipe" && run.backgroundSwipe) {
+    // Never show an optimistic indicator for guided_swipe (foreground or background) —
+    // the new swipe page has not been created yet, so attaching below the current
+    // swipe's MessageContent makes foreground swipe look like guided_continue.
+    if (run.actionId === "guided_swipe") {
       return { kind: "none" };
     }
 

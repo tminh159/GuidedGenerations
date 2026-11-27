@@ -5792,7 +5792,7 @@ describe("frontend orchestration and safety", () => {
     }
   });
 
-  test("optimistic 3-dot indicator attaches immediately to latest message row for guided_continue & foreground guided_swipe via getLatestMessageId(), hands off seamlessly, and falls back gracefully when absent", async () => {
+  test("optimistic 3-dot indicator attaches immediately to latest message row for guided_continue via getLatestMessageId(), skips optimistic mount for foreground guided_swipe until confirmed, and falls back gracefully when absent", async () => {
     const h = createFrontendHarness({
       initialChatId: "chat-a",
       composerMounted: true,
@@ -5851,9 +5851,24 @@ describe("frontend orchestration and safety", () => {
       await flushMicrotasks();
       expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
 
-      // 2. Foreground guided_swipe attaches immediately to m-latest at t=0ms, then hands off to confirmed swipeId
+      // 2. Foreground guided_swipe does NOT attach optimistically to old swipe before confirmation,
+      //    then mounts once confirmed with messageId and swipeId
       getBtn("guided_swipe").click();
-      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(1);
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+      expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
+
+      // Intermediate pre-dryRun gg:status (no messageId/swipeId yet) still does not attach optimistically
+      h.emitFromBackend({
+        type: "gg:status",
+        run: {
+          runId: "swipe-real-1",
+          actionId: "guided_swipe",
+          chatId: "chat-a",
+          startedAt: Date.now(),
+          backgroundSwipe: false,
+        },
+      });
+      expect(latestRow.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
       expect(h.streamAfterMount.querySelectorAll(".gg-streaming-indicator")).toHaveLength(0);
 
       h.emitFromBackend({

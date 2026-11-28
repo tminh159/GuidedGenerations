@@ -28,6 +28,7 @@ interface MockHarnessOptions {
   streamChunks?: Array<{ type: "token"; token: string } | { type: "done"; content: string; finish_reason: string; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }>;
   onStreamStart?: (input: unknown, signal?: AbortSignal) => AsyncGenerator<unknown, void, void>;
   dryRunMessages?: LlmMessageDTO[];
+  dryRunRequestMessages?: LlmMessageDTO[];
   regexScripts?: Array<{
     id: string;
     name: string;
@@ -477,7 +478,7 @@ function createMockSpindle(opts: MockHarnessOptions = {}) {
         }
         return {
           messages: assembled,
-          request_messages: assembled,
+          request_messages: opts.dryRunRequestMessages ?? assembled,
           breakdown: [],
           parameters: { temperature: 0.7 },
           model: "claude-sonnet",
@@ -1899,7 +1900,7 @@ describe("Guided Scene backend integration", () => {
     expect(mockUserTail.appendCalls).toHaveLength(1);
     backendUserTail.dispose();
 
-    // 2. Trailing assistant message with new_swipe LLM drop -> excludes m2 in lightweight AND full_preset (+ merges consecutive user turns)
+    // 2. Trailing assistant message with new_swipe LLM drop + full_preset post-processing fidelity
     const mockLightweight = createMockSpindle();
     const backendLight = registerBackend(mockLightweight.spindle);
     await backendLight.sceneManager.dropSceneNow(
@@ -1918,22 +1919,71 @@ describe("Guided Scene backend integration", () => {
     expect(JSON.stringify(lightReq.messages)).toContain("head upstairs to the rooftop");
     backendLight.dispose();
 
-    const mockFull = createMockSpindle({
+    // 2a. Unmerged preset (promptPostProcessing: "none") preserves separate system prompt blocks in preview & drop
+    const mockFullUnmerged = createMockSpindle({
       dryRunMessages: [
-        { role: "system", content: "System block." },
-        { role: "user", content: "Let's head upstairs.", __isChatHistory: true },
+        { role: "system", content: "Main system prompt." },
+        { role: "system", content: "Character description." },
+        { role: "system", content: "Personality and scenario." },
+        { role: "user", content: "Let's head upstairs.", __isChatHistory: true } as LlmMessageDTO,
         {
           role: "assistant",
           content: "Right behind you.",
           __isChatHistory: true,
           sourceMessageId: "m2",
-        },
+        } as LlmMessageDTO,
+        { role: "system", content: "Post-history instructions." },
       ],
     });
-    const storeFull = new SettingsStore(mockFull.spindle);
-    await storeFull.saveSettings({ guidedScene: { contextMode: "full_preset" } }, "u1");
-    const mgrFull = new GuidedSceneManager(mockFull.spindle, storeFull, () => {});
-    await mgrFull.dropSceneNow(
+    const storeFullUnmerged = new SettingsStore(mockFullUnmerged.spindle);
+    await storeFullUnmerged.saveSettings({ guidedScene: { contextMode: "full_preset" } }, "u1");
+    const mgrFullUnmerged = new GuidedSceneManager(mockFullUnmerged.spindle, storeFullUnmerged, () => {});
+    await mgrFullUnmerged.previewSceneDraft(
+      {
+        chatId: "chat-1",
+        delivery: "bridge",
+        adjustmentMode: "context_adapt",
+        greetingSource: "custom",
+        rawGreetingText: "Preview unmerged full_preset.",
+      },
+      "u1",
+    );
+    const previewReq = mockFullUnmerged.rawStreamCalls[0] as { messages: LlmMessageDTO[] };
+    expect(previewReq.messages.slice(0, 3)).toEqual([
+      { role: "system", content: "Main system prompt." },
+      { role: "system", content: "Character description." },
+      { role: "system", content: "Personality and scenario." },
+    ]);
+    expect(previewReq.messages[3]).toEqual({ role: "user", content: "Let's head upstairs." });
+    expect(previewReq.messages[4]).toEqual({ role: "assistant", content: "Right behind you." });
+    expect(previewReq.messages[5]).toEqual({ role: "system", content: "Post-history instructions." });
+    expect(previewReq.messages[6]?.role).toBe("user");
+    expect(String(previewReq.messages[6]?.content)).toContain("Preview unmerged full_preset.");
+    mgrFullUnmerged.dispose();
+
+    // 2b. Merged preset (promptPostProcessing: "merge") strips m2 via captured metadata AND re-applies consecutive role merge
+    const mockFullMerged = createMockSpindle({
+      dryRunMessages: [
+        { role: "system", content: "Main system prompt." },
+        { role: "system", content: "Character description." },
+        { role: "user", content: "Let's head upstairs.", __isChatHistory: true } as LlmMessageDTO,
+        {
+          role: "assistant",
+          content: "Right behind you.",
+          __isChatHistory: true,
+          sourceMessageId: "m2",
+        } as LlmMessageDTO,
+      ],
+      dryRunRequestMessages: [
+        { role: "system", content: "Main system prompt.\n\nCharacter description." },
+        { role: "user", content: "Let's head upstairs." },
+        { role: "assistant", content: "Right behind you." },
+      ],
+    });
+    const storeFullMerged = new SettingsStore(mockFullMerged.spindle);
+    await storeFullMerged.saveSettings({ guidedScene: { contextMode: "full_preset" } }, "u1");
+    const mgrFullMerged = new GuidedSceneManager(mockFullMerged.spindle, storeFullMerged, () => {});
+    await mgrFullMerged.dropSceneNow(
       {
         chatId: "chat-1",
         delivery: "bridge",
@@ -1944,14 +1994,53 @@ describe("Guided Scene backend integration", () => {
       },
       "u1",
     );
-    expect((mockFull.dryRunCalls[0] as { generationType?: string }).generationType).toBe("swipe");
-    const fullReq = mockFull.rawStreamCalls[0] as { messages: LlmMessageDTO[] };
-    expect(JSON.stringify(fullReq.messages)).not.toContain("Right behind you.");
-    // Consecutive user turns (user history + user task) must be merged cleanly
-    for (let i = 1; i < fullReq.messages.length; i += 1) {
-      expect(fullReq.messages[i]!.role).not.toBe(fullReq.messages[i - 1]!.role);
-    }
-    mgrFull.dispose();
+    expect((mockFullMerged.dryRunCalls[0] as { generationType?: string }).generationType).toBe("swipe");
+    const fullMergedReq = mockFullMerged.rawStreamCalls[0] as { messages: LlmMessageDTO[] };
+    expect(JSON.stringify(fullMergedReq.messages)).not.toContain("Right behind you.");
+    // Consecutive system blocks and consecutive user turns (user history + user task) must be merged cleanly
+    expect(fullMergedReq.messages).toHaveLength(2);
+    expect(fullMergedReq.messages[0]).toEqual({
+      role: "system",
+      content: "Main system prompt.\n\nCharacter description.",
+    });
+    expect(fullMergedReq.messages[1]?.role).toBe("user");
+    expect(String(fullMergedReq.messages[1]?.content)).toContain("Let's head upstairs.");
+    expect(String(fullMergedReq.messages[1]?.content)).toContain("New full_preset swipe.");
+    mgrFullMerged.dispose();
+
+    // 2c. Single-role collapsed preset (promptPostProcessing: "single") collapses final prompt into one system message
+    const mockFullSingle = createMockSpindle({
+      dryRunMessages: [
+        { role: "system", content: "Main system prompt." },
+        { role: "user", content: "Let's head upstairs.", __isChatHistory: true } as LlmMessageDTO,
+        { role: "assistant", content: "Right behind you.", __isChatHistory: true } as LlmMessageDTO,
+      ],
+      dryRunRequestMessages: [
+        {
+          role: "system",
+          content: "Main system prompt.\n\nLet's head upstairs.\n\nRight behind you.",
+        },
+      ],
+    });
+    const storeFullSingle = new SettingsStore(mockFullSingle.spindle);
+    await storeFullSingle.saveSettings({ guidedScene: { contextMode: "full_preset" } }, "u1");
+    const mgrFullSingle = new GuidedSceneManager(mockFullSingle.spindle, storeFullSingle, () => {});
+    await mgrFullSingle.previewSceneDraft(
+      {
+        chatId: "chat-1",
+        delivery: "bridge",
+        adjustmentMode: "context_adapt",
+        greetingSource: "custom",
+        rawGreetingText: "Preview single collapsed full_preset.",
+      },
+      "u1",
+    );
+    const fullSingleReq = mockFullSingle.rawStreamCalls[0] as { messages: LlmMessageDTO[] };
+    expect(fullSingleReq.messages).toHaveLength(1);
+    expect(fullSingleReq.messages[0]?.role).toBe("system");
+    expect(String(fullSingleReq.messages[0]?.content)).toContain("Main system prompt.");
+    expect(String(fullSingleReq.messages[0]?.content)).toContain("Preview single collapsed full_preset.");
+    mgrFullSingle.dispose();
   });
 
   test("#57 Medium #5, #7, #8, #58 Medium #4, and Low #9/#10 regressions", async () => {

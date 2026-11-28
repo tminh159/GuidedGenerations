@@ -50,10 +50,13 @@ import {
   buildActiveSwipePatch,
   buildPresetContextMetadata,
   type ChatMessageWithRole,
+  collapseMessagesToSingleRole,
   type DryRunRequestWithOverride,
   type DryRunResultWithRequestMessages,
+  hasNonEmptyLlmContent,
   isAssistantMessage,
   mergeConsecutiveSameRoleMessages,
+  mergeDryRunAndCapturedMessages,
   normalizeMessageSwipes,
   resolveChatHistoryFlags,
   resolveEffectiveModelAndProvider,
@@ -2745,13 +2748,15 @@ export class GuidedSceneManager {
       dryRunProvider = dryRunResult.provider;
       parameters = dryRunResult.parameters;
 
-      // Prefer post-processed request_messages when available; fall back to captured or messages.
-      let presetMessages: AssembledLlmMessageDTO[] =
-        Array.isArray(dryRunResult.request_messages) && dryRunResult.request_messages.length > 0
-          ? (dryRunResult.request_messages as AssembledLlmMessageDTO[])
-          : capturedMessages && capturedMessages.length > 0
-            ? capturedMessages
-            : (dryRunResult.messages as AssembledLlmMessageDTO[]);
+      // Reconcile post-processed request_messages against pre-post-processing captured
+      // messages so we preserve metadata and only merge/collapse roles when Lumiverse did.
+      const {
+        messages: rawPresetMessages,
+        reapplyRoleMerge,
+        applyEmptyFilter,
+        collapseToSingleRole,
+      } = mergeDryRunAndCapturedMessages(dryRunResult, capturedMessages);
+      let presetMessages = rawPresetMessages;
 
       if (args.excludeMessageId && presetMessages.length > 0) {
         const isChatHistory = resolveChatHistoryFlags(presetMessages, {
@@ -2762,6 +2767,10 @@ export class GuidedSceneManager {
           args.excludeMessageId,
           isChatHistory,
         ).messages;
+      }
+
+      if (applyEmptyFilter) {
+        presetMessages = presetMessages.filter(hasNonEmptyLlmContent);
       }
 
       const rawFullMessages = buildRewriteMessages({
@@ -2777,9 +2786,16 @@ export class GuidedSceneManager {
         names,
         presetMessages,
       });
-      messages = stripInternalMessageMarkers(
-        mergeConsecutiveSameRoleMessages(rawFullMessages as AssembledLlmMessageDTO[]),
-      );
+      const filteredFull = applyEmptyFilter
+        ? (rawFullMessages as AssembledLlmMessageDTO[]).filter(hasNonEmptyLlmContent)
+        : (rawFullMessages as AssembledLlmMessageDTO[]);
+      const mergedFull = reapplyRoleMerge
+        ? mergeConsecutiveSameRoleMessages(filteredFull)
+        : filteredFull;
+      const collapsedFull = collapseToSingleRole
+        ? collapseMessagesToSingleRole(mergedFull, collapseToSingleRole)
+        : mergedFull;
+      messages = stripInternalMessageMarkers(collapsedFull);
     } else {
       const [character, persona, recentHistory] = await Promise.all([
         this.loadLightweightCharacter(effectiveCharId, userId),

@@ -662,6 +662,178 @@ export function collapseMessagesToSingleRole(
   return [{ role, content: collapsed }];
 }
 
+export interface MergedDryRunMessagesResult {
+  messages: AssembledLlmMessageDTO[];
+  reapplyRoleMerge: boolean;
+  applyEmptyFilter: boolean;
+  collapseToSingleRole?: "system" | "user";
+}
+
+/**
+ * Reconciles `dryRunResult.request_messages` against pre-post-processing
+ * `capturedMessages` from the interceptor so callers preserve per-message
+ * metadata and detect whether Lumiverse applied empty filtering, consecutive
+ * same-role merging, or single-role collapsing.
+ */
+export function mergeDryRunAndCapturedMessages(
+  dryRunResult: DryRunResultWithRequestMessages,
+  capturedMessages?: AssembledLlmMessageDTO[],
+): MergedDryRunMessagesResult {
+  const requestMessages = dryRunResult.request_messages;
+  if (Array.isArray(requestMessages)) {
+    const reqHasMetadata = requestMessages.some(
+      (m) =>
+        typeof m.__isChatHistory === "boolean" ||
+        typeof m.__chatHistorySource === "boolean" ||
+        (typeof m.sourceMessageId === "string" && m.sourceMessageId.length > 0) ||
+        (typeof m.__sourceMessageId === "string" && m.__sourceMessageId.length > 0),
+    );
+    if (capturedMessages && capturedMessages.length > 0) {
+      const copyFlagsFromCapture = (
+        msg: AssembledLlmMessageDTO,
+        cap: AssembledLlmMessageDTO,
+      ): AssembledLlmMessageDTO => ({
+        ...msg,
+        ...(msg.__isChatHistory === undefined && cap.__isChatHistory !== undefined
+          ? { __isChatHistory: cap.__isChatHistory }
+          : {}),
+        ...(msg.__isWorldInfoEntry === undefined && cap.__isWorldInfoEntry !== undefined
+          ? { __isWorldInfoEntry: cap.__isWorldInfoEntry }
+          : {}),
+        ...(msg.__chatHistorySource === undefined && cap.__chatHistorySource !== undefined
+          ? { __chatHistorySource: cap.__chatHistorySource }
+          : {}),
+        ...(msg.__worldInfoSource === undefined && cap.__worldInfoSource !== undefined
+          ? { __worldInfoSource: cap.__worldInfoSource }
+          : {}),
+        ...(msg.sourceMessageId === undefined && cap.sourceMessageId !== undefined
+          ? { sourceMessageId: cap.sourceMessageId }
+          : {}),
+        ...(msg.__sourceMessageId === undefined && cap.__sourceMessageId !== undefined
+          ? { __sourceMessageId: cap.__sourceMessageId }
+          : {}),
+        ...(msg.sourceIndexInChat === undefined && cap.sourceIndexInChat !== undefined
+          ? { sourceIndexInChat: cap.sourceIndexInChat }
+          : {}),
+        ...(msg.__sourceIndexInChat === undefined && cap.__sourceIndexInChat !== undefined
+          ? { __sourceIndexInChat: cap.__sourceIndexInChat }
+          : {}),
+      });
+
+      if (capturedMessages.length === requestMessages.length) {
+        return {
+          messages: requestMessages.map((msg, idx) =>
+            copyFlagsFromCapture(msg, capturedMessages[idx]!),
+          ),
+          reapplyRoleMerge: false,
+          applyEmptyFilter: false,
+        };
+      }
+
+      // Reconcile capturedMessages against request_messages when Lumiverse's
+      // hasNonEmptyContent filter pruned empty turns (such as assistant(""))
+      // after interceptor capture, without merging consecutive roles.
+      const filteredIndices: number[] = [];
+      for (let i = 0; i < capturedMessages.length; i += 1) {
+        if (hasNonEmptyLlmContent(capturedMessages[i]!)) {
+          filteredIndices.push(i);
+        }
+      }
+      const matchesFilteredCapture =
+        filteredIndices.length === requestMessages.length &&
+        filteredIndices.every(
+          (capIdx, reqIdx) =>
+            capturedMessages[capIdx]!.role === requestMessages[reqIdx]!.role,
+        );
+      if (matchesFilteredCapture) {
+        const reqIdxByCapIdx = new Map<number, number>();
+        filteredIndices.forEach((capIdx, reqIdx) => {
+          reqIdxByCapIdx.set(capIdx, reqIdx);
+        });
+        const reconstructed = capturedMessages.map((cap, capIdx) => {
+          const reqIdx = reqIdxByCapIdx.get(capIdx);
+          if (reqIdx === undefined) {
+            return { ...cap };
+          }
+          const req = requestMessages[reqIdx]!;
+          return copyFlagsFromCapture(
+            {
+              ...cap,
+              role: req.role,
+              content: req.content,
+              ...(req.name !== undefined ? { name: req.name } : {}),
+              ...(req.partial !== undefined ? { partial: req.partial } : {}),
+            },
+            cap,
+          );
+        });
+        return {
+          messages: reconstructed,
+          reapplyRoleMerge: false,
+          applyEmptyFilter: true,
+        };
+      }
+
+      const mergedFilteredCapture = mergeConsecutiveSameRoleMessages(
+        capturedMessages.filter(hasNonEmptyLlmContent),
+      );
+      const didMergeConsecutiveRoles =
+        capturedMessages.length > requestMessages.length &&
+        mergedFilteredCapture.length === requestMessages.length &&
+        mergedFilteredCapture.every((msg, idx) => msg.role === requestMessages[idx]?.role);
+      if (didMergeConsecutiveRoles) {
+        return {
+          messages: capturedMessages,
+          reapplyRoleMerge: true,
+          applyEmptyFilter: true,
+        };
+      }
+
+      const singleCollapsedRole =
+        requestMessages.length === 1 &&
+        capturedMessages.length > 1 &&
+        !reqHasMetadata &&
+        (requestMessages[0]?.role === "system" || requestMessages[0]?.role === "user")
+          ? (requestMessages[0]!.role as "system" | "user")
+          : undefined;
+      if (singleCollapsedRole) {
+        return {
+          messages: capturedMessages,
+          reapplyRoleMerge: false,
+          applyEmptyFilter: true,
+          collapseToSingleRole: singleCollapsedRole,
+        };
+      }
+      if (!reqHasMetadata) {
+        return {
+          messages: capturedMessages,
+          reapplyRoleMerge: false,
+          applyEmptyFilter: true,
+        };
+      }
+    }
+    return {
+      messages: requestMessages,
+      reapplyRoleMerge: false,
+      applyEmptyFilter: false,
+    };
+  }
+
+  if (capturedMessages && capturedMessages.length > 0) {
+    return {
+      messages: capturedMessages,
+      reapplyRoleMerge: false,
+      applyEmptyFilter: false,
+    };
+  }
+
+  return {
+    messages: dryRunResult.messages,
+    reapplyRoleMerge: false,
+    applyEmptyFilter: false,
+  };
+}
+
 /**
  * Removes the trailing chat-history turn at `targetIdx` and unshifts any
  * depth-inserted (`depth >= 1`) non-chat-history blocks one history turn earlier
